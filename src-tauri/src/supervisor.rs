@@ -1,12 +1,13 @@
 use crate::{network, telemetry::Controller};
 use serde_json::Value;
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const RETRY_DELAYS: [Duration; 3] = [
@@ -62,6 +63,36 @@ fn recovery_delay(enabled: bool, mode: &str, failures: usize) -> Option<Duration
 struct Slot {
     active: Option<Running>,
     message: Option<&'static str>,
+    events: VecDeque<Event>,
+    next_event: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct Event {
+    sequence: u64,
+    timestamp: u64,
+    level: &'static str,
+    message: &'static str,
+}
+
+impl Slot {
+    fn record(&mut self, level: &'static str, message: &'static str) {
+        const LIMIT: usize = 160;
+        if self.events.len() == LIMIT {
+            self.events.pop_front();
+        }
+        self.next_event += 1;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.events.push_back(Event {
+            sequence: self.next_event,
+            timestamp,
+            level,
+            message,
+        });
+    }
 }
 
 #[derive(Default)]
@@ -103,7 +134,13 @@ impl Supervisor {
         {
             return Err("代理已经运行".into());
         }
-        let session = launch(&plan)?;
+        let session = match launch(&plan) {
+            Ok(session) => session,
+            Err(error) => {
+                slot.record("error", "网络进程启动失败");
+                return Err(error);
+            }
+        };
         slot.active = Some(Running {
             session,
             plan,
@@ -112,17 +149,24 @@ impl Supervisor {
             retry_at: None,
         });
         slot.message = None;
+        slot.record("info", "本地网络入口已就绪");
         Ok(())
     }
 
     pub fn stop(&self) -> Result<(), String> {
         let mut slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
         slot.message = None;
-        match slot.active.take() {
+        let result = match slot.active.take() {
             Some(active) if active.session.running() => active.session.stop(),
             Some(_) => network::recover(),
-            None => Ok(()),
+            None => return Ok(()),
+        };
+        if result.is_ok() {
+            slot.record("info", "已停止代理并结束网络接管");
+        } else {
+            slot.record("error", "代理已请求停止，网络设置恢复暂未确认");
         }
+        result
     }
 
     pub fn shutdown(&self) -> Result<(), String> {
@@ -163,7 +207,12 @@ impl Supervisor {
             }))
     }
 
-    pub fn update_plan(&self, id: &str, update: impl FnOnce(&mut Plan)) -> bool {
+    pub fn update_plan(
+        &self,
+        id: &str,
+        event: &'static str,
+        update: impl FnOnce(&mut Plan),
+    ) -> bool {
         if let Ok(mut slot) = self.slot.lock() {
             if let Some(active) = slot
                 .active
@@ -171,10 +220,19 @@ impl Supervisor {
                 .filter(|active| active.session.id == id)
             {
                 update(&mut active.plan);
+                slot.record("info", event);
                 return true;
             }
         }
         false
+    }
+
+    pub fn events(&self) -> Result<Vec<Event>, String> {
+        let slot = self
+            .slot
+            .try_lock()
+            .map_err(|_| "代理正在处理网络状态，请稍后刷新")?;
+        Ok(slot.events.iter().cloned().collect())
     }
 
     pub fn configure_recovery(&self, enabled: bool) -> Result<(), String> {
@@ -206,7 +264,7 @@ impl Supervisor {
             let tun = active.plan.mode == "tun";
             let exhausted = active.failures >= RETRY_DELAYS.len();
             slot.active.take();
-            slot.message = Some(if network::recover().is_err() {
+            let message = if network::recover().is_err() {
                 "内核已退出，系统代理恢复暂未确认，请重新检查 Windows 代理设置"
             } else if tun {
                 "TUN 内核已退出，重新连接时需要管理员授权"
@@ -214,7 +272,9 @@ impl Supervisor {
                 "自动恢复失败，已退出接管"
             } else {
                 "内核意外退出，已恢复网络设置"
-            });
+            };
+            slot.message = Some(message);
+            slot.record("warn", message);
             return;
         };
         let retry_at = active
@@ -225,10 +285,14 @@ impl Supervisor {
         }
         active.failures += 1;
         active.retry_at = None;
-        if let Ok(session) = launch(&active.plan) {
-            active.session = session;
-            active.since = Instant::now();
-            slot.message = Some("代理已自动恢复");
+        match launch(&active.plan) {
+            Ok(session) => {
+                active.session = session;
+                active.since = Instant::now();
+                slot.message = Some("代理已自动恢复");
+                slot.record("info", "检测到内核中断，代理已自动恢复");
+            }
+            Err(_) => slot.record("warn", "网络恢复尝试失败"),
         }
     }
 
@@ -259,6 +323,17 @@ mod tests {
         assert!(recovery_delay(true, "system", 3).is_none());
         assert!(recovery_delay(false, "local", 0).is_none());
         assert!(recovery_delay(true, "tun", 0).is_none());
+    }
+
+    #[test]
+    fn event_buffer_retains_latest_entries_in_order() {
+        let mut slot = Slot::default();
+        for _ in 0..165 {
+            slot.record("info", "fixture");
+        }
+        assert_eq!(slot.events.len(), 160);
+        assert_eq!(slot.events.front().unwrap().sequence, 6);
+        assert_eq!(slot.events.back().unwrap().sequence, 165);
     }
 
     #[test]

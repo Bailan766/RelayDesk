@@ -25,6 +25,7 @@ export type Workspace = {
   refreshHours: number;
   favorites: string[];
   autoReconnect: boolean;
+  proxyPort: number | null;
 };
 
 export const emptyWorkspace: Workspace = {
@@ -35,6 +36,7 @@ export const emptyWorkspace: Workspace = {
   refreshHours: 0,
   favorites: [],
   autoReconnect: true,
+  proxyPort: null,
 };
 
 export function subscriptionHost(source: string): string {
@@ -181,6 +183,8 @@ export function deserializeWorkspace(raw: string): Workspace {
       ? [...new Set<string>(saved.favorites.filter((id: unknown): id is string => typeof id === "string").map(recoverId))]
       : [],
     autoReconnect: saved.autoReconnect !== false,
+    proxyPort: Number.isInteger(saved.proxyPort) && saved.proxyPort >= 1024 && saved.proxyPort <= 65535
+      ? saved.proxyPort : null,
   };
 }
 

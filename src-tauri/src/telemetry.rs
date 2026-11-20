@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{net::TcpListener, sync::OnceLock, time::Duration};
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
+    sync::OnceLock,
+    time::Duration,
+};
 
 static CLIENT: OnceLock<Result<reqwest::Client, reqwest::Error>> = OnceLock::new();
 
@@ -39,6 +44,30 @@ impl Controller {
                 "access_control_allow_origin": ["http://127.0.0.1"]
             }
         });
+    }
+
+    pub fn ready(&self) -> bool {
+        let address = SocketAddr::from(([127, 0, 0, 1], self.port));
+        let timeout = Duration::from_millis(150);
+        let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+            return false;
+        };
+        if stream.set_read_timeout(Some(timeout)).is_err()
+            || stream.set_write_timeout(Some(timeout)).is_err()
+        {
+            return false;
+        }
+        let request = format!("GET /version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            self.port, self.secret);
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        let reader = BufReader::with_capacity(128, stream);
+        reader.take(128).split(b'\n').next().is_some_and(|line| {
+            line.is_ok_and(|line| {
+                line.starts_with(b"HTTP/1.1 200 ") || line.starts_with(b"HTTP/1.0 200 ")
+            })
+        })
     }
 
     fn request(

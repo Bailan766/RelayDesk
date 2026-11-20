@@ -52,6 +52,13 @@ main { background: #f4f5f7; border: 0; border-radius: 0; margin: 0; padding: 24p
 .site-grid span { display: block; color: #596675; font-size: 12px; margin-top: 12px; }
 .site-grid .link { display: block; margin: 8px auto 0; }
 .site-grid span:empty { display: none; }
+.event-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
+.event-controls select { font: inherit; border: 1px solid #dbe2ec; border-radius: 5px; padding: 5px; background: #fff; }
+.event-list { list-style: none; padding: 0; margin: 0; }
+.event { display: grid; grid-template-columns: 86px 44px 1fr; gap: 8px; padding: 9px 0; border-bottom: 1px solid #edf0f3; font-size: 13px; }
+.event time { color: #596675; font-variant-numeric: tabular-nums; }
+.event-warn > span:first-of-type { color: #8a4d11; }
+.event-error > span:first-of-type { color: #ad2424; }
 .group-heading { padding: 16px; margin: 12px 0; display: flex; justify-content: space-between; gap: 10px; }
 .group-heading span { color: #8793a1; font-size: 12px; }
 .node-grid, .unlock-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 10px; }

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 use std::{
-    net::{SocketAddr, TcpStream, UdpSocket},
+    net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     os::windows::io::AsRawHandle,
     process::{Child, Stdio},
 };
@@ -472,6 +472,7 @@ impl Session {
         if !matches!(mode, "local" | "system" | "tun") {
             return Err("代理入口模式无效".into());
         }
+        ensure_port_available(port)?;
         let directory = runtime_dir()?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let ready = Handle::new(unsafe {
@@ -617,6 +618,13 @@ fn assign(child: &mut Child, job: &Handle) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_port_available(port: u16) -> Result<(), String> {
+    let busy = |_| format!("本地端口 {port} 已被占用，请在设置中更换端口或改为自动分配");
+    let _tcp = TcpListener::bind(("127.0.0.1", port)).map_err(busy)?;
+    let _udp = UdpSocket::bind(("127.0.0.1", port)).map_err(busy)?;
+    Ok(())
+}
+
 fn add_routing_modes(config: &mut Value, tun: bool) -> Option<()> {
     let route = config
         .as_object_mut()?
@@ -671,6 +679,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let directory = runtime_dir()?;
     let journal = directory.join("proxy.json");
     system_proxy::recover(&journal).map_err(|_| "恢复系统代理失败")?;
+    ensure_port_available(port)?;
     let input = directory.join(format!("{token}.json"));
     let config = fs::read(input).map_err(|_| "无法读取内核配置")?;
     let WorkerInput {
@@ -740,7 +749,10 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         }
         let tun_ready =
             mode != "tun" || UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_ok();
-        if tun_ready && TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok() {
+        if tun_ready
+            && TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
+            && controller.ready()
+        {
             break;
         }
         thread::sleep(Duration::from_millis(70));
@@ -776,6 +788,14 @@ pub fn cli() -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_and_udp_bind_conflicts_are_detected_before_network_changes() {
+        let tcp = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        assert!(ensure_port_available(tcp.local_addr().unwrap().port()).is_err());
+        let udp = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        assert!(ensure_port_available(udp.local_addr().unwrap().port()).is_err());
+    }
     #[test]
     fn elevated_worker_rejects_unexpected_fields() {
         let mut config = json!({

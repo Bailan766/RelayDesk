@@ -24,6 +24,7 @@ import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleValue,
 import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
 import { SubscriptionCard } from "./SubscriptionCard";
 import { WebsiteChecks } from "./WebsiteChecks";
+import { EventLog } from "./EventLog";
 import { useWorkspace } from "./useWorkspace";
 import { preferredNode, type EntryMode, type RoutingMode, type Workspace } from "./workspace";
 import "./style.css";
@@ -58,7 +59,7 @@ const nav: { name: Page; icon: typeof Activity }[] = [
 function App() {
   const [page, setPage] = useState<Page>("概览");
   const work = useWorkspace();
-  const { subscriptions, rules, selected, favorites, autoReconnect, entryMode: mode } = work.workspace;
+  const { subscriptions, rules, selected, favorites, autoReconnect, proxyPort, entryMode: mode } = work.workspace;
   const nodes = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes), [subscriptions]);
   const unavailableNodes = useMemo(() => new Map(nodes.map(node => [node.id, connectionSupport(node)])), [nodes]);
   const ruleTargets = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes
@@ -353,7 +354,7 @@ function App() {
         clearSession();
       } else {
         if (!preferred) throw new Error("请先导入并选择节点");
-        const localPort = await invoke<number>("allocate_port");
+        const localPort = proxyPort ?? await invoke<number>("allocate_port");
         const next = await prepareSession(preferred, localPort);
         await invoke("start_proxy", { config: next.config, mode, routingMode, autoReconnect });
         session.current = next;
@@ -724,7 +725,7 @@ function App() {
           )}
           {page === "测试" && <UnlockTests />}
           {page === "连接" && <ConnectionMonitor telemetry={telemetry} running={running} />}
-          {page === "日志" && <section className="panel"><h2>内核日志</h2><p className="empty">日志查看尚未接入。</p></section>}
+          {page === "日志" && <EventLog />}
           {page === "规则" && (
             <RulesEditor rules={rules} targets={ruleTargets} onChange={edit => void saveSettings(state => ({ ...state, rules: edit(state.rules) }))} running={running} />
           )}
@@ -768,6 +769,8 @@ function App() {
                 </label>
               </div>
               <p className="rule-hint">适用于系统代理和本地端口。TUN 重新连接时需要管理员授权。</p>
+              <FixedPortSetting key={String(proxyPort)} value={proxyPort} disabled={!work.ready || busy || running}
+                onChange={changed => saveSettings(state => ({ ...state, proxyPort: changed }))} />
             </section>
           )}
         </main>
@@ -833,6 +836,37 @@ function App() {
       )}
     </div>
   );
+}
+
+function FixedPortSetting({ value, disabled, onChange }: {
+  value: number | null;
+  disabled: boolean;
+  onChange: (port: number | null) => Promise<void>;
+}) {
+  const [port, setPort] = useState(value == null ? "" : String(value));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const isUnchanged = port.trim() === (value == null ? "" : String(value));
+  return <form className="rule-form" onSubmit={event => {
+    event.preventDefault();
+    const input = port.trim();
+    const number = input ? Number(input) : null;
+    if (number != null && (!/^\d{1,5}$/.test(input) || number < 1024 || number > 65535)) {
+      setError("端口须为 1024 至 65535 的整数");
+      return;
+    }
+    setError("");
+    setSaving(true);
+    void onChange(number).finally(() => setSaving(false));
+  }}>
+    <label className="port-setting"><span>本地 HTTP / SOCKS5 端口</span>
+      <input inputMode="numeric" value={port} disabled={disabled || saving} placeholder="自动分配"
+        aria-describedby="proxy-port-note" onChange={event => { setPort(event.target.value); setError(""); }} />
+    </label>
+    <button disabled={disabled || saving || isUnchanged}>保存端口</button>
+    <p className="rule-hint port-setting-note" id="proxy-port-note">留空自动分配。停止代理后可更改。</p>
+    {error && <span className="error" role="alert">{error}</span>}
+  </form>;
 }
 function UnlockTests() {
   const services = ["哔哩哔哩大陆", "哔哩哔哩港澳台", "Bahamut Anime", "ChatGPT iOS", "ChatGPT Web", "Claude", "Disney+", "Gemini", "Netflix", "Prime Video", "Spotify", "TikTok", "YouTube Premium"];
