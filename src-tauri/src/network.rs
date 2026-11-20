@@ -31,6 +31,11 @@ use winapi::{
 };
 
 const APPLY_TIMEOUT: Duration = Duration::from_secs(15);
+const TUN_READY_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn tun_interface(token: &str) -> String {
+    format!("RelayDesk-{}", &token[..12])
+}
 
 struct Handle(HANDLE);
 unsafe impl Send for Handle {}
@@ -239,7 +244,7 @@ fn validate_outbounds(outbounds: &[Value]) -> Option<()> {
 }
 
 // The elevated worker constructs its own inbound, DNS and interface settings.
-fn tun_config(config: &Value, port: u16) -> Option<Value> {
+fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> {
     let root = checked_object(config, &["log", "inbounds", "outbounds", "route"])?;
     let outbounds = root.get("outbounds")?.as_array()?;
     validate_outbounds(outbounds)?;
@@ -272,7 +277,7 @@ fn tun_config(config: &Value, port: u16) -> Option<Value> {
         "log": {"level":"warn"},
         "inbounds": [
             {"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port},
-            {"type":"tun","tag":"tun","interface_name":"RelayDesk","address":["172.28.254.1/30","fdfe:dcba:9876::1/126"],"auto_route":true,"strict_route":true,"stack":"mixed"}
+            {"type":"tun","tag":"tun","interface_name":interface_name,"address":["172.28.254.1/30","fdfe:dcba:9876::1/126"],"auto_route":true,"strict_route":true,"stack":"mixed"}
         ],
         "outbounds": outbounds,
         "route":{"rules":output_rules,"final":"proxy","auto_detect_interface":true,"default_domain_resolver":"bootstrap"},
@@ -364,7 +369,12 @@ impl Session {
             controller,
             id: token,
         };
-        let deadline = Instant::now() + APPLY_TIMEOUT;
+        let deadline = Instant::now()
+            + if mode == "tun" {
+                TUN_READY_TIMEOUT + Duration::from_secs(5)
+            } else {
+                APPLY_TIMEOUT
+            };
         while Instant::now() < deadline {
             if ready.signaled(40) && session.running() {
                 return Ok(session);
@@ -472,7 +482,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         controller,
     } = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
     if mode == "tun" {
-        config = tun_config(&config, port).ok_or("TUN 配置无效")?;
+        config = tun_config(&config, port, &tun_interface(token)).ok_or("TUN 配置无效")?;
     }
     controller.configure(&mut config);
     let core = core_path()?;
@@ -513,7 +523,12 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         .write_all(&config)
         .map_err(|_| "内核拒绝代理配置")?;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let deadline = Instant::now() + Duration::from_secs(9);
+    let deadline = Instant::now()
+        + if mode == "tun" {
+            TUN_READY_TIMEOUT
+        } else {
+            Duration::from_secs(9)
+        };
     loop {
         if stop.signaled(0)
             || parent.signaled(0)
@@ -569,8 +584,15 @@ mod tests {
             "outbounds": [{"type":"vless","tag":"proxy","server":"example.com","server_port":443,"uuid":"00000000-0000-4000-8000-000000000000"},{"type":"direct","tag":"direct"}],
             "route": {"rules":[]}
         });
-        assert!(tun_config(&config, 17771).is_some());
+        let first = tun_interface("2c09680c214648ca8f08c155e93bc721");
+        let second = tun_interface("e91fe4c94dd043bda858623f29ef8bbe");
+        assert_ne!(first, second);
+        let generated = tun_config(&config, 17771, &first).unwrap();
+        assert_eq!(
+            generated["inbounds"][1]["interface_name"].as_str(),
+            Some(first.as_str())
+        );
         config["outbounds"][0]["tls"] = json!({"enabled":true,"certificate_path":"sensitive"});
-        assert!(tun_config(&config, 17771).is_none());
+        assert!(tun_config(&config, 17771, &second).is_none());
     }
 }

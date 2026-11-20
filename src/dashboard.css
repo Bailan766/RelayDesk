@@ -1,5 +1,5 @@
 body { background: #f1f2f4; color: #171b22; }
-aside { width: 220px; background: #fff; border-right: 1px solid #e8ebef; padding: 24px 14px; }
+aside { width: 220px; background: #fff; border-right: 1px solid #e8ebef; padding: 24px 16px; }
 .brand { padding-bottom: 30px; color: #15191e; }
 .brand strong { letter-spacing: 0; font-size: 18px; }
 .side-label { display: none; }
@@ -11,9 +11,9 @@ nav button.active { background: #e7f1ff; color: #0876ed; }
 main { background: #f4f5f7; border: 0; border-radius: 0; margin: 0; padding: 24px 28px 40px; }
 .title { margin-bottom: 20px; align-items: center; }
 .title h1 { font-size: 21px; }
-.primary, .connect { background: #0878ed !important; border-color: #0878ed !important; }
+.primary, .connect { background: #096acb !important; border-color: #096acb !important; }
 .connect:disabled { background: #b7c4d4 !important; }
-.link { color: #0878ed; }
+.link { color: #096acb; }
 .connection, .panel, .group-heading, .node-card, .test-card { background: white; border: 1px solid #e9edf2; border-radius: 8px; }
 .connection { padding: 18px 22px; margin-bottom: 16px; }
 .status { font-size: 18px; }
@@ -46,7 +46,7 @@ main { background: #f4f5f7; border: 0; border-radius: 0; margin: 0; padding: 24p
 .metric { border: 1px solid #edf0f3; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 6px; color: #6b7685; }
 .metric strong { color: #202c38; font-size: 18px; }
 .stats { padding: 20px 0; }
-.columns { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; margin-top: 16px; }
+.columns { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; margin-top: 16px; align-items: start; }
 .site-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 8px; }
 .site-grid div { background: #f4f8fd; padding: 18px 6px; text-align: center; border-radius: 6px; overflow: hidden; }
 .site-grid span { display: block; color: #596675; font-size: 12px; margin-top: 12px; }

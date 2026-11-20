@@ -101,7 +101,7 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
             $parentId = $parent.Id
         }
         $worker = Start-Process -FilePath $exePath -ArgumentList '--network-worker', $parentId, $token, $port, $Mode -PassThru -WindowStyle Hidden -RedirectStandardError $errorLog
-        if (-not $ready.WaitOne(15000)) {
+        if (-not $ready.WaitOne(27000)) {
             throw "$Mode worker did not report network readiness; exited=$($worker.HasExited); $(Get-Content -Raw -LiteralPath $errorLog)"
         }
         if ($Mode -eq 'system') {
@@ -110,7 +110,8 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
                 throw 'The system proxy was not set to the local listener'
             }
         }
-        if ($Mode -eq 'tun' -and -not (Get-NetIPAddress -IPAddress '172.28.254.1' -ErrorAction SilentlyContinue)) {
+        $tunAlias = "RelayDesk-$($token.Substring(0, 12))"
+        if ($Mode -eq 'tun' -and -not (Get-NetIPAddress -InterfaceAlias $tunAlias -IPAddress '172.28.254.1' -ErrorAction SilentlyContinue)) {
             throw 'The TUN virtual interface was not configured'
         }
         $url = "http://127.0.0.1:$controllerPort/connections"
@@ -166,4 +167,5 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
 Test-NetworkSession 'local' $false
 Test-NetworkSession 'system' $false
 Test-NetworkSession 'system' $true
+Test-NetworkSession 'tun' $false
 Test-NetworkSession 'tun' $false
