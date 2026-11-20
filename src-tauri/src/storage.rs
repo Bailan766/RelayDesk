@@ -29,12 +29,16 @@ fn database(app: &tauri::AppHandle) -> Result<Connection, String> {
     Ok(conn)
 }
 
-#[tauri::command]
-pub fn save_subscription(app: tauri::AppHandle, data: String) -> Result<(), String> {
+fn store(conn: &Connection, data: &str) -> Result<(), String> {
     let encrypted = transform(data.as_bytes(), true)?;
-    database(&app)?.execute("INSERT INTO subscription (id, encrypted) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET encrypted=excluded.encrypted", params![encrypted])
+    conn.execute("INSERT INTO subscription (id, encrypted) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET encrypted=excluded.encrypted", params![encrypted])
         .map_err(|_| "无法保存订阅")?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn save_subscription(app: tauri::AppHandle, data: String) -> Result<(), String> {
+    store(&database(&app)?, &data)
 }
 
 #[tauri::command]
@@ -53,12 +57,23 @@ pub fn load_subscription(app: tauri::AppHandle) -> Result<Option<String>, String
 
 #[cfg(test)]
 mod tests {
-    use super::transform;
+    use super::{store, transform};
+    use rusqlite::Connection;
     #[test]
     fn encrypted_data_roundtrips_without_plaintext() {
         let plaintext = b"subscription-secret-example";
         let ciphertext = transform(plaintext, true).unwrap();
         assert!(!ciphertext.windows(plaintext.len()).any(|part| part == plaintext));
         assert_eq!(transform(&ciphertext, false).unwrap(), plaintext);
+    }
+    #[test]
+    fn failed_update_preserves_encrypted_previous_subscription() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE subscription (id INTEGER PRIMARY KEY CHECK(id = 1), encrypted BLOB NOT NULL)").unwrap();
+        store(&conn, "previous-secret").unwrap();
+        assert!(store(&conn, &"x".repeat(8 * 1024 * 1024 + 1)).is_err());
+        let encrypted: Vec<u8> = conn.query_row("SELECT encrypted FROM subscription WHERE id=1", [], |row| row.get(0)).unwrap();
+        assert!(!encrypted.windows(15).any(|part| part == b"previous-secret"));
+        assert_eq!(transform(&encrypted, false).unwrap(), b"previous-secret");
     }
 }
