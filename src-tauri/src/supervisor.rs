@@ -712,6 +712,7 @@ mod tests {
                     Err(error) => panic!("standby proxy was never reached: {error}"),
                 }
             };
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(4)))
                 .unwrap();
