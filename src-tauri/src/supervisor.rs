@@ -372,6 +372,59 @@ impl Supervisor {
         Ok(())
     }
 
+    pub async fn reload_mihomo(&self, config: Value) -> Result<(), String> {
+        let _guard = self.control.lock().await;
+        let (id, controller, old, port, mode, selections) = {
+            let slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
+            let active = slot
+                .active
+                .as_ref()
+                .filter(|active| {
+                    active.session.running() && active.plan.settings.core == network::Core::Mihomo
+                })
+                .ok_or("Mihomo 原配置模式未运行")?;
+            (
+                active.session.id.clone(),
+                active.session.controller.clone(),
+                active.plan.settings.config.clone(),
+                active.plan.port,
+                active.plan.routing_mode,
+                active.plan.settings.selections.clone(),
+            )
+        };
+        let next = crate::mihomo::prepare(&config, port, mode)?;
+        match controller.reload_mihomo(next).await {
+            Ok(true) => {}
+            Ok(false) => return Err("Mihomo 拒绝了更新，连接继续使用原配置".into()),
+            Err(error) => {
+                if let Ok(previous) = crate::mihomo::prepare(&old, port, mode) {
+                    if controller
+                        .reload_mihomo(previous)
+                        .await
+                        .is_ok_and(|restored| restored)
+                    {
+                        crate::mihomo::restore_selections(
+                            &controller,
+                            selections,
+                            Duration::from_secs(4),
+                        )
+                        .await;
+                        self.update_plan(&id, "Mihomo 更新中断，已恢复原配置", None, |_| {});
+                        return Err(format!("{error}，已恢复原配置"));
+                    }
+                }
+                return Err("无法确认配置更新结果，请停止代理后重新连接".into());
+            }
+        }
+        crate::mihomo::restore_selections(&controller, selections, Duration::from_secs(4)).await;
+        if !self.update_plan(&id, "已应用 Mihomo 原配置更新", None, |plan| {
+            plan.settings.config = config;
+        }) {
+            return Err("Mihomo 会话已变化，请重新应用更新".into());
+        }
+        Ok(())
+    }
+
     pub async fn change_mode(&self, mode: network::RoutingMode) -> Result<(), String> {
         let _guard = self.control.lock().await;
         let active = self.live()?.ok_or("代理内核未运行")?;

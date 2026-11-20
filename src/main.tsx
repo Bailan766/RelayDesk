@@ -415,6 +415,21 @@ function App() {
       setLocalTcpBusy(false);
     }
   }
+  async function applyOriginalUpdate() {
+    const next = liveOriginalProfile;
+    if (busy || recovering || !runningOriginal || !next?.parsed.mihomo) return;
+    setBusy(true);
+    setConnectionError("");
+    try {
+      await invoke("reload_mihomo", { config: next.parsed.mihomo });
+      setRunningOriginal({ id: next.id, name: next.name, content: next.content });
+      resetDiagnostics();
+    } catch (failure) {
+      setConnectionError(typeof failure === "string" ? failure : "配置更新失败");
+    } finally {
+      setBusy(false);
+    }
+  }
   async function toggleProxy() {
     setBusy(true);
     setConnectionError("");
@@ -563,6 +578,20 @@ function App() {
                   </button>
                 </div>
               </section>
+              {originalUpdated && <div className="notice" role="status">
+                订阅配置已更新。
+                <button className="link inline-action" disabled={busy || recovering}
+                  onClick={() => void applyOriginalUpdate()}>应用到当前连接</button>
+              </div>}
+              {runningOriginal && <MihomoGroups mode={routingMode} disabled={busy || recovering}
+                onMode={value => void changeRouting(value)} onChange={async (group, choice) => {
+                  resetDiagnostics();
+                  await saveSettings(state => ({ ...state, subscriptions: state.subscriptions.map(profile =>
+                    profile.id === runningOriginal.id
+                      ? { ...profile, mihomoSelections: { ...profile.mihomoSelections, [group]: choice } }
+                      : profile,
+                  ) }));
+                }} />}
               <TrafficDashboard telemetry={telemetry} />
               <div className="stats">
                 <div>
@@ -576,7 +605,6 @@ function App() {
                   {originalName && !running && <button className="link" disabled={busy}
                     onClick={() => void saveSettings(state => ({ ...state, mihomoProfile: undefined }))}>切回节点模式</button>}
                   {nodeHealth && <small role="status">{nodeHealthLabels[nodeHealth]}</small>}
-                  {originalUpdated && <small role="status">订阅已更新，重连后使用新配置。</small>}
                 </div>
                 <div>
                   <span>代理模式</span>
@@ -584,15 +612,6 @@ function App() {
                   <small>{routingModes.find(entry => entry.value === routingMode)?.label}路由</small>
                 </div>
               </div>
-              {runningOriginal && <MihomoGroups mode={routingMode} disabled={busy || recovering}
-                onMode={value => void changeRouting(value)} onChange={async (group, choice) => {
-                  resetDiagnostics();
-                  await saveSettings(state => ({ ...state, subscriptions: state.subscriptions.map(profile =>
-                    profile.id === runningOriginal.id
-                      ? { ...profile, mihomoSelections: { ...profile.mihomoSelections, [group]: choice } }
-                      : profile,
-                  ) }));
-                }} />}
               <div className="columns">
                 <WebsiteChecks key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
                 <section className="panel">

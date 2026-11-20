@@ -160,6 +160,24 @@ impl Controller {
             .collect())
     }
 
+    pub async fn reload_mihomo(&self, mut config: Value) -> Result<bool, String> {
+        self.configure_mihomo(&mut config);
+        let payload = serde_json::to_string(&config).map_err(|_| "无法读取订阅配置")?;
+        let response = self
+            .request(reqwest::Method::PUT, "/configs?force=true")?
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .timeout(Duration::from_secs(24))
+            .body(json!({ "payload": payload }).to_string())
+            .send()
+            .await
+            .map_err(|_| "Mihomo 更新响应超时或中断")?;
+        match response.status().as_u16() {
+            204 => Ok(true),
+            400 => Ok(false),
+            _ => Err("Mihomo 更新返回异常".into()),
+        }
+    }
+
     pub async fn probe_outbound(&self, tag: &str, url: &str) -> Option<bool> {
         let path = format!("/proxies/{tag}/delay");
         let response = self

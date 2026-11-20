@@ -220,6 +220,14 @@ async fn switch_mihomo_group(
 }
 
 #[tauri::command]
+async fn reload_mihomo(
+    config: serde_json::Value,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<(), String> {
+    state.reload_mihomo(config).await
+}
+
+#[tauri::command]
 async fn stop_proxy(app: tauri::AppHandle) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || app.state::<ProxyState>().stop())
         .await
@@ -660,6 +668,7 @@ fn main() {
             start_mihomo,
             mihomo_groups,
             switch_mihomo_group,
+            reload_mihomo,
             stop_proxy,
             proxy_status,
             proxy_events,

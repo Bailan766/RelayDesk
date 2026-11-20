@@ -1,6 +1,10 @@
 use crate::{network::RoutingMode, telemetry::Controller};
 use serde_json::{json, Map, Value};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    hash::{DefaultHasher, Hash, Hasher},
+    time::Duration,
+};
 
 const TRAFFIC_FIELDS: &[&str] = &[
     "proxies",
@@ -33,7 +37,7 @@ fn prepare_providers(config: &mut Map<String, Value>, field: &str) -> Result<(),
         return Ok(());
     };
     let providers = providers.as_object_mut().ok_or("提供者配置必须为对象")?;
-    for (index, provider) in providers.values_mut().enumerate() {
+    for (name, provider) in providers.iter_mut() {
         let provider = provider.as_object_mut().ok_or("提供者配置必须为对象")?;
         match provider.get("type").and_then(Value::as_str) {
             Some("http") => {
@@ -45,7 +49,17 @@ fn prepare_providers(config: &mut Map<String, Value>, field: &str) -> Result<(),
                 if !matches!(url.scheme(), "https" | "http") || url.host_str().is_none() {
                     return Err("远程提供者仅支持 HTTP 或 HTTPS".into());
                 }
-                provider.insert("path".into(), json!(format!("./{field}/{index}.cache")));
+                let mut identity = DefaultHasher::new();
+                name.hash(&mut identity);
+                url.as_str().hash(&mut identity);
+                provider
+                    .get("header")
+                    .map(Value::to_string)
+                    .hash(&mut identity);
+                provider.insert(
+                    "path".into(),
+                    json!(format!("./{field}/{:016x}.cache", identity.finish())),
+                );
             }
             Some("inline") => {
                 provider.remove("path");
@@ -152,9 +166,14 @@ mod tests {
         assert_eq!(output["dns"]["nameserver"], input["dns"]["nameserver"]);
         assert_eq!(output["rules"], input["rules"]);
         assert_eq!(output["proxy-groups"], input["proxy-groups"]);
-        assert_eq!(
-            output["rule-providers"]["remote"]["path"],
-            "./rule-providers/0.cache"
+        let path = output["rule-providers"]["remote"]["path"].as_str().unwrap();
+        assert!(path.starts_with("./rule-providers/") && path.ends_with(".cache"));
+        let mut changed = input.clone();
+        changed["rule-providers"]["remote"]["url"] = json!("https://fixture.test/changed");
+        let changed = prepare(&changed, 17071, RoutingMode::Rule).unwrap();
+        assert_ne!(
+            changed["rule-providers"]["remote"]["path"].as_str(),
+            Some(path)
         );
         assert_eq!(output["rule-providers"]["remote"]["size-limit"], 1024);
         assert!(prepare(

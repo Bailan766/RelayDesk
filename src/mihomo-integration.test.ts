@@ -174,6 +174,20 @@ async function verifyProfile(executable: string, pack = false) {
     const rejection = await through().then(result => result.status ?? 0, () => 502);
     expect(rejection).toBeGreaterThanOrEqual(400);
     expect(targetCalls).toBe(1);
+
+    const reload = (rules: string[]) => call("/configs?force=true", {
+      method: "PUT",
+      body: JSON.stringify({ payload: JSON.stringify({
+        ...config, rules, "mixed-port": port, "bind-address": "127.0.0.1", "allow-lan": false,
+        "external-controller": `127.0.0.1:${controllerPort}`, secret, mode: "rule", "log-level": "warning",
+      }) }),
+    });
+    expect((await reload(["MATCH,NonexistentOutbound"])).status).toBe(400);
+    expect((await call(groupPath, { method: "PUT", body: '{"name":"DIRECT"}' })).status).toBe(204);
+    expect(await through()).toEqual({ status: 200, text: "relaydesk-mihomo-fixture" });
+    expect((await reload([`DOMAIN,${hostname},REJECT`, "MATCH,DIRECT"])).status).toBe(204);
+    expect(await through().then(result => result.status ?? 0, () => 502)).toBeGreaterThanOrEqual(400);
+    expect(targetCalls).toBe(2);
   } catch (error) {
     throw new Error(log.join("").slice(-3200) || "Mihomo profile test failed", { cause: error });
   } finally {
