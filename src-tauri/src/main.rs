@@ -27,7 +27,7 @@ fn start_proxy(config: serde_json::Value, state: tauri::State<'_, ProxyState>) -
     let port = inbound.get("listen_port").and_then(|v| v.as_u64()).filter(|v| (1024..=65535).contains(v)).ok_or("本地端口无效")? as u16;
     if inbound.get("listen").and_then(|x| x.as_str()) != Some("127.0.0.1") || inbound.get("type").and_then(|x| x.as_str()) != Some("mixed") { return Err("本地入口配置无效".into()); }
     let path = std::env::temp_dir().join(format!("relaydesk-{}.json", uuid::Uuid::new_v4()));
-    let result = (|| {
+    let result = (|| -> Result<(), String> {
         let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|_| "无法创建临时配置")?;
         file.write_all(serde_json::to_string(&config).map_err(|_| "配置无效")?.as_bytes()).map_err(|_| "无法写入配置")?;
         drop(file);
@@ -37,7 +37,7 @@ fn start_proxy(config: serde_json::Value, state: tauri::State<'_, ProxyState>) -
         let mut process = Command::new(core).args(["run", "-c"]).arg(&path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_| "无法启动内核")?;
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         for _ in 0..50 {
-            if process.try_wait().map_err(|_| "无法检查内核进程")?.is_some() { return Err("内核启动失败") }
+            if process.try_wait().map_err(|_| "无法检查内核进程")?.is_some() { return Err("内核启动失败".into()) }
             if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() { *child = Some(process); return Ok(()) }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -91,7 +91,7 @@ fn main() {
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
             let state = handle.state::<ProxyState>();
-            if let Ok(mut child) = state.0.lock() { if let Some(mut process) = child.take() { let _ = process.kill(); let _ = process.wait(); } }
+            if let Ok(mut child) = state.0.lock() { if let Some(mut process) = child.take() { let _ = process.kill(); let _ = process.wait(); } };
         }
     });
 }
