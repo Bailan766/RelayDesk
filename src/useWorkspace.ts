@@ -2,16 +2,16 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   deserializeWorkspace, emptyWorkspace, receiveSubscription, replaceSubscription,
-  serializeWorkspace, type SubscriptionDownload, type Workspace,
+  serializeWorkspace, type SubscriptionDownload, type SubscriptionRequest, type Workspace,
 } from "./workspace";
 
 function errorMessage(error: unknown, fallback: string): string {
   return typeof error === "string" ? error : error instanceof Error ? error.message : fallback;
 }
 
-async function download(source: string): Promise<SubscriptionDownload> {
+async function download(source: string, request?: SubscriptionRequest): Promise<SubscriptionDownload> {
   if (!isTauri()) throw new Error("请使用桌面应用下载订阅");
-  return invoke<SubscriptionDownload>("fetch_subscription", { address: source });
+  return invoke<SubscriptionDownload>("fetch_subscription", { address: source, request });
 }
 
 type RefreshStatus = { pending: boolean; error?: string };
@@ -64,14 +64,12 @@ export function useWorkspace() {
     if (!profile?.source) return Promise.resolve();
     lastAttempt.current.set(id, Date.now());
     setRefreshStatus(previous => ({ ...previous, [id]: { pending: true } }));
-    const task = download(profile.source).then(downloaded => {
-      const replacement = receiveSubscription(downloaded.content, profile.source, downloaded.usage, profile);
-      return commit(previous => {
-        const existing = previous.subscriptions.find(item => item.id === id);
-        if (!existing || existing.source !== profile.source || existing.updatedAt !== profile.updatedAt) return previous;
-        return replaceSubscription(previous, replacement);
-      });
-    }).then(() => {
+    const task = download(profile.source, profile.request).then(downloaded => commit(previous => {
+      const existing = previous.subscriptions.find(item => item.id === id);
+      if (!existing || existing.source !== profile.source || existing.updatedAt !== profile.updatedAt) return previous;
+      if (existing.request !== profile.request) throw new Error("请求设置已变更，请重新更新");
+      return replaceSubscription(previous, receiveSubscription(downloaded.content, existing.source, downloaded.usage, existing));
+    })).then(() => {
       setRefreshStatus(previous => ({ ...previous, [id]: { pending: false } }));
     }).catch(error => {
       const message = errorMessage(error, "订阅更新失败");
@@ -83,6 +81,17 @@ export function useWorkspace() {
     refreshes.current.set(id, task);
     return task;
   }, [commit]);
+
+  function configureRequest(id: string, request: SubscriptionRequest) {
+    return commit(state => {
+      const existing = state.subscriptions.find(profile => profile.id === id);
+      if (!existing || (existing.request.route === request.route && existing.request.userAgent === request.userAgent)) return state;
+      return {
+        ...state,
+        subscriptions: state.subscriptions.map(profile => profile.id === id ? { ...profile, request } : profile),
+      };
+    });
+  }
 
   useEffect(() => {
     if (!ready || !workspace.refreshHours || !isTauri()) return;
@@ -103,18 +112,24 @@ export function useWorkspace() {
     return () => window.clearInterval(timer);
   }, [ready, refresh, workspace.refreshHours]);
 
-  async function add(raw: string) {
+  async function add(raw: string, request?: SubscriptionRequest) {
     const text = raw.trim();
     if (!canWrite.current) throw new Error("本地工作区尚未加载");
     const source = /^https?:\/\//i.test(text) ? new URL(text).href : "";
     const previous = source ? current.current.subscriptions.find(item => item.source === source) : undefined;
-    if (previous) return refresh(previous.id);
-    const downloaded = source ? await download(source) : { content: text, usage: null };
-    const subscription = receiveSubscription(downloaded.content, source, downloaded.usage);
+    if (previous) {
+      if (request) {
+        await configureRequest(previous.id, request);
+        await refreshes.current.get(previous.id)?.catch(() => {});
+      }
+      return refresh(previous.id);
+    }
+    const downloaded = source ? await download(source, request) : { content: text, usage: null };
+    const subscription = receiveSubscription(downloaded.content, source, downloaded.usage, undefined, source ? request : undefined);
     await commit(state => source && state.subscriptions.some(item => item.source === source)
       ? state
       : replaceSubscription(state, subscription));
   }
 
-  return { workspace, ready, storageError, commit, add, refresh, refreshStatus };
+  return { workspace, ready, storageError, commit, add, refresh, refreshStatus, configureRequest };
 }

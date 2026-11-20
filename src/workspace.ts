@@ -5,6 +5,8 @@ export type EntryMode = "system" | "tun" | "local";
 export type RoutingMode = "rule" | "global" | "direct";
 export type Usage = { upload?: number; download?: number; total?: number; expire?: number };
 export type SubscriptionDownload = { content: string; usage: Usage | null };
+export type SubscriptionRequest = { route: "automatic" | "direct" | "relaydesk"; userAgent: string };
+export const defaultSubscriptionRequest: SubscriptionRequest = { route: "automatic", userAgent: "" };
 
 export type Subscription = {
   id: string;
@@ -13,6 +15,7 @@ export type Subscription = {
   content: string;
   updatedAt: number | null;
   usage: Usage | null;
+  request: SubscriptionRequest;
   parsed: ImportResult;
 };
 
@@ -44,6 +47,15 @@ export const emptyWorkspace: Workspace = {
 export function subscriptionHost(source: string): string {
   try { return new URL(source).hostname; }
   catch { return ""; }
+}
+
+function subscriptionRequest(value: unknown): SubscriptionRequest {
+  const settings = value as Partial<SubscriptionRequest> | null | undefined;
+  return {
+    route: settings?.route === "direct" || settings?.route === "relaydesk" ? settings.route : "automatic",
+    userAgent: typeof settings?.userAgent === "string" && /^[\x20-\x7e]{0,256}$/.test(settings.userAgent)
+      ? settings.userAgent.trim() : "",
+  };
 }
 
 function validUsage(value: unknown): Usage | null {
@@ -79,6 +91,7 @@ export function receiveSubscription(
   source: string,
   usage: Usage | null,
   previous?: Subscription,
+  request?: SubscriptionRequest,
 ): Subscription {
   return parseProfile({
     id: previous?.id ?? crypto.randomUUID(),
@@ -87,6 +100,7 @@ export function receiveSubscription(
     content: text,
     updatedAt: Date.now(),
     usage: validUsage(usage),
+    request: request ?? previous?.request ?? defaultSubscriptionRequest,
   });
 }
 
@@ -136,6 +150,7 @@ export function deserializeWorkspace(raw: string): Workspace {
       name: subscriptionHost(source) || "原有订阅",
       updatedAt: null,
       usage: null,
+      request: defaultSubscriptionRequest,
     });
     // Earlier clients indexed the first appearance of each display name and endpoint.
     const seen = new Set<string>();
@@ -161,6 +176,7 @@ export function deserializeWorkspace(raw: string): Workspace {
       id: profile.id, name: profile.name, source: profile.source, content: profile.content,
       updatedAt: Number.isSafeInteger(profile.updatedAt) ? profile.updatedAt : null,
       usage: validUsage(profile.usage),
+      request: subscriptionRequest(profile.request),
     });
   });
   const known = new Set<string>();

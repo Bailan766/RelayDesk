@@ -342,17 +342,27 @@ struct SubscriptionDownload {
     usage: Option<SubscriptionUsage>,
 }
 
-#[tauri::command]
-async fn fetch_subscription(address: String) -> Result<SubscriptionDownload, String> {
-    let parsed = url::Url::parse(&address).map_err(|_| "订阅地址无效")?;
-    if parsed.scheme() != "https"
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return Err("请输入不含账号密码的 HTTPS 订阅地址".into());
-    }
-    let client = reqwest::Client::builder()
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SubscriptionRoute {
+    #[default]
+    Automatic,
+    Direct,
+    Relaydesk,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SubscriptionRequest {
+    route: SubscriptionRoute,
+    user_agent: String,
+}
+
+fn subscription_http_client(
+    request: SubscriptionRequest,
+    port: Option<u16>,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let target = attempt.url();
@@ -365,9 +375,48 @@ async fn fetch_subscription(address: String) -> Result<SubscriptionDownload, Str
             } else {
                 attempt.follow()
             }
-        }))
-        .build()
-        .map_err(|_| "无法初始化网络请求")?;
+        }));
+    builder = match request.route {
+        SubscriptionRoute::Automatic => builder,
+        SubscriptionRoute::Direct => builder.no_proxy(),
+        SubscriptionRoute::Relaydesk => {
+            let port = port.ok_or("请先连接 RelayDesk，再通过当前代理更新订阅")?;
+            let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))
+                .map_err(|_| "无法使用当前代理入口")?;
+            builder.no_proxy().proxy(proxy)
+        }
+    };
+    let agent = request.user_agent.trim();
+    if !agent.is_empty() {
+        if agent.len() > 256 || !agent.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+            return Err("客户端标识只能包含可见英文字符，最多 256 字符".into());
+        }
+        builder = builder.user_agent(agent);
+    }
+    builder.build().map_err(|_| "无法初始化网络请求".into())
+}
+
+#[tauri::command]
+async fn fetch_subscription(
+    address: String,
+    request: Option<SubscriptionRequest>,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<SubscriptionDownload, String> {
+    let parsed = url::Url::parse(&address).map_err(|_| "订阅地址无效")?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("请输入不含账号密码的 HTTPS 订阅地址".into());
+    }
+    let request = request.unwrap_or_default();
+    let port = if matches!(&request.route, SubscriptionRoute::Relaydesk) {
+        running_port(&state)
+    } else {
+        None
+    };
+    let client = subscription_http_client(request, port)?;
     let mut response = client
         .get(parsed)
         .send()
@@ -396,6 +445,71 @@ async fn fetch_subscription(address: String) -> Result<SubscriptionDownload, Str
     }
     let content = String::from_utf8(data).map_err(|_| "订阅内容不是 UTF-8 文本")?;
     Ok(SubscriptionDownload { content, usage })
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn explicit_subscription_routes_send_the_custom_header_and_do_not_fall_back() {
+        async fn fixture() -> (u16, tokio::task::JoinHandle<String>) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let capture = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") && headers.len() < 4096 {
+                    headers.push(socket.read_u8().await.unwrap());
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfixture",
+                    )
+                    .await
+                    .unwrap();
+                String::from_utf8(headers).unwrap().to_ascii_lowercase()
+            });
+            (port, capture)
+        }
+
+        let request = |route| SubscriptionRequest {
+            route,
+            user_agent: " RelayDesk-Fixture/1.0 ".into(),
+        };
+        assert!(subscription_http_client(request(SubscriptionRoute::Relaydesk), None).is_err());
+
+        for through_proxy in [false, true] {
+            let (port, capture) = fixture().await;
+            let (client, url, path) = if through_proxy {
+                (
+                    subscription_http_client(request(SubscriptionRoute::Relaydesk), Some(port))
+                        .unwrap(),
+                    "http://subscription.fixture.test/nodes".to_owned(),
+                    "get http://subscription.fixture.test/nodes http/1.1",
+                )
+            } else {
+                (
+                    subscription_http_client(request(SubscriptionRoute::Direct), None).unwrap(),
+                    format!("http://127.0.0.1:{port}/nodes"),
+                    "get /nodes http/1.1",
+                )
+            };
+            let response = client
+                .get(url)
+                .timeout(std::time::Duration::from_secs(3))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "fixture");
+            let headers = capture.await.unwrap();
+            assert!(headers.starts_with(path));
+            assert!(headers.contains("\r\nuser-agent: relaydesk-fixture/1.0\r\n"));
+        }
+    }
 }
 
 fn main() {

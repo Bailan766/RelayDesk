@@ -33,6 +33,16 @@ describe("encrypted workspace data", () => {
     expect(merged.subscriptions[0].usage).toEqual({ total: 25 });
   });
 
+  it("keeps a subscription's request settings through refresh and workspace reload", () => {
+    const request = { route: "relaydesk" as const, userAgent: "SubscriptionClient/1.0" };
+    const profile = receiveSubscription(primary, source, null, undefined, request);
+    const updated = receiveSubscription(backup, source, { total: 1024 }, profile);
+    const workspace = replaceSubscription(emptyWorkspace, updated);
+    expect(deserializeWorkspace(serializeWorkspace(workspace)).subscriptions[0].request).toEqual(request);
+    expect(deserializeWorkspace(JSON.stringify({ content: primary, source })).subscriptions[0].request)
+      .toEqual({ route: "automatic", userAgent: "" });
+  });
+
   it("preserves an existing usable source when the replacement contains no usable nodes", () => {
     const original = receiveSubscription(primary, source, null);
     const workspace = replaceSubscription(emptyWorkspace, original);

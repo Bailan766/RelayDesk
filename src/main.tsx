@@ -22,11 +22,11 @@ import {
 import { nodeRevision, type NodeProfile } from "./subscription";
 import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleValue, ruleTypes, withSelectedOutbound, type RouteRule, type SessionPlan } from "./config";
 import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
-import { SubscriptionCard } from "./SubscriptionCard";
+import { SubscriptionCard, SubscriptionRequestFields } from "./SubscriptionCard";
 import { WebsiteChecks } from "./WebsiteChecks";
 import { EventLog } from "./EventLog";
 import { useWorkspace } from "./useWorkspace";
-import { preferredNode, type EntryMode, type RoutingMode, type Workspace } from "./workspace";
+import { defaultSubscriptionRequest, preferredNode, type EntryMode, type RoutingMode, type SubscriptionRequest, type Workspace } from "./workspace";
 import "./style.css";
 import "./accessibility.css";
 import "./rules.css";
@@ -91,6 +91,7 @@ function App() {
   const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [dialog, setDialog] = useState(false);
   const [text, setText] = useState("");
+  const [importRequest, setImportRequest] = useState<SubscriptionRequest>();
   const [error, setError] = useState("");
   const [importing, setImporting] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -216,9 +217,11 @@ function App() {
     setImporting(true);
     setError("");
     try {
-      await work.add(text);
+      const request = importRequest && { ...importRequest, userAgent: importRequest.userAgent.trim() };
+      await work.add(text, request);
       setSubscriptionFilter("");
       setText("");
+      setImportRequest(undefined);
       setDialog(false);
       setPage("节点");
     } catch (e) {
@@ -770,6 +773,7 @@ function App() {
                   error={work.refreshStatus[profile.id]?.error}
                   refreshable={isTauri()}
                   onRefresh={() => void work.refresh(profile.id).catch(() => {})}
+                  onConfigure={request => work.configureRequest(profile.id, request)}
                   onBrowse={() => { setSubscriptionFilter(profile.id); setSearch(""); setOnlyFavorites(false); setPage("节点"); }}
                   onRename={name => void saveSettings(state => ({ ...state, subscriptions:
                     state.subscriptions.map(item => item.id === profile.id ? { ...item, name } : item) }))}
@@ -877,6 +881,13 @@ function App() {
               onChange={(e) => setText(e.target.value)}
               placeholder="粘贴订阅地址、内容或节点链接"
             />
+            {/^https?:\/\//i.test(text.trim()) && (
+              <details className="subscription-request-details">
+                <summary>请求设置</summary>
+                <SubscriptionRequestFields value={importRequest ?? defaultSubscriptionRequest}
+                  disabled={importing} onChange={setImportRequest} />
+              </details>
+            )}
             <input
               hidden
               ref={file}
