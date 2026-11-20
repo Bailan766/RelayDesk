@@ -39,7 +39,7 @@ function read(socket: Socket, expected: (value: string) => boolean): Promise<str
   });
 }
 
-it.skipIf(!core)("switches live outgoing traffic without closing an existing TCP tunnel", async () => {
+it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", async () => {
   const server = createServer(socket => socket.pipe(socket));
   const sockets: Socket[] = [];
   const children: ChildProcess[] = [];
@@ -65,8 +65,13 @@ it.skipIf(!core)("switches live outgoing traffic without closing an existing TCP
     const nodes = parseSubscription([firstNode, secondNode].map((port, index) =>
       `vless://${user}@127.0.0.1:${port}#node-${index}`).join("\n")).nodes;
     const { config } = buildSessionConfig(nodes[0], nodes, mixed, []);
-    start({ ...config, experimental: { clash_api: {
-      external_controller: `127.0.0.1:${api}`, secret,
+    start({ ...config, route: { ...config.route, rules: [
+      { clash_mode: "direct", outbound: "direct" },
+      { clash_mode: "global", outbound: "proxy" },
+      { ip_cidr: ["127.0.0.1/32"], action: "reject" },
+      { clash_mode: "rule", outbound: "proxy" },
+    ] }, experimental: { clash_api: {
+      external_controller: `127.0.0.1:${api}`, secret, default_mode: "global",
     } } });
 
     const controller = (path: string, init?: RequestInit) => fetch(`http://127.0.0.1:${api}${path}`, {
@@ -105,6 +110,18 @@ it.skipIf(!core)("switches live outgoing traffic without closing an existing TCP
     const body = await response.json() as { connections: { chains: string[] }[] };
     expect(body.connections.some(connection => connection.chains.includes("node-0"))).toBe(true);
     expect(body.connections.some(connection => connection.chains.includes("node-1"))).toBe(true);
+
+    const setMode = async (mode: string) => {
+      expect((await controller("/configs", { method: "PATCH", body: JSON.stringify({ mode }) })).status).toBe(204);
+      const payload = await (await controller("/configs")).json() as { mode: string };
+      expect(payload.mode).toBe(mode);
+    };
+    await setMode("direct");
+    await echo(await tunnel(), "direct");
+    const snapshot = await (await controller("/connections")).json() as { connections: { chains: string[] }[] };
+    expect(snapshot.connections.some(connection => connection.chains.includes("direct"))).toBe(true);
+    await setMode("rule");
+    await expect(tunnel().then(socket => echo(socket, "blocked"))).rejects.toThrow();
   } finally {
     sockets.forEach(socket => socket.destroy());
     server.close();

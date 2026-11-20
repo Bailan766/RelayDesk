@@ -37,6 +37,25 @@ fn tun_interface(token: &str) -> String {
     format!("RelayDesk-{}", &token[..12])
 }
 
+#[derive(Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingMode {
+    #[default]
+    Rule,
+    Global,
+    Direct,
+}
+
+impl RoutingMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::Global => "global",
+            Self::Direct => "direct",
+        }
+    }
+}
+
 struct Handle(HANDLE);
 unsafe impl Send for Handle {}
 
@@ -283,6 +302,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         "route":{"rules":output_rules,"final":"proxy","auto_detect_interface":true,"default_domain_resolver":"bootstrap"},
         "dns":{
             "servers":[{"type":"local","tag":"bootstrap"},{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","detour":"proxy"}],
+            "rules":[{"clash_mode":"direct","action":"route","server":"bootstrap"}],
             "final":"remote"
         }
     }))
@@ -300,10 +320,17 @@ pub struct Session {
 struct WorkerInput {
     config: Value,
     controller: crate::telemetry::Controller,
+    #[serde(default)]
+    routing_mode: RoutingMode,
 }
 
 impl Session {
-    pub fn start(config: Value, port: u16, mode: &str) -> Result<Self, String> {
+    pub fn start(
+        config: Value,
+        port: u16,
+        mode: &str,
+        routing_mode: RoutingMode,
+    ) -> Result<Self, String> {
         if !matches!(mode, "local" | "system" | "tun") {
             return Err("代理入口模式无效".into());
         }
@@ -331,6 +358,7 @@ impl Session {
         let input = WorkerInput {
             config,
             controller: controller.clone(),
+            routing_mode,
         };
         fs::write(
             &path,
@@ -448,6 +476,33 @@ fn assign(child: &mut Child, job: &Handle) -> Result<(), String> {
     Ok(())
 }
 
+fn add_routing_modes(config: &mut Value, tun: bool) -> Option<()> {
+    let route = config
+        .as_object_mut()?
+        .entry("route")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?;
+    let fallback = route
+        .get("final")
+        .and_then(Value::as_str)
+        .unwrap_or("proxy")
+        .to_owned();
+    let rules = route
+        .entry("rules")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()?;
+    let first = if tun { 2 } else { 0 };
+    rules.splice(
+        first..first,
+        [
+            json!({"clash_mode":"direct","outbound":"direct"}),
+            json!({"clash_mode":"global","outbound":"proxy"}),
+        ],
+    );
+    rules.push(json!({"clash_mode":"rule","outbound":fallback}));
+    Some(())
+}
+
 fn run_worker(args: &[String]) -> Result<(), String> {
     let [parent, token, port, mode] = args else {
         return Err("网络参数无效".into());
@@ -480,11 +535,13 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let WorkerInput {
         mut config,
         controller,
+        routing_mode,
     } = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
     if mode == "tun" {
         config = tun_config(&config, port, &tun_interface(token)).ok_or("TUN 配置无效")?;
     }
-    controller.configure(&mut config);
+    add_routing_modes(&mut config, mode == "tun").ok_or("无法配置路由模式")?;
+    controller.configure(&mut config, routing_mode.name());
     let core = core_path()?;
     let config = serde_json::to_vec(&config).map_err(|_| "内核配置无效")?;
     let job = job()?;
@@ -594,5 +651,24 @@ mod tests {
         );
         config["outbounds"][0]["tls"] = json!({"enabled":true,"certificate_path":"sensitive"});
         assert!(tun_config(&config, 17771, &second).is_none());
+    }
+
+    #[test]
+    fn routing_modes_preserve_dns_interception_and_user_rule_order() {
+        let guarded = json!({"domain":["example.com"],"action":"reject"});
+        let mut config = json!({"route":{"final":"proxy","rules":[
+            {"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},guarded
+        ]}});
+        add_routing_modes(&mut config, true).unwrap();
+        assert_eq!(
+            config["route"]["rules"],
+            json!([
+                {"action":"sniff"},{"protocol":"dns","action":"hijack-dns"},
+                {"clash_mode":"direct","outbound":"direct"},
+                {"clash_mode":"global","outbound":"proxy"},
+                {"domain":["example.com"],"action":"reject"},
+                {"clash_mode":"rule","outbound":"proxy"}
+            ])
+        );
     }
 }

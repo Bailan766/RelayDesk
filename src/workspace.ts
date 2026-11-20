@@ -2,6 +2,7 @@ import { connectionSupport, type RouteRule } from "./config";
 import { parseSubscription, type ImportResult, type NodeProfile } from "./subscription";
 
 export type EntryMode = "system" | "tun" | "local";
+export type RoutingMode = "rule" | "global" | "direct";
 export type Usage = { upload?: number; download?: number; total?: number; expire?: number };
 export type SubscriptionDownload = { content: string; usage: Usage | null };
 
@@ -20,6 +21,7 @@ export type Workspace = {
   selected?: string;
   rules: RouteRule[];
   entryMode: EntryMode;
+  routingMode: RoutingMode;
   refreshHours: number;
 };
 
@@ -27,6 +29,7 @@ export const emptyWorkspace: Workspace = {
   subscriptions: [],
   rules: [],
   entryMode: "system",
+  routingMode: "rule",
   refreshHours: 0,
 };
 
@@ -130,6 +133,7 @@ export function deserializeWorkspace(raw: string): Workspace {
     selected: preferredNode(subscriptions, saved.selected),
     rules: saved.rules,
     entryMode: saved.entryMode === "local" || saved.entryMode === "tun" ? saved.entryMode : "system",
+    routingMode: saved.routingMode === "direct" || saved.routingMode === "global" ? saved.routingMode : "rule",
     refreshHours: [1, 6, 24].includes(saved.refreshHours) ? saved.refreshHours : 0,
   };
 }

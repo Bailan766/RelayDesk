@@ -30,11 +30,12 @@ impl Controller {
         })
     }
 
-    pub fn configure(&self, config: &mut Value) {
+    pub fn configure(&self, config: &mut Value, default_mode: &str) {
         config["experimental"] = json!({
             "clash_api": {
                 "external_controller": format!("127.0.0.1:{}", self.port),
                 "secret": self.secret.to_string(),
+                "default_mode": default_mode,
                 "access_control_allow_origin": ["http://127.0.0.1"]
             }
         });
@@ -72,6 +73,36 @@ impl Controller {
             return Ok(());
         }
         Err("内核未接受节点切换".into())
+    }
+
+    pub async fn routing_mode(&self, mode: &str) -> Result<(), String> {
+        let response = self
+            .request(reqwest::Method::PATCH, "/configs")?
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(json!({ "mode": mode }).to_string())
+            .send()
+            .await
+            .map_err(|_| "连接内核控制接口失败")?;
+        if !response.status().is_success() {
+            return Err("内核未接受路由模式".into());
+        }
+        let status = self
+            .request(reqwest::Method::GET, "/configs")?
+            .send()
+            .await
+            .map_err(|_| "读取内核路由模式失败")?
+            .text()
+            .await
+            .map_err(|_| "读取内核路由模式失败")?;
+        let body: Value = serde_json::from_str(&status).map_err(|_| "内核路由模式响应无效")?;
+        if body["mode"]
+            .as_str()
+            .is_some_and(|active| active.eq_ignore_ascii_case(mode))
+        {
+            Ok(())
+        } else {
+            Err("内核未切换路由模式".into())
+        }
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot, String> {

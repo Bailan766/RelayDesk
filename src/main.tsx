@@ -23,7 +23,7 @@ import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleDomain
 import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
 import { SubscriptionCard } from "./SubscriptionCard";
 import { useWorkspace } from "./useWorkspace";
-import { preferredNode, type EntryMode, type Workspace } from "./workspace";
+import { preferredNode, type EntryMode, type RoutingMode, type Workspace } from "./workspace";
 import "./style.css";
 import "./accessibility.css";
 import "./rules.css";
@@ -34,6 +34,11 @@ const entryModes: { value: EntryMode; label: string }[] = [
   { value: "system", label: "系统代理" },
   { value: "tun", label: "TUN" },
   { value: "local", label: "本地端口" },
+];
+const routingModes: { value: RoutingMode; label: string }[] = [
+  { value: "rule", label: "规则" },
+  { value: "global", label: "全局" },
+  { value: "direct", label: "直连" },
 ];
 const nav: { name: Page; icon: typeof Activity }[] = [
   { name: "概览", icon: LayoutDashboard },
@@ -62,6 +67,8 @@ function App() {
   const file = useRef<HTMLInputElement>(null);
   const [running, setRunning] = useState(false);
   const [runningNode, setRunningNode] = useState<NodeProfile>();
+  const [liveRouting, setLiveRouting] = useState<RoutingMode>();
+  const routingMode = running ? liveRouting ?? work.workspace.routingMode : work.workspace.routingMode;
   const session = useRef<SessionPlan>();
   const telemetry = useTelemetry(running);
   const [port, setPort] = useState<number>();
@@ -86,6 +93,7 @@ function App() {
     session.current = undefined;
     setRunning(false);
     setRunningNode(undefined);
+    setLiveRouting(undefined);
     setPort(undefined);
     setExitIp("");
     setCheckResult("");
@@ -156,6 +164,24 @@ function App() {
     }
     return { config: single, loaded: new Map() };
   }
+  async function changeRouting(value: RoutingMode) {
+    if (busy || value === routingMode) return;
+    setBusy(true);
+    setConnectionError("");
+    try {
+      if (running) {
+        await invoke("set_routing_mode", { mode: value });
+        setLiveRouting(value);
+        setCheckResult("");
+        setExitIp("");
+      }
+      await saveSettings(state => ({ ...state, routingMode: value }));
+    } catch (error) {
+      setConnectionError(typeof error === "string" ? error : "路由模式切换失败");
+    } finally {
+      setBusy(false);
+    }
+  }
   async function selectNode(node: NodeProfile) {
     if (busy || testing || isSelected(node)) return;
     const remember = () => saveSettings(state => ({ ...state,
@@ -182,14 +208,14 @@ function App() {
       const next = await prepareSession(node, port);
       await invoke("stop_proxy");
       try {
-        await invoke("start_proxy", { config: next.config, mode });
+        await invoke("start_proxy", { config: next.config, mode, routingMode });
         session.current = next;
         setRunningNode(node);
         setRunning(true);
         await remember();
       } catch (failure) {
         try {
-          await invoke("start_proxy", { config: previous.config, mode });
+          await invoke("start_proxy", { config: previous.config, mode, routingMode });
           setRunning(true);
         } catch {
           clearSession();
@@ -273,9 +299,10 @@ function App() {
         if (!preferred) throw new Error("请先导入并选择节点");
         const localPort = await invoke<number>("allocate_port");
         const next = await prepareSession(preferred, localPort);
-        await invoke("start_proxy", { config: next.config, mode });
+        await invoke("start_proxy", { config: next.config, mode, routingMode });
         session.current = next;
         setRunningNode(preferred);
+        setLiveRouting(routingMode);
         setPort(localPort);
         setRunning(true);
       }
@@ -409,7 +436,7 @@ function App() {
                 <div>
                   <span>代理模式</span>
                   <strong>{entryModes.find((entry) => entry.value === mode)?.label}</strong>
-                  <small>HTTP / SOCKS5</small>
+                  <small>{routingModes.find(entry => entry.value === routingMode)?.label}路由</small>
                 </div>
               </div>
               <div className="columns">
@@ -506,6 +533,11 @@ function App() {
                   {testing ? "取消测速" : "一键测试延迟"}
                 </button>
                 <span>{filtered.length} 个节点</span>
+                <div className="mode-switch" role="group" aria-label="路由模式">
+                  {routingModes.map(option => <button className="link" key={option.value}
+                    aria-pressed={routingMode === option.value} disabled={busy || !work.ready}
+                    onClick={() => void changeRouting(option.value)}>{option.label}</button>)}
+                </div>
               </div>
               <div className="group-heading"><strong>已导入节点</strong><span>手动选择 · {filtered.length} 个节点</span></div>
               {connectionError && (

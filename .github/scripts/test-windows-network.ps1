@@ -127,6 +127,14 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
         if ((Invoke-RestMethod -Uri $selector -NoProxy -TimeoutSec 3 -Headers $headers).now -ne 'node-1') {
             throw 'The installed core did not switch outbound on the running selector'
         }
+        $routing = "http://127.0.0.1:$controllerPort/configs"
+        foreach ($routingMode in @('direct', 'global', 'rule')) {
+            $body = @{mode=$routingMode} | ConvertTo-Json -Compress
+            [void](Invoke-RestMethod -Method Patch -Uri $routing -NoProxy -TimeoutSec 3 -Headers $headers -ContentType 'application/json' -Body $body)
+            if ((Invoke-RestMethod -Uri $routing -NoProxy -TimeoutSec 3 -Headers $headers).mode -ne $routingMode) {
+                throw "The installed core did not apply routing mode $routingMode"
+            }
+        }
         if ($Mode -eq 'local') { Test-ConnectionCounters $url $headers $port }
         if ($SimulateCrash) {
             $parent.Kill()

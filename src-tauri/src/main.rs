@@ -213,6 +213,7 @@ async fn validate_proxy_config(config: serde_json::Value) -> Result<bool, String
 async fn start_proxy(
     config: serde_json::Value,
     mode: Option<String>,
+    routing_mode: Option<network::RoutingMode>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -240,6 +241,7 @@ async fn start_proxy(
             config,
             port,
             mode.as_deref().unwrap_or("local"),
+            routing_mode.unwrap_or_default(),
         )?);
         Ok(())
     })
@@ -280,15 +282,24 @@ async fn switch_proxy_node(tag: String, state: tauri::State<'_, ProxyState>) -> 
     {
         return Err("节点标识无效".into());
     }
-    let controller = {
-        let active = state.0.lock().map_err(|_| "代理状态不可用")?;
-        active
-            .as_ref()
-            .filter(|session| session.running())
-            .map(|session| session.controller.clone())
-            .ok_or("代理内核未运行")?
-    };
-    controller.switch(&tag).await
+    active_controller(&state)?.switch(&tag).await
+}
+
+fn active_controller(state: &ProxyState) -> Result<telemetry::Controller, String> {
+    let active = state.0.lock().map_err(|_| "代理状态不可用")?;
+    active
+        .as_ref()
+        .filter(|session| session.running())
+        .map(|session| session.controller.clone())
+        .ok_or_else(|| "代理内核未运行".into())
+}
+
+#[tauri::command]
+async fn set_routing_mode(
+    mode: network::RoutingMode,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<(), String> {
+    active_controller(&state)?.routing_mode(mode.name()).await
 }
 
 #[tauri::command]
@@ -498,6 +509,7 @@ fn main() {
             stop_proxy,
             proxy_running,
             switch_proxy_node,
+            set_routing_mode,
             proxy_telemetry,
             check_connection,
             probe_node,
