@@ -27,6 +27,15 @@ impl Drop for ProbeProcess {
 }
 
 #[tauri::command]
+async fn local_tcp_google() -> Result<u64, String> {
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(8), tokio::net::TcpStream::connect(("www.google.com", 443)))
+        .await.map_err(|_| "本地 TCP 连接超时")?
+        .map_err(|_| "本地 DNS 解析或 TCP 连接失败")?;
+    Ok(started.elapsed().as_millis() as u64)
+}
+
+#[tauri::command]
 async fn probe_node(config: serde_json::Value, port: u16) -> Result<u64, String> {
     let inbound = config.get("inbounds").and_then(|v| v.as_array()).and_then(|v| v.first()).ok_or("缺少本地入口")?;
     if inbound.get("listen").and_then(|v| v.as_str()) != Some("127.0.0.1") || inbound.get("type").and_then(|v| v.as_str()) != Some("mixed") || inbound.get("listen_port").and_then(|v| v.as_u64()) != Some(port as u64) { return Err("测速入口配置无效".into()); }
@@ -161,7 +170,7 @@ async fn fetch_subscription(address: String) -> Result<String, String> {
 fn main() {
     let app = tauri::Builder::default()
         .manage(ProxyState::default())
-        .invoke_handler(tauri::generate_handler![fetch_subscription, allocate_port, start_proxy, stop_proxy, proxy_running, check_connection, probe_node, check_exit_ip, storage::save_subscription, storage::load_subscription])
+        .invoke_handler(tauri::generate_handler![fetch_subscription, allocate_port, start_proxy, stop_proxy, proxy_running, check_connection, probe_node, check_exit_ip, local_tcp_google, storage::save_subscription, storage::load_subscription])
         .build(tauri::generate_context!()).expect("failed to build RelayDesk");
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
