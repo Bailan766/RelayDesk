@@ -1,4 +1,5 @@
 !macro NSIS_HOOK_PREINSTALL
+  IfFileExists "$INSTDIR\network-recovery-v1.txt" 0 relaydesk_preinstall_done
   IfFileExists "$INSTDIR\relaydesk.exe" 0 relaydesk_preinstall_done
     ExecWait '"$INSTDIR\relaydesk.exe" --recover-network' $0
     ${If} $0 != 0

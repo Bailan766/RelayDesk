@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 use std::{
-    net::{SocketAddr, TcpStream},
+    net::{SocketAddr, TcpStream, UdpSocket},
     os::windows::io::AsRawHandle,
     process::{Child, Stdio},
 };
@@ -467,7 +467,9 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         {
             return Err("本地代理入口未就绪".into());
         }
-        if TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok() {
+        let tun_ready =
+            mode != "tun" || UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_ok();
+        if tun_ready && TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok() {
             break;
         }
         thread::sleep(Duration::from_millis(70));
@@ -488,7 +490,13 @@ fn run_worker(args: &[String]) -> Result<(), String> {
 pub fn cli() -> Option<i32> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("--network-worker") => Some(if run_worker(&args[1..]).is_ok() { 0 } else { 1 }),
+        Some("--network-worker") => Some(match run_worker(&args[1..]) {
+            Ok(()) => 0,
+            Err(reason) => {
+                eprintln!("{reason}");
+                1
+            }
+        }),
         Some("--recover-network") => Some(if recover().is_ok() { 0 } else { 1 }),
         _ => None,
     }
