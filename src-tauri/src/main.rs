@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use std::{fs, io::Write, net::{TcpListener, TcpStream}, path::PathBuf, process::{Child, Command, Stdio}, sync::Mutex, time::Duration};
 use tauri::Manager;
+mod storage;
 
 fn core_command(path: &std::path::Path) -> Command {
     let mut command = Command::new(path);
@@ -160,7 +161,7 @@ async fn fetch_subscription(address: String) -> Result<String, String> {
 fn main() {
     let app = tauri::Builder::default()
         .manage(ProxyState::default())
-        .invoke_handler(tauri::generate_handler![fetch_subscription, allocate_port, start_proxy, stop_proxy, proxy_running, check_connection, probe_node, check_exit_ip])
+        .invoke_handler(tauri::generate_handler![fetch_subscription, allocate_port, start_proxy, stop_proxy, proxy_running, check_connection, probe_node, check_exit_ip, storage::save_subscription, storage::load_subscription])
         .build(tauri::generate_context!()).expect("failed to build RelayDesk");
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {

@@ -39,6 +39,8 @@ jobs:
           New-Item -ItemType Directory -Path build-resources | Out-Null
           Copy-Item $env:SING_BOX build-resources/sing-box.exe
           Copy-Item (Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/LICENSE') build-resources/THIRD-PARTY-SING-BOX-LICENSE.txt
+      - name: Test Windows data protection
+        run: cargo test --manifest-path src-tauri/Cargo.toml
       - run: npm run tauri -- build --bundles nsis
       - name: Package pinned sing-box
         shell: pwsh
