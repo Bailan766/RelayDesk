@@ -66,7 +66,7 @@ async fn launch(core: &Path, action: &str, content: &[u8]) -> Result<Child, Stri
     Ok(child)
 }
 
-async fn measure(config: Value, port: u16) -> Result<u64, String> {
+async fn measure(core: &Path, config: Value, port: u16) -> Result<u64, String> {
     let inbound = config
         .get("inbounds")
         .and_then(Value::as_array)
@@ -78,10 +78,9 @@ async fn measure(config: Value, port: u16) -> Result<u64, String> {
     {
         return Err("测速入口配置无效".into());
     }
-    let core = crate::core_path()?;
     let content = serde_json::to_vec(&config).map_err(|_| "配置无效")?;
     let accepted = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut check = launch(&core, "check", &content).await?;
+        let mut check = launch(core, "check", &content).await?;
         Ok::<_, String>(
             check
                 .wait()
@@ -96,7 +95,7 @@ async fn measure(config: Value, port: u16) -> Result<u64, String> {
         return Err("节点配置未通过内核检查".into());
     }
 
-    let mut process = launch(&core, "run", &content).await?;
+    let mut process = launch(core, "run", &content).await?;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -157,11 +156,20 @@ pub async fn probe_node(
     batch: uuid::Uuid,
     state: tauri::State<'_, ProbeBatch>,
 ) -> Result<u64, String> {
-    let mut cancel = state.receive(batch)?;
+    let core = crate::core_path()?;
+    cancellable_measure(&core, config, port, state.receive(batch)?).await
+}
+
+async fn cancellable_measure(
+    core: &Path,
+    config: Value,
+    port: u16,
+    mut cancel: watch::Receiver<()>,
+) -> Result<u64, String> {
     tokio::select! {
         biased;
         _ = cancel.changed() => Err("已取消".into()),
-        result = measure(config, port) => result,
+        result = measure(core, config, port) => result,
     }
 }
 
@@ -182,5 +190,55 @@ mod tests {
         state.cancel(new).unwrap();
         assert!(receiver.has_changed().is_err());
         assert!(state.receive(new).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_reclaims_a_real_probe_listener_before_the_upstream_times_out() {
+        let Some(core) = std::env::var_os("SING_BOX").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let delayed_upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_port = delayed_upstream.local_addr().unwrap().port();
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let state = ProbeBatch::default();
+        let batch = state.begin().unwrap();
+        let cancel = state.receive(batch).unwrap();
+        let config = serde_json::json!({
+            "inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":port}],
+            "outbounds":[{"type":"http","tag":"proxy","server":"127.0.0.1","server_port":upstream_port}],
+            "route":{"final":"proxy"}
+        });
+        let worker =
+            tokio::spawn(async move { cancellable_measure(&core, config, port, cancel).await });
+        let (_unfinished, _) =
+            tokio::time::timeout(Duration::from_secs(8), delayed_upstream.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        state.cancel(batch).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "已取消");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await
+        .expect("cancelled probe still accepts local connections");
     }
 }
