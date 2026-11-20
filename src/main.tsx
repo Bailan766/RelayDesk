@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
@@ -18,20 +18,18 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import {
-  parseSubscription,
-  type ImportResult,
-  type NodeProfile,
-} from "./subscription";
-import { buildConfig, connectionSupport, type RouteRule } from "./config";
+import type { NodeProfile } from "./subscription";
+import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleDomain, withSelectedOutbound, type RouteRule, type SessionPlan } from "./config";
 import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
+import { SubscriptionCard } from "./SubscriptionCard";
+import { useWorkspace } from "./useWorkspace";
+import { preferredNode, type EntryMode, type Workspace } from "./workspace";
 import "./style.css";
 import "./accessibility.css";
 import "./rules.css";
 import "./dashboard.css";
 
 type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "诊断" | "设置";
-type EntryMode = "system" | "tun" | "local";
 const entryModes: { value: EntryMode; label: string }[] = [
   { value: "system", label: "系统代理" },
   { value: "tun", label: "TUN" },
@@ -50,122 +48,76 @@ const nav: { name: Page; icon: typeof Activity }[] = [
 ];
 function App() {
   const [page, setPage] = useState<Page>("概览");
-  const [nodes, setNodes] = useState<NodeProfile[]>([]);
-  const [selected, setSelected] = useState<string>();
+  const work = useWorkspace();
+  const { subscriptions, rules, selected, entryMode: mode } = work.workspace;
+  const nodes = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes), [subscriptions]);
+  const [subscriptionFilter, setSubscriptionFilter] = useState("");
   const [dialog, setDialog] = useState(false);
   const [text, setText] = useState("");
   const [error, setError] = useState("");
+  const [importing, setImporting] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<ImportResult>();
+  const [settingsError, setSettingsError] = useState("");
   const [search, setSearch] = useState("");
   const file = useRef<HTMLInputElement>(null);
   const [running, setRunning] = useState(false);
+  const [runningNode, setRunningNode] = useState<NodeProfile>();
+  const session = useRef<SessionPlan>();
   const telemetry = useTelemetry(running);
-  const [mode, setMode] = useState<EntryMode>("system");
   const [port, setPort] = useState<number>();
   const [connectionError, setConnectionError] = useState("");
   const [checkResult, setCheckResult] = useState("");
   const [checking, setChecking] = useState(false);
-  const [rules, setRules] = useState<RouteRule[]>([]);
   const [latencies, setLatencies] = useState<Record<string, string>>({});
   const [testing, setTesting] = useState(false);
   const [exitIp, setExitIp] = useState("");
   const [localTcp, setLocalTcp] = useState("尚未测试");
   const [localTcpBusy, setLocalTcpBusy] = useState(false);
   const cancelTesting = useRef(false);
-  const [savedContent, setSavedContent] = useState("");
-  const [savedSource, setSavedSource] = useState("");
-  const [storageError, setStorageError] = useState("");
-  const [storageReady, setStorageReady] = useState(!isTauri());
-  const saveQueue = useRef<Promise<void>>(Promise.resolve());
-  function persist(data: string) {
-    const next = saveQueue.current
-      .catch(() => {})
-      .then(() => invoke<void>("save_subscription", { data }));
-    saveQueue.current = next;
-    return next;
+  async function saveSettings(edit: (previous: Workspace) => Workspace) {
+    setSettingsError("");
+    try {
+      await work.commit(edit);
+    } catch (error) {
+      setSettingsError(typeof error === "string" ? error : error instanceof Error ? error.message : "设置保存失败");
+    }
+  }
+  function clearSession() {
+    session.current = undefined;
+    setRunning(false);
+    setRunningNode(undefined);
+    setPort(undefined);
+    setExitIp("");
+    setCheckResult("");
   }
   useEffect(() => {
-    if (!isTauri()) return;
-    let cancelled = false;
-    invoke<string | null>("load_subscription")
-      .then((raw) => {
-        if (!raw || cancelled) return;
-        const saved = JSON.parse(raw) as {
-          content: string;
-          source?: string;
-          selected: number;
-        };
-        const parsed = parseSubscription(saved.content);
-        setNodes(parsed.nodes);
-        setResult(parsed);
-        setSavedContent(saved.content);
-        setSavedSource(saved.source || "");
-        setSelected(
-          parsed.nodes[saved.selected]?.id ||
-            parsed.nodes.find((n) => !connectionSupport(n))?.id,
-        );
-      })
-      .catch(() => {
-        if (!cancelled) setStorageError("已保存的订阅读取失败，原数据仍保留。");
-      })
-      .finally(() => {
-        if (!cancelled) setStorageReady(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  useEffect(() => {
-    if (!isTauri() || busy) return;
+    if (!isTauri() || busy || !running) return;
     let cancelled = false;
     const timer = window.setInterval(() => {
       invoke<boolean>("proxy_running")
         .then((active) => {
           if (cancelled) return;
-          setRunning(active);
-          if (!active) setPort(undefined);
+          if (!active) clearSession();
         })
-        .catch(() => {
-          if (cancelled) return;
-          setRunning(false);
-          setPort(undefined);
-        });
+        .catch(() => { /* IPC failure does not prove that the core has stopped. */ });
     }, 2000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [busy]);
-  const filtered = nodes.filter((n) =>
+  }, [busy, running]);
+  const activeFilter = subscriptions.find(profile => profile.id === subscriptionFilter);
+  const filtered = (activeFilter?.parsed.nodes ?? nodes).filter((n) =>
     `#${n.sourceIndex ?? ""} ${n.name} ${n.protocol} ${n.server}`
       .toLowerCase()
       .includes(search.trim().toLowerCase()),
   );
   async function add() {
-    setBusy(true);
+    setImporting(true);
     setError("");
     try {
-      if (!storageReady) throw new Error("正在读取本地订阅，请稍候");
-      if (running) throw new Error("请先停止当前代理");
-      let content = text.trim();
-      const source = /^https?:\/\//i.test(content) ? content : "";
-      if (source) {
-        if (!isTauri()) throw new Error("订阅地址需要在桌面应用中下载");
-        content = await invoke<string>("fetch_subscription", {
-          address: source,
-        });
-      }
-      const parsed = parseSubscription(content);
-      const index = parsed.nodes.findIndex((n) => !connectionSupport(n));
-      if (isTauri())
-        await persist(JSON.stringify({ content, source, selected: index }));
-      setNodes(parsed.nodes);
-      setSelected(parsed.nodes[index]?.id);
-      setResult(parsed);
-      setSavedContent(content);
-      setSavedSource(source);
-      setStorageError("");
+      await work.add(text);
+      setSubscriptionFilter("");
       setText("");
       setDialog(false);
       setPage("节点");
@@ -174,22 +126,14 @@ function App() {
         typeof e === "string" ? e : e instanceof Error ? e.message : "导入失败",
       );
     } finally {
-      setBusy(false);
+      setImporting(false);
     }
   }
-  const current = nodes.find((n) => n.id === selected);
-  useEffect(() => {
-    if (!isTauri() || !savedContent || !selected) return;
-    const index = nodes.findIndex((n) => n.id === selected);
-    if (index < 0) return;
-    persist(
-      JSON.stringify({
-        content: savedContent,
-        source: savedSource,
-        selected: index,
-      }),
-    ).catch(() => setStorageError("节点选择保存失败"));
-  }, [selected, savedContent, savedSource, nodes]);
+  const preferred = nodes.find(n => n.id === selected);
+  const current = running ? runningNode ?? preferred : preferred;
+  const isSelected = (node: NodeProfile) => running
+    ? runningNode?.id === node.id && runningNode.uri === node.uri
+    : node.id === selected;
   async function checkProxy() {
     if (!port) return;
     setChecking(true);
@@ -203,10 +147,23 @@ function App() {
       setChecking(false);
     }
   }
+  async function prepareSession(node: NodeProfile, localPort: number): Promise<SessionPlan> {
+    const candidate = buildSessionConfig(node, nodes, localPort, rules);
+    if (await invoke<boolean>("validate_proxy_config", { config: candidate.config })) return candidate;
+    const single = buildConfig(node, localPort, rules);
+    if (!await invoke<boolean>("validate_proxy_config", { config: single })) {
+      throw new Error("所选节点或规则未通过内核配置检查");
+    }
+    return { config: single, loaded: new Map() };
+  }
   async function selectNode(node: NodeProfile) {
-    if (busy || testing || node.id === selected) return;
-    if (!running || !port || !current) {
-      setSelected(node.id);
+    if (busy || testing || isSelected(node)) return;
+    const remember = () => saveSettings(state => ({ ...state,
+      selected: preferredNode(state.subscriptions, node.id),
+    }));
+    const previous = session.current;
+    if (!running || !port || !previous) {
+      await remember();
       return;
     }
     setBusy(true);
@@ -214,20 +171,28 @@ function App() {
     setCheckResult("");
     setExitIp("");
     try {
-      const next = buildConfig(node, port, rules);
-      const previous = buildConfig(current, port, rules);
+      const loaded = previous.loaded.get(node.id);
+      if (loaded && loaded.uri === node.uri) {
+        await invoke("switch_proxy_node", { tag: loaded.tag });
+        session.current = withSelectedOutbound(previous, loaded.tag);
+        setRunningNode(node);
+        await remember();
+        return;
+      }
+      const next = await prepareSession(node, port);
       await invoke("stop_proxy");
       try {
-        await invoke("start_proxy", { config: next, mode });
-        setSelected(node.id);
+        await invoke("start_proxy", { config: next.config, mode });
+        session.current = next;
+        setRunningNode(node);
         setRunning(true);
+        await remember();
       } catch (failure) {
         try {
-          await invoke("start_proxy", { config: previous, mode });
+          await invoke("start_proxy", { config: previous.config, mode });
           setRunning(true);
         } catch {
-          setRunning(false);
-          setPort(undefined);
+          clearSession();
         }
         throw failure;
       }
@@ -303,16 +268,14 @@ function App() {
       if (!isTauri()) throw new Error("请在桌面应用中连接");
       if (running) {
         await invoke("stop_proxy");
-        setRunning(false);
-        setPort(undefined);
-        setExitIp("");
+        clearSession();
       } else {
-        if (!current) throw new Error("请先导入并选择节点");
+        if (!preferred) throw new Error("请先导入并选择节点");
         const localPort = await invoke<number>("allocate_port");
-        await invoke("start_proxy", {
-          config: buildConfig(current, localPort, rules),
-          mode,
-        });
+        const next = await prepareSession(preferred, localPort);
+        await invoke("start_proxy", { config: next.config, mode });
+        session.current = next;
+        setRunningNode(preferred);
         setPort(localPort);
         setRunning(true);
       }
@@ -376,12 +339,13 @@ function App() {
               </p>
             </div>
             {["概览", "节点", "订阅"].includes(page) && (
-              <button className="primary" onClick={() => setDialog(true)}>
+              <button className="primary" disabled={!work.ready} onClick={() => setDialog(true)}>
                 <Plus size={16} />
                 导入订阅
               </button>
             )}
           </div>
+          {(work.storageError || settingsError) && <p className="notice" role="alert">{work.storageError || settingsError}</p>}
           {page === "概览" && (
             <>
               <section className="connection">
@@ -414,7 +378,10 @@ function App() {
                 <div className="connection-actions">
                   <label>
                     <span>接管方式</span>
-                    <select value={mode} disabled={busy || running} onChange={(e) => setMode(e.target.value as EntryMode)}>
+                    <select value={mode} disabled={busy || running || !work.ready} onChange={(e) => {
+                      const entryMode = e.target.value as EntryMode;
+                      void saveSettings(state => ({ ...state, entryMode }));
+                    }}>
                       {entryModes.map(({ value, label }) => <option key={value} value={value}>{label}</option>)}
                     </select>
                   </label>
@@ -523,6 +490,10 @@ function App() {
                     onChange={(e) => setSearch(e.target.value)}
                   />
                 </label>
+                {subscriptions.length > 1 && <select className="toolbar-select" aria-label="筛选订阅来源" value={activeFilter?.id ?? ""} onChange={event => setSubscriptionFilter(event.target.value)}>
+                  <option value="">全部订阅</option>
+                  {subscriptions.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                </select>}
                 <button
                   className="link"
                   disabled={busy || !filtered.length || !isTauri()}
@@ -554,14 +525,14 @@ function App() {
                   </button>
                 </div>
               )}
-              {result?.warnings.length ? (
+              {activeFilter?.parsed.warnings.length ? (
                 <div className="notice">
-                  {result.warnings.length} 项未导入，请检查订阅格式。
+                  {activeFilter.parsed.warnings.length} 项未导入，请检查订阅格式。
                 </div>
               ) : null}
               <div className="node-grid">
                 {filtered.map((n) => (
-                  <div className={`node-card ${selected === n.id ? "selected" : ""}`} key={n.id}>
+                  <div className={`node-card ${isSelected(n) ? "selected" : ""}`} key={n.id}>
                     <div className="node-name">
                       <span className="node-icon">
                         <Globe2 size={17} />
@@ -587,16 +558,16 @@ function App() {
                         busy ||
                         testing ||
                         !!connectionSupport(n) ||
-                        selected === n.id
+                        isSelected(n)
                       }
                       title={connectionSupport(n) || undefined}
                       onClick={() => selectNode(n)}
                     >
-                      {selected === n.id
+                      {isSelected(n)
                         ? "已选择"
                         : connectionSupport(n)
                           ? "不可用"
-                          : "切换"}
+                          : runningNode?.id === n.id ? "应用更新" : "切换"}
                     </button>
                   </div>
                 ))}
@@ -614,26 +585,43 @@ function App() {
             </section>
           )}
           {page === "订阅" && (
-            <><section className="panel">
+            <section className="panel">
               <div className="panel-head">
                 <h2>订阅来源</h2>
+                <label className="refresh-setting">自动更新
+                  <select value={work.workspace.refreshHours} disabled={!work.ready || !isTauri()} onChange={event => {
+                    const refreshHours = Number(event.target.value);
+                    void saveSettings(state => ({ ...state, refreshHours }));
+                  }}>
+                    <option value="0">关闭</option>
+                    <option value="1">每小时</option>
+                    <option value="6">每 6 小时</option>
+                    <option value="24">每天</option>
+                  </select>
+                </label>
               </div>
-              <div className="empty">
-                {storageError ||
-                  (result
-                    ? `已从 ${result.format} 导入 ${nodes.length} 个节点。订阅已加密保存在本机。`
-                    : "尚未导入订阅。")}
-                <button className="link" onClick={() => setDialog(true)}>
-                  导入订阅 →
-                </button>
-              </div>
-            </section><div className="extension-grid"><section className="panel"><h2>全局扩展覆写配置</h2><p>尚未接入</p></section><section className="panel"><h2>全局扩展脚本</h2><p>尚未接入</p></section></div></>
+              {subscriptions.length ? <div className="subscription-grid">
+                {subscriptions.map(profile => <SubscriptionCard key={profile.id} profile={profile}
+                  pending={work.refreshStatus[profile.id]?.pending ?? false}
+                  error={work.refreshStatus[profile.id]?.error}
+                  refreshable={isTauri()}
+                  onRefresh={() => void work.refresh(profile.id).catch(() => {})}
+                  onBrowse={() => { setSubscriptionFilter(profile.id); setSearch(""); setPage("节点"); }}
+                  onRename={name => void saveSettings(state => ({ ...state, subscriptions:
+                    state.subscriptions.map(item => item.id === profile.id ? { ...item, name } : item) }))}
+                  onRemove={() => void saveSettings(state => {
+                    const remaining = state.subscriptions.filter(item => item.id !== profile.id);
+                    return { ...state, subscriptions: remaining, selected: preferredNode(remaining, state.selected) };
+                  })}
+                />)}
+              </div> : <p className="empty">{work.ready ? "尚未导入订阅" : "等待本地订阅读取"}</p>}
+            </section>
           )}
           {page === "测试" && <UnlockTests />}
           {page === "连接" && <ConnectionMonitor telemetry={telemetry} running={running} />}
           {page === "日志" && <section className="panel"><h2>内核日志</h2><p className="empty">日志查看尚未接入。</p></section>}
           {page === "规则" && (
-            <RulesEditor rules={rules} onChange={setRules} running={running} />
+            <RulesEditor rules={rules} onChange={edit => void saveSettings(state => ({ ...state, rules: edit(state.rules) }))} running={running} />
           )}
           {page === "诊断" && (
             <section className="panel">
@@ -670,7 +658,7 @@ function App() {
         </main>
       </div>
       {dialog && (
-        <div className="overlay" onMouseDown={() => !busy && setDialog(false)}>
+        <div className="overlay" onMouseDown={() => !importing && setDialog(false)}>
           <div
             className="modal"
             role="dialog"
@@ -689,7 +677,7 @@ function App() {
               <button
                 className="icon-button"
                 aria-label="关闭"
-                disabled={busy}
+                disabled={importing}
                 onClick={() => setDialog(false)}
               >
                 <X size={18} />
@@ -712,13 +700,13 @@ function App() {
               }}
             />
             <div className="modal-actions">
-              <button disabled={busy} onClick={() => file.current?.click()}>
+              <button disabled={importing} onClick={() => file.current?.click()}>
                 <Upload size={16} />
                 选择文件
               </button>
               <span className="error">{error}</span>
-              <button className="primary" disabled={busy} onClick={add}>
-                {busy ? "正在导入…" : "解析并导入"}
+              <button className="primary" disabled={importing || !work.ready} onClick={add}>
+                {importing ? "正在导入…" : "解析并导入"}
               </button>
             </div>
             <p className="privacy">
@@ -744,12 +732,13 @@ function RulesEditor({
   running,
 }: {
   rules: RouteRule[];
-  onChange: (rules: RouteRule[]) => void;
+  onChange: (edit: (rules: RouteRule[]) => RouteRule[]) => void;
   running: boolean;
 }) {
   const [type, setType] = useState<RouteRule["type"]>("domain_suffix");
   const [action, setAction] = useState<RouteRule["action"]>("direct");
   const [value, setValue] = useState("");
+  const [validationError, setValidationError] = useState("");
   return (
     <section className="panel">
       <div className="panel-head">
@@ -757,7 +746,7 @@ function RulesEditor({
       </div>
       <p className="rule-hint">
         按顺序匹配，未命中时使用当前节点。
-        {running ? "修改将在重新连接后生效。" : ""}规则仅保留到应用退出。
+        {running ? "修改将在重新连接后生效。" : ""}
       </p>
       <div className="rule-form">
         <select
@@ -772,7 +761,7 @@ function RulesEditor({
           aria-label="规则内容"
           placeholder="example.com"
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => { setValue(e.target.value); setValidationError(""); }}
         />
         <select
           aria-label="规则动作"
@@ -786,13 +775,20 @@ function RulesEditor({
         <button
           disabled={!value.trim()}
           onClick={() => {
-            onChange([...rules, { type, value: value.trim(), action }]);
-            setValue("");
+            try {
+              const domain = normalizeRuleDomain(value);
+              onChange(current => [...current, { type, value: domain, action }]);
+              setValue("");
+              setValidationError("");
+            } catch (error) {
+              setValidationError(error instanceof Error ? error.message : "规则格式有误");
+            }
           }}
         >
           添加
         </button>
       </div>
+      {validationError && <p className="error" role="alert">{validationError}</p>}
       {rules.map((rule, index) => (
         <div className="env-row" key={index}>
           <span>
@@ -800,7 +796,7 @@ function RulesEditor({
           </span>
           <button
             className="link"
-            onClick={() => onChange(rules.filter((_, i) => i !== index))}
+            onClick={() => onChange(current => current.filter(item => item !== rule))}
           >
             删除
           </button>

@@ -103,7 +103,7 @@ export function useTelemetry(running: boolean): Telemetry {
   return running ? telemetry : idle;
 }
 
-function formatBytes(bytes?: number | null, rate = false): string {
+export function formatBytes(bytes?: number | null, rate = false): string {
   if (bytes == null) return "—";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   const exponent = Math.min(units.length - 1, Math.floor(Math.log2(Math.max(1, bytes)) / 10));

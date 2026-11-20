@@ -40,7 +40,11 @@ impl Controller {
         });
     }
 
-    pub async fn snapshot(&self) -> Result<Snapshot, String> {
+    fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
         let client = CLIENT
             .get_or_init(|| {
                 reqwest::Client::builder()
@@ -51,9 +55,28 @@ impl Controller {
             })
             .as_ref()
             .map_err(|_| "无法初始化内核监控")?;
-        let mut response = client
-            .get(format!("http://127.0.0.1:{}/connections", self.port))
-            .bearer_auth(self.secret.to_string())
+        Ok(client
+            .request(method, format!("http://127.0.0.1:{}{path}", self.port))
+            .bearer_auth(self.secret.to_string()))
+    }
+
+    pub async fn switch(&self, tag: &str) -> Result<(), String> {
+        let response = self
+            .request(reqwest::Method::PUT, "/proxies/proxy")?
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(json!({ "name": tag }).to_string())
+            .send()
+            .await
+            .map_err(|_| "连接内核控制接口失败")?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Err("内核未接受节点切换".into())
+    }
+
+    pub async fn snapshot(&self) -> Result<Snapshot, String> {
+        let mut response = self
+            .request(reqwest::Method::GET, "/connections")?
             .send()
             .await
             .map_err(|_| "内核监控暂时不可用")?

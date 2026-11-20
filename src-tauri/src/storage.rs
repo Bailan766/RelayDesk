@@ -4,7 +4,9 @@ use tauri::Manager;
 use winapi::um::{dpapi::{CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN}, winbase::LocalFree, wincrypt::DATA_BLOB};
 
 fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
-    if input.len() > 8 * 1024 * 1024 { return Err("订阅数据过大".into()); }
+    const LIMIT: usize = 32 * 1024 * 1024;
+    let limit = if encrypt { LIMIT } else { LIMIT + 64 * 1024 };
+    if input.len() > limit { return Err("订阅和规则数据过大".into()); }
     let mut source = DATA_BLOB { cbData: input.len() as u32, pbData: input.as_ptr() as *mut u8 };
     let mut output = DATA_BLOB { cbData: 0, pbData: ptr::null_mut() };
     let ok = unsafe {
@@ -71,7 +73,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE subscription (id INTEGER PRIMARY KEY CHECK(id = 1), encrypted BLOB NOT NULL)").unwrap();
         store(&conn, "previous-secret").unwrap();
-        assert!(store(&conn, &"x".repeat(8 * 1024 * 1024 + 1)).is_err());
+        assert!(store(&conn, &"x".repeat(32 * 1024 * 1024 + 1)).is_err());
         let encrypted: Vec<u8> = conn.query_row("SELECT encrypted FROM subscription WHERE id=1", [], |row| row.get(0)).unwrap();
         assert!(!encrypted.windows(15).any(|part| part == b"previous-secret"));
         assert_eq!(transform(&encrypted, false).unwrap(), b"previous-secret");

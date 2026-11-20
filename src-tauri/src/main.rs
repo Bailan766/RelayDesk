@@ -188,6 +188,28 @@ fn allocate_port() -> Result<u16, String> {
 }
 
 #[tauri::command]
+async fn validate_proxy_config(config: serde_json::Value) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut check = core_command(&core_path()?)
+            .args(["check", "-c", "stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| "无法启动配置检查")?;
+        let content = serde_json::to_vec(&config).map_err(|_| "代理配置无效")?;
+        let written = check
+            .stdin
+            .take()
+            .is_some_and(|mut input| input.write_all(&content).is_ok());
+        let status = check.wait().map_err(|_| "无法完成配置检查")?;
+        Ok(written && status.success())
+    })
+    .await
+    .map_err(|_| "配置检查异常".to_string())?
+}
+
+#[tauri::command]
 async fn start_proxy(
     config: serde_json::Value,
     mode: Option<String>,
@@ -251,6 +273,25 @@ fn proxy_running(state: tauri::State<'_, ProxyState>) -> bool {
 }
 
 #[tauri::command]
+async fn switch_proxy_node(tag: String, state: tauri::State<'_, ProxyState>) -> Result<(), String> {
+    if !tag
+        .strip_prefix("node-")
+        .is_some_and(|index| index.parse::<usize>().is_ok_and(|number| number < 2048))
+    {
+        return Err("节点标识无效".into());
+    }
+    let controller = {
+        let active = state.0.lock().map_err(|_| "代理状态不可用")?;
+        active
+            .as_ref()
+            .filter(|session| session.running())
+            .map(|session| session.controller.clone())
+            .ok_or("代理内核未运行")?
+    };
+    controller.switch(&tag).await
+}
+
+#[tauri::command]
 async fn proxy_telemetry(
     state: tauri::State<'_, ProxyState>,
 ) -> Result<Option<telemetry::SessionSnapshot>, String> {
@@ -303,8 +344,47 @@ async fn check_connection(port: u16, state: tauri::State<'_, ProxyState>) -> Res
     Ok(started.elapsed().as_millis())
 }
 
+#[derive(Default, serde::Serialize)]
+struct SubscriptionUsage {
+    upload: Option<u64>,
+    download: Option<u64>,
+    total: Option<u64>,
+    expire: Option<u64>,
+}
+
+fn subscription_usage(headers: &reqwest::header::HeaderMap) -> Option<SubscriptionUsage> {
+    let value = headers.get("subscription-userinfo")?.to_str().ok()?;
+    let mut usage = SubscriptionUsage::default();
+    for (name, raw) in value.split(';').filter_map(|field| field.split_once('=')) {
+        let Ok(amount) = raw.trim().parse::<u64>() else {
+            continue;
+        };
+        if amount > 9_007_199_254_740_991 {
+            continue;
+        }
+        match name.trim().to_ascii_lowercase().as_str() {
+            "upload" => usage.upload = Some(amount),
+            "download" => usage.download = Some(amount),
+            "total" => usage.total = Some(amount),
+            "expire" => usage.expire = Some(amount),
+            _ => (),
+        }
+    }
+    (usage.upload.is_some()
+        || usage.download.is_some()
+        || usage.total.is_some()
+        || usage.expire.is_some())
+    .then_some(usage)
+}
+
+#[derive(serde::Serialize)]
+struct SubscriptionDownload {
+    content: String,
+    usage: Option<SubscriptionUsage>,
+}
+
 #[tauri::command]
-async fn fetch_subscription(address: String) -> Result<String, String> {
+async fn fetch_subscription(address: String) -> Result<SubscriptionDownload, String> {
     let parsed = url::Url::parse(&address).map_err(|_| "订阅地址无效")?;
     if parsed.scheme() != "https"
         || parsed.host_str().is_none()
@@ -315,16 +395,32 @@ async fn fetch_subscription(address: String) -> Result<String, String> {
     }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let target = attempt.url();
+            if attempt.previous().len() > 3
+                || target.scheme() != "https"
+                || !target.username().is_empty()
+                || target.password().is_some()
+            {
+                attempt.error("invalid subscription redirect")
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|_| "无法初始化网络请求")?;
     let mut response = client
         .get(parsed)
         .send()
         .await
-        .map_err(|_| "订阅请求失败，请检查网络")?
-        .error_for_status()
-        .map_err(|_| "订阅服务器返回错误状态")?;
+        .map_err(|_| "订阅请求失败，请检查网络")?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "订阅服务器返回 HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let usage = subscription_usage(response.headers());
     const LIMIT: usize = 4 * 1024 * 1024;
     if response
         .content_length()
@@ -339,7 +435,8 @@ async fn fetch_subscription(address: String) -> Result<String, String> {
         }
         data.extend_from_slice(&chunk);
     }
-    String::from_utf8(data).map_err(|_| "订阅内容不是 UTF-8 文本".into())
+    let content = String::from_utf8(data).map_err(|_| "订阅内容不是 UTF-8 文本")?;
+    Ok(SubscriptionDownload { content, usage })
 }
 
 fn main() {
@@ -396,9 +493,11 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             fetch_subscription,
             allocate_port,
+            validate_proxy_config,
             start_proxy,
             stop_proxy,
             proxy_running,
+            switch_proxy_node,
             proxy_telemetry,
             check_connection,
             probe_node,

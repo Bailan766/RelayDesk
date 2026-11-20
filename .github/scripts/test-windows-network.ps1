@@ -86,7 +86,9 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
             config = @{
                 inbounds = @(@{type='mixed'; tag='local'; listen='127.0.0.1'; listen_port=$port})
                 outbounds = @(
-                    @{type='vless'; tag='proxy'; server='127.0.0.1'; server_port=9; uuid='00000000-0000-4000-8000-000000000000'}
+                    @{type='selector'; tag='proxy'; outbounds=@('node-0','node-1'); default='node-0'; interrupt_exist_connections=$false}
+                    @{type='vless'; tag='node-0'; server='127.0.0.1'; server_port=9; uuid='00000000-0000-4000-8000-000000000000'}
+                    @{type='vless'; tag='node-1'; server='127.0.0.1'; server_port=10; uuid='00000000-0000-4000-8000-000000000000'}
                     @{type='direct'; tag='direct'}
                 )
                 route = @{rules=@(); final=$outbound; auto_detect_interface=$true}
@@ -118,6 +120,11 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
         $snapshot = Invoke-RestMethod -Uri $url -NoProxy -TimeoutSec 3 -Headers $headers
         if ($null -eq $snapshot.uploadTotal -or $null -eq $snapshot.downloadTotal -or $null -eq $snapshot.connections) {
             throw 'The authenticated controller did not return traffic counters and connections'
+        }
+        $selector = "http://127.0.0.1:$controllerPort/proxies/proxy"
+        [void](Invoke-RestMethod -Method Put -Uri $selector -NoProxy -TimeoutSec 3 -Headers $headers -ContentType 'application/json' -Body '{"name":"node-1"}')
+        if ((Invoke-RestMethod -Uri $selector -NoProxy -TimeoutSec 3 -Headers $headers).now -ne 'node-1') {
+            throw 'The installed core did not switch outbound on the running selector'
         }
         if ($Mode -eq 'local') { Test-ConnectionCounters $url $headers $port }
         if ($SimulateCrash) {

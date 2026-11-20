@@ -109,17 +109,7 @@ fn checked_object<'a>(
         .filter(|map| map.keys().all(|key| allowed.contains(&key.as_str())))
 }
 
-// The elevated worker accepts only the fields our own compiler emits. Inbound,
-// DNS, interface and route behavior are constructed locally, not supplied by IPC.
-fn tun_config(config: &Value, port: u16) -> Option<Value> {
-    let root = checked_object(config, &["log", "inbounds", "outbounds", "route"])?;
-    let outbounds = root.get("outbounds")?.as_array()?;
-    let [node, direct] = outbounds.as_slice() else {
-        return None;
-    };
-    if *direct != json!({"type":"direct","tag":"direct"}) {
-        return None;
-    }
+fn validate_node(node: &Value, tag: &str) -> Option<()> {
     let node = checked_object(
         node,
         &[
@@ -136,7 +126,7 @@ fn tun_config(config: &Value, port: u16) -> Option<Value> {
         ],
     )?;
     if !matches!(node.get("type")?.as_str(), Some("vless" | "hysteria2"))
-        || node.get("tag")?.as_str()? != "proxy"
+        || node.get("tag")?.as_str()? != tag
     {
         return None;
     }
@@ -204,6 +194,55 @@ fn tun_config(config: &Value, port: u16) -> Option<Value> {
             return None;
         }
     }
+    Some(())
+}
+
+fn validate_outbounds(outbounds: &[Value]) -> Option<()> {
+    let (direct, group) = outbounds.split_last()?;
+    if *direct != json!({"type":"direct","tag":"direct"}) {
+        return None;
+    }
+    if let [node] = group {
+        return validate_node(node, "proxy");
+    }
+    let (selector, nodes) = group.split_first()?;
+    let selector = checked_object(
+        selector,
+        &[
+            "type",
+            "tag",
+            "outbounds",
+            "default",
+            "interrupt_exist_connections",
+        ],
+    )?;
+    if selector.get("type")?.as_str()? != "selector"
+        || selector.get("tag")?.as_str()? != "proxy"
+        || selector.get("interrupt_exist_connections")?.as_bool()?
+        || nodes.len() > 2048
+    {
+        return None;
+    }
+    let tags = selector.get("outbounds")?.as_array()?;
+    let default = selector.get("default")?.as_str()?;
+    if tags.len() != nodes.len() || !tags.iter().any(|tag| tag.as_str() == Some(default)) {
+        return None;
+    }
+    for (index, (tag, node)) in tags.iter().zip(nodes).enumerate() {
+        let expected = format!("node-{index}");
+        if tag.as_str()? != expected {
+            return None;
+        }
+        validate_node(node, &expected)?;
+    }
+    Some(())
+}
+
+// The elevated worker constructs its own inbound, DNS and interface settings.
+fn tun_config(config: &Value, port: u16) -> Option<Value> {
+    let root = checked_object(config, &["log", "inbounds", "outbounds", "route"])?;
+    let outbounds = root.get("outbounds")?.as_array()?;
+    validate_outbounds(outbounds)?;
     let route = checked_object(
         root.get("route")?,
         &["rules", "final", "auto_detect_interface"],
