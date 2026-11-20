@@ -248,6 +248,14 @@ pub struct Session {
     worker: Handle,
     stop: Handle,
     pub port: u16,
+    pub controller: crate::telemetry::Controller,
+    pub id: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct WorkerInput {
+    config: Value,
+    controller: crate::telemetry::Controller,
 }
 
 impl Session {
@@ -275,9 +283,14 @@ impl Session {
         })?;
         let path = directory.join(format!("{token}.json"));
         let _cleanup = crate::TemporaryConfig(path.clone());
+        let controller = crate::telemetry::Controller::new(port)?;
+        let input = WorkerInput {
+            config,
+            controller: controller.clone(),
+        };
         fs::write(
             &path,
-            serde_json::to_vec(&config).map_err(|_| "代理配置无效")?,
+            serde_json::to_vec(&input).map_err(|_| "代理配置无效")?,
         )
         .map_err(|_| "无法写入代理配置")?;
         let executable = wide(
@@ -309,6 +322,8 @@ impl Session {
             worker: Handle::new(info.hProcess)?,
             stop,
             port,
+            controller,
+            id: token,
         };
         let deadline = Instant::now() + APPLY_TIMEOUT;
         while Instant::now() < deadline {
@@ -413,10 +428,14 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     system_proxy::recover(&journal).map_err(|_| "恢复系统代理失败")?;
     let input = directory.join(format!("{token}.json"));
     let config = fs::read(input).map_err(|_| "无法读取内核配置")?;
-    let mut config: Value = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
+    let WorkerInput {
+        mut config,
+        controller,
+    } = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
     if mode == "tun" {
         config = tun_config(&config, port).ok_or("TUN 配置无效")?;
     }
+    controller.configure(&mut config);
     let core = core_path()?;
     let config = serde_json::to_vec(&config).map_err(|_| "内核配置无效")?;
     let job = job()?;

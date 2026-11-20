@@ -21,6 +21,27 @@ main { background: #f4f5f7; border: 0; border-radius: 0; margin: 0; padding: 24p
 .panel { padding: 18px; }
 .traffic-panel { margin-top: 16px; }
 .traffic-empty { height: 132px; background: #f7f9fb; border: 1px solid #edf0f3; display: grid; place-items: center; color: #596675; border-radius: 6px; }
+.traffic-up { color: #a65014; }
+.traffic-down { color: #096acb; }
+.traffic-legend { display: flex; gap: 16px; font-size: 12px; }
+.traffic-plot { display: grid; grid-template-columns: 6.5em minmax(0, 1fr); gap: 5px 10px; }
+.traffic-plot svg { display: block; width: 100%; height: 132px; }
+.traffic-plot path, .traffic-sidebar path { fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.traffic-guide { stroke: #e5eaf0; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.traffic-scale, .traffic-times { display: flex; justify-content: space-between; color: #596675; font-size: 11px; font-variant-numeric: tabular-nums; }
+.traffic-scale { flex-direction: column; align-items: flex-end; }
+.traffic-times { grid-column: 2; }
+.traffic-sidebar { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 12px 0 0; font-size: 11px; font-variant-numeric: tabular-nums; }
+.traffic-sidebar svg, .traffic-sidebar small { grid-column: 1 / -1; }
+.traffic-sidebar svg { display: block; width: 100%; height: 24px; }
+.traffic-sidebar small { color: #596675; }
+.connection-table { overflow-x: auto; }
+.connection-table table { width: 100%; min-width: 520px; border-collapse: collapse; text-align: left; font-size: 12px; table-layout: fixed; }
+.connection-table th, .connection-table td { border-bottom: 1px solid #edf0f3; padding: 9px 8px; vertical-align: top; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connection-table th { color: #596675; font-weight: 600; }
+.connection-table :is(th, td):nth-last-child(-n+2) { width: 7em; text-align: right; font-variant-numeric: tabular-nums; }
+.connection-table td strong, .connection-table td small { display: block; overflow: hidden; text-overflow: ellipsis; }
+.connection-table td small { margin-top: 3px; color: #596675; }
 .metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
 .metric { border: 1px solid #edf0f3; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 6px; color: #6b7685; }
 .metric strong { color: #202c38; font-size: 18px; }
@@ -52,5 +73,5 @@ main { background: #f4f5f7; border: 0; border-radius: 0; margin: 0; padding: 24p
 .connection-actions small { color: #576677; }
 .source-index { font-variant-numeric: tabular-nums; color: #096acb; }
 .probe-result { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@media(max-width:800px) { aside { width: 64px; } main { padding: 20px 16px; } .columns { grid-template-columns: 1fr; } .metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media(max-width:800px) { aside { width: 64px; } main { padding: 20px 16px; } .columns { grid-template-columns: 1fr; } .metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } .traffic-sidebar { display: none; } }
 @media(max-width:480px) { .site-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } .extension-grid { grid-template-columns: 1fr; } .toolbar { flex-wrap: wrap; gap: 10px; } }

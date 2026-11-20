@@ -12,6 +12,7 @@ use tauri::Manager;
 mod network;
 mod storage;
 mod system_proxy;
+mod telemetry;
 
 fn core_command(path: &std::path::Path) -> Command {
     let mut command = Command::new(path);
@@ -250,6 +251,34 @@ fn proxy_running(state: tauri::State<'_, ProxyState>) -> bool {
 }
 
 #[tauri::command]
+async fn proxy_telemetry(
+    state: tauri::State<'_, ProxyState>,
+) -> Result<Option<telemetry::SessionSnapshot>, String> {
+    let controller = || {
+        state
+            .0
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|session| session.running())
+            .map(|session| (session.id.clone(), session.controller.clone()))
+    };
+    let Some((session_id, active)) = controller() else {
+        return Ok(None);
+    };
+    let snapshot = active.snapshot().await;
+    if !controller().is_some_and(|(current, _)| current == session_id) {
+        return Ok(None);
+    }
+    snapshot.map(|snapshot| {
+        Some(telemetry::SessionSnapshot {
+            session_id,
+            snapshot,
+        })
+    })
+}
+
+#[tauri::command]
 async fn check_connection(port: u16, state: tauri::State<'_, ProxyState>) -> Result<u128, String> {
     if running_port(&state) != Some(port) {
         return Err("代理内核未运行".into());
@@ -370,6 +399,7 @@ fn main() {
             start_proxy,
             stop_proxy,
             proxy_running,
+            proxy_telemetry,
             check_connection,
             probe_node,
             check_exit_ip,

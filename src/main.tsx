@@ -4,7 +4,6 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   Activity,
   Boxes,
-  CircleHelp,
   Cat,
   Link2,
   List,
@@ -25,6 +24,7 @@ import {
   type NodeProfile,
 } from "./subscription";
 import { buildConfig, connectionSupport, type RouteRule } from "./config";
+import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
 import "./style.css";
 import "./accessibility.css";
 import "./rules.css";
@@ -60,6 +60,7 @@ function App() {
   const [search, setSearch] = useState("");
   const file = useRef<HTMLInputElement>(null);
   const [running, setRunning] = useState(false);
+  const telemetry = useTelemetry(running);
   const [mode, setMode] = useState<EntryMode>("system");
   const [port, setPort] = useState<number>();
   const [connectionError, setConnectionError] = useState("");
@@ -346,10 +347,7 @@ function App() {
             </button>
           ))}
         </nav>
-        <div className="side-bottom">
-          <CircleHelp size={16} />
-          <div>实时流量未接入<small>↑ —　↓ —</small></div>
-        </div>
+        <TrafficSidebar telemetry={telemetry} />
       </aside>
       <div className="workspace">
         <header>
@@ -430,7 +428,7 @@ function App() {
                   </button>
                 </div>
               </section>
-              <TrafficDashboard />
+              <TrafficDashboard telemetry={telemetry} />
               <div className="stats">
                 <div>
                   <span>当前节点</span>
@@ -445,16 +443,6 @@ function App() {
                   <span>代理模式</span>
                   <strong>{entryModes.find((entry) => entry.value === mode)?.label}</strong>
                   <small>HTTP / SOCKS5</small>
-                </div>
-                <div>
-                  <span>本次上传</span>
-                  <strong>—</strong>
-                  <small>暂无流量数据</small>
-                </div>
-                <div>
-                  <span>本次下载</span>
-                  <strong>—</strong>
-                  <small>暂无流量数据</small>
                 </div>
               </div>
               <div className="columns">
@@ -642,7 +630,7 @@ function App() {
             </section><div className="extension-grid"><section className="panel"><h2>全局扩展覆写配置</h2><p>尚未接入</p></section><section className="panel"><h2>全局扩展脚本</h2><p>尚未接入</p></section></div></>
           )}
           {page === "测试" && <UnlockTests />}
-          {page === "连接" && <section className="panel"><h2>连接监控</h2><p className="empty">连接列表尚未接入。</p></section>}
+          {page === "连接" && <ConnectionMonitor telemetry={telemetry} running={running} />}
           {page === "日志" && <section className="panel"><h2>内核日志</h2><p className="empty">日志查看尚未接入。</p></section>}
           {page === "规则" && (
             <RulesEditor rules={rules} onChange={setRules} running={running} />
@@ -742,10 +730,6 @@ function App() {
       )}
     </div>
   );
-}
-function TrafficDashboard() {
-  const metrics = ["上传速度", "下载速度", "活跃连接", "上传量", "下载量", "内核占用"];
-  return <section className="panel traffic-panel"><div className="panel-head"><h2>流量统计</h2><span className="muted">上传 / 下载</span></div><div className="traffic-empty"><span>实时流量数据尚未接入</span></div><div className="metric-grid">{metrics.map(label => <div className="metric" key={label}><span>{label}</span><strong>—</strong></div>)}</div></section>;
 }
 function UnlockTests() {
   const services = ["哔哩哔哩大陆", "哔哩哔哩港澳台", "Bahamut Anime", "ChatGPT iOS", "ChatGPT Web", "Claude", "Disney+", "Gemini", "Netflix", "Prime Video", "Spotify", "TikTok", "YouTube Premium"];
