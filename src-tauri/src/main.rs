@@ -2,6 +2,17 @@
 use std::{fs, io::Write, net::{TcpListener, TcpStream}, path::PathBuf, process::{Child, Command, Stdio}, sync::Mutex, time::Duration};
 use tauri::Manager;
 
+fn core_command(path: &std::path::Path) -> Command {
+    let mut command = Command::new(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 #[derive(Default)]
 struct ProxyState(Mutex<Option<Child>>);
 
@@ -23,8 +34,8 @@ async fn probe_node(config: serde_json::Value, port: u16) -> Result<u64, String>
     let _temporary_config = TemporaryConfig(path.clone());
     let result = (|| -> Result<ProbeProcess, String> {
         let core = core_path()?;
-        if !Command::new(&core).args(["check", "-c"]).arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|_| "无法检查配置")?.success() { return Err("节点配置未通过内核检查".into()); }
-        let child = Command::new(core).args(["run", "-c"]).arg(&path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_| "无法启动测速内核")?;
+        if !core_command(&core).args(["check", "-c"]).arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|_| "无法检查配置")?.success() { return Err("节点配置未通过内核检查".into()); }
+        let child = core_command(&core).args(["run", "-c"]).arg(&path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_| "无法启动测速内核")?;
         Ok(ProbeProcess(child))
     })();
     let mut process = result?;
@@ -81,9 +92,9 @@ fn start_proxy(config: serde_json::Value, state: tauri::State<'_, ProxyState>) -
         file.write_all(serde_json::to_string(&config).map_err(|_| "配置无效")?.as_bytes()).map_err(|_| "无法写入配置")?;
         drop(file);
         let core = core_path()?;
-        let check = Command::new(&core).args(["check", "-c"]).arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|_| "无法启动内核检查")?;
+        let check = core_command(&core).args(["check", "-c"]).arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|_| "无法启动内核检查")?;
         if !check.success() { return Err("节点配置未通过内核检查".into()); }
-        let mut process = Command::new(core).args(["run", "-c"]).arg(&path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_| "无法启动内核")?;
+        let mut process = core_command(&core).args(["run", "-c"]).arg(&path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_| "无法启动内核")?;
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
         for _ in 0..50 {
             if process.try_wait().map_err(|_| "无法检查内核进程")?.is_some() { return Err("内核启动失败".into()) }
