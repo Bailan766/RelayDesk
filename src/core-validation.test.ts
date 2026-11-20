@@ -17,7 +17,10 @@ describe.skipIf(!core)('real sing-box config validation', () => {
     const folder = mkdtempSync(join(tmpdir(), 'relaydesk-test-'));
     try {
       const configPath = join(folder, 'config.json');
-      writeFileSync(configPath, JSON.stringify(buildConfig(parseSubscription(example).nodes[0], 32123)));
+      writeFileSync(configPath, JSON.stringify(buildConfig(parseSubscription(example).nodes[0], 32123, [
+        { type: 'domain', value: 'example.com', action: 'direct' },
+        { type: 'domain_suffix', value: 'blocked.test', action: 'reject' },
+      ])));
       const result = spawnSync(core!, ['check', '-c', configPath], { encoding: 'utf8' });
       expect(result.status, result.stderr).toBe(0);
     } finally { rmSync(folder, { recursive: true, force: true }); }

@@ -1,6 +1,8 @@
 name: Windows build
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   pull_request:
@@ -49,6 +51,15 @@ jobs:
           Copy-Item THIRD_PARTY_NOTICES.md release/
           Compress-Archive -Path release/* -DestinationPath relaydesk-windows-x64-portable.zip
           Copy-Item src-tauri/target/release/bundle/nsis/*-setup.exe relaydesk-windows-x64-setup.exe
+      - name: Smoke test installer
+        shell: pwsh
+        run: |
+          $install = Join-Path $env:RUNNER_TEMP 'RelayDeskSmoke'
+          $setup = Start-Process -FilePath (Resolve-Path relaydesk-windows-x64-setup.exe) -ArgumentList '/S', "/D=$install" -Wait -PassThru
+          if ($setup.ExitCode -ne 0) { throw "Installer failed: $($setup.ExitCode)" }
+          foreach ($name in @('relaydesk.exe', 'sing-box.exe', 'THIRD-PARTY-SING-BOX-LICENSE.txt')) {
+            if (-not (Test-Path (Join-Path $install $name))) { throw "Missing installed file: $name" }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: relaydesk-windows-x64
