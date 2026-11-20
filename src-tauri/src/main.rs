@@ -455,6 +455,7 @@ fn main() {
             tray.build(app)?;
             let handle = app.handle().clone();
             std::thread::spawn(move || ProxyState::run(handle));
+            tauri::async_runtime::spawn(ProxyState::watch_core_logs(app.handle().clone()));
             Ok(())
         })
         .on_window_event(|window, event| {

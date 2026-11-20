@@ -246,6 +246,60 @@ impl Supervisor {
         Ok(slot.events.iter().cloned().collect())
     }
 
+    pub async fn watch_core_logs(app: tauri::AppHandle) {
+        use tauri::Manager;
+        let state = app.state::<Self>();
+        while !state.closing.load(Ordering::Acquire) {
+            let current = || {
+                state.slot.try_lock().ok().and_then(|slot| {
+                    slot.active
+                        .as_ref()
+                        .filter(|active| active.session.running())
+                        .map(|active| active.session.id.clone())
+                })
+            };
+            let link = state.slot.try_lock().ok().and_then(|slot| {
+                slot.active
+                    .as_ref()
+                    .filter(|active| active.session.running())
+                    .map(|active| (active.session.id.clone(), active.session.controller.clone()))
+            });
+            if let Some((id, controller)) = link {
+                controller
+                    .stream_logs(
+                        || {
+                            !state.closing.load(Ordering::Acquire)
+                                && current().is_some_and(|current| current == id)
+                        },
+                        |level, message| {
+                            if let Ok(mut slot) = state.slot.try_lock() {
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let duplicate = slot
+                                    .events
+                                    .iter()
+                                    .rev()
+                                    .take_while(|entry| now.saturating_sub(entry.timestamp) < 5)
+                                    .any(|entry| entry.level == level && entry.message == message);
+                                if !duplicate
+                                    && slot
+                                        .active
+                                        .as_ref()
+                                        .is_some_and(|active| active.session.id == id)
+                                {
+                                    slot.record(level, message);
+                                }
+                            }
+                        },
+                    )
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+    }
+
     pub fn configure_recovery(&self, enabled: bool) -> Result<(), String> {
         let mut slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
         if let Some(active) = slot.active.as_mut() {

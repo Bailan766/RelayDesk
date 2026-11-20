@@ -8,6 +8,7 @@ use std::{
 };
 
 static CLIENT: OnceLock<Result<reqwest::Client, reqwest::Error>> = OnceLock::new();
+static LOG_CLIENT: OnceLock<Result<reqwest::Client, reqwest::Error>> = OnceLock::new();
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Controller {
@@ -151,6 +152,128 @@ impl Controller {
             data.extend_from_slice(&chunk);
         }
         serde_json::from_slice(&data).map_err(|_| "内核监控数据格式无效".into())
+    }
+
+    pub async fn stream_logs(
+        &self,
+        still_current: impl Fn() -> bool,
+        mut receive: impl FnMut(&'static str, &'static str),
+    ) {
+        let Ok(client) = LOG_CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(2))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+        }) else {
+            return;
+        };
+        let request = client
+            .get(format!("http://127.0.0.1:{}/logs?level=warn", self.port))
+            .bearer_auth(self.secret.to_string());
+        let Ok(Ok(mut response)) =
+            tokio::time::timeout(Duration::from_secs(45), request.send()).await
+        else {
+            return;
+        };
+        if !response.status().is_success() {
+            return;
+        }
+        let mut pending = Vec::new();
+        while still_current() {
+            match tokio::time::timeout(Duration::from_secs(4), response.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
+                    if pending.len() + chunk.len() > 64 * 1024 {
+                        return;
+                    }
+                    pending.extend_from_slice(&chunk);
+                    log_lines(&mut pending, &mut receive);
+                }
+                Ok(_) => return,
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CoreLog {
+    #[serde(rename = "type")]
+    level: String,
+    payload: String,
+}
+
+fn log_lines(buffer: &mut Vec<u8>, receive: &mut impl FnMut(&'static str, &'static str)) {
+    let Some(end) = buffer.iter().rposition(|byte| *byte == b'\n') else {
+        return;
+    };
+    for line in buffer
+        .drain(..=end)
+        .collect::<Vec<_>>()
+        .split(|byte| *byte == b'\n')
+    {
+        let Ok(entry) = serde_json::from_slice::<CoreLog>(line) else {
+            continue;
+        };
+        let level = match entry.level.as_str() {
+            "error" | "fatal" | "panic" => "error",
+            "warning" | "warn" => "warn",
+            _ => continue,
+        };
+        let payload = entry.payload.to_ascii_lowercase();
+        let message = if payload.contains("certificate")
+            || payload.contains("tls handshake")
+            || payload.contains("x509")
+        {
+            "内核报告 TLS 握手或证书校验异常"
+        } else if payload.contains("authentication") || payload.contains("invalid password") {
+            "内核报告代理认证异常"
+        } else if payload.contains("dns:")
+            || payload.contains("lookup ")
+            || payload.contains("resolve domain")
+        {
+            "内核报告 DNS 请求异常"
+        } else if payload.contains("wintun") || payload.contains("inbound/tun") {
+            "内核报告 TUN 网卡或路由异常"
+        } else if payload.contains("timeout")
+            || payload.contains("deadline exceeded")
+            || payload.contains("context deadline")
+        {
+            "内核报告请求超时"
+        } else if payload.contains("connect") || payload.contains("dial ") {
+            "内核报告连接异常"
+        } else {
+            "内核报告网络处理异常"
+        };
+        receive(level, message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_split_records_and_discards_all_remote_text() {
+        let mut buffer =
+            b"{\"type\":\"error\",\"payload\":\"TLS handshake for secret.example".to_vec();
+        let mut events = Vec::new();
+        super::log_lines(&mut buffer, &mut |level, message| {
+            events.push((level, message))
+        });
+        assert!(events.is_empty());
+        buffer.extend_from_slice(
+            b"\"}\n{\"type\":\"warn\",\"payload\":\"lookup private.example\"}\n",
+        );
+        super::log_lines(&mut buffer, &mut |level, message| {
+            events.push((level, message))
+        });
+        assert_eq!(
+            events,
+            [
+                ("error", "内核报告 TLS 握手或证书校验异常"),
+                ("warn", "内核报告 DNS 请求异常")
+            ]
+        );
+        assert!(buffer.is_empty());
     }
 }
 
