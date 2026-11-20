@@ -34,7 +34,7 @@ import "./dashboard.css";
 
 type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "诊断" | "设置";
 type Probe = { revision: string; label: string; milliseconds?: number };
-type ProxyStatus = { phase: "running" | "recovering" | "stopped" | "busy"; message: string | null };
+type ProxyStatus = { phase: "running" | "recovering" | "stopped" | "busy"; message: string | null; session_id: string | null };
 const entryModes: { value: EntryMode; label: string }[] = [
   { value: "system", label: "系统代理" },
   { value: "tun", label: "TUN" },
@@ -88,6 +88,9 @@ function App() {
   const [connectionError, setConnectionError] = useState("");
   const [checkResult, setCheckResult] = useState("");
   const [checking, setChecking] = useState(false);
+  const diagnosticsEpoch = useRef(0);
+  const [diagnosticsVersion, setDiagnosticsVersion] = useState(0);
+  const confirmedSession = useRef<string | null>(null);
   const [latencies, setLatencies] = useState<Record<string, Probe>>({});
   const [testing, setTesting] = useState(false);
   const [exitIp, setExitIp] = useState("");
@@ -103,16 +106,23 @@ function App() {
       setSettingsError(typeof error === "string" ? error : error instanceof Error ? error.message : "设置保存失败");
     }
   }
+  function resetDiagnostics() {
+    diagnosticsEpoch.current += 1;
+    setDiagnosticsVersion(diagnosticsEpoch.current);
+    setChecking(false);
+    setExitIp("");
+    setCheckResult("");
+  }
   function clearSession() {
     session.current = undefined;
+    confirmedSession.current = null;
     setRunning(false);
     setRecovering(false);
     setRecoveryMessage("");
     setRunningNode(undefined);
     setLiveRouting(undefined);
     setPort(undefined);
-    setExitIp("");
-    setCheckResult("");
+    resetDiagnostics();
   }
   useEffect(() => {
     if (!isTauri() || busy || !running) return;
@@ -123,11 +133,15 @@ function App() {
         const status = await invoke<ProxyStatus>("proxy_status");
         if (cancelled || status.phase === "busy") return;
         if (status.phase === "stopped") clearSession();
+        if (status.phase === "running" && status.session_id) {
+          if (confirmedSession.current && confirmedSession.current !== status.session_id) resetDiagnostics();
+          confirmedSession.current = status.session_id;
+        }
         setRecovering(status.phase === "recovering");
         setRecoveryMessage(status.message ?? "");
-        if (status.phase === "recovering") {
-          setCheckResult("");
-          setExitIp("");
+        if (status.phase === "recovering" && confirmedSession.current) {
+          confirmedSession.current = null;
+          resetDiagnostics();
         }
       } catch {
         // A transient IPC failure leaves the last confirmed status visible.
@@ -184,16 +198,17 @@ function App() {
     ? runningNode?.id === node.id && nodeRevision(runningNode) === nodeRevision(node)
     : node.id === selected;
   async function checkProxy() {
-    if (!port) return;
+    if (!port || busy || recovering) return;
+    const epoch = diagnosticsEpoch.current;
     setChecking(true);
     setCheckResult("");
     try {
       const ms = await invoke<number>("check_connection", { port });
-      setCheckResult(`当前路由可达 · ${ms} ms`);
+      if (epoch === diagnosticsEpoch.current) setCheckResult(`当前路由可达 · ${ms} ms`);
     } catch (e) {
-      setCheckResult(typeof e === "string" ? e : "网络验证失败");
+      if (epoch === diagnosticsEpoch.current) setCheckResult(typeof e === "string" ? e : "网络验证失败");
     } finally {
-      setChecking(false);
+      if (epoch === diagnosticsEpoch.current) setChecking(false);
     }
   }
   async function prepareSession(node: NodeProfile, localPort: number): Promise<SessionPlan> {
@@ -213,8 +228,7 @@ function App() {
       if (running) {
         await invoke("set_routing_mode", { mode: value });
         setLiveRouting(value);
-        setCheckResult("");
-        setExitIp("");
+        resetDiagnostics();
       }
       await saveSettings(state => ({ ...state, routingMode: value }));
     } catch (error) {
@@ -235,8 +249,7 @@ function App() {
     }
     setBusy(true);
     setConnectionError("");
-    setCheckResult("");
-    setExitIp("");
+    resetDiagnostics();
     try {
       const loaded = previous.loaded.get(node.id);
       if (loaded && loaded.revision === nodeRevision(node)) {
@@ -247,6 +260,7 @@ function App() {
         return;
       }
       const next = await prepareSession(node, port);
+      confirmedSession.current = null;
       await invoke("stop_proxy");
       try {
         await invoke("start_proxy", { config: next.config, mode, routingMode, autoReconnect });
@@ -320,15 +334,17 @@ function App() {
     if (batch) void invoke("cancel_probe_batch", { batch }).catch(() => setConnectionError("无法取消正在运行的测速"));
   }
   async function showExitIp() {
-    if (!port) return;
+    if (!port || busy || recovering) return;
+    const epoch = diagnosticsEpoch.current;
     setChecking(true);
     setExitIp("查询中");
     try {
-      setExitIp(await invoke<string>("check_exit_ip", { port }));
+      const result = await invoke<string>("check_exit_ip", { port });
+      if (epoch === diagnosticsEpoch.current) setExitIp(result);
     } catch (e) {
-      setExitIp(typeof e === "string" ? e : "查询失败");
+      if (epoch === diagnosticsEpoch.current) setExitIp(typeof e === "string" ? e : "查询失败");
     } finally {
-      setChecking(false);
+      if (epoch === diagnosticsEpoch.current) setChecking(false);
     }
   }
   async function testLocalTcp() {
@@ -345,7 +361,7 @@ function App() {
   async function toggleProxy() {
     setBusy(true);
     setConnectionError("");
-    setCheckResult("");
+    resetDiagnostics();
     setRecoveryMessage("");
     try {
       if (!isTauri()) throw new Error("请在桌面应用中连接");
@@ -450,7 +466,7 @@ function App() {
                         {checkResult || "尚未验证远程连接"}{" "}
                         <button
                           className="link"
-                          disabled={checking}
+                          disabled={checking || busy}
                           onClick={checkProxy}
                         >
                           {checking ? "检查中…" : "检查连接"}
@@ -497,9 +513,9 @@ function App() {
                 </div>
               </div>
               <div className="columns">
-                <WebsiteChecks key={JSON.stringify([telemetry.snapshot?.sessionId, current?.id, routingMode])} port={running && !recovering ? port : undefined} />
+                <WebsiteChecks key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
                 <section className="panel">
-                  <div className="panel-head"><h2>当前路由出口 IP</h2><button className="link" disabled={!running || recovering || checking} onClick={showExitIp}>刷新</button></div>
+                  <div className="panel-head"><h2>当前路由出口 IP</h2><button className="link" disabled={!running || recovering || checking || busy} onClick={showExitIp}>刷新</button></div>
                   <div className="empty">{exitIp || (running ? "尚未检查出口 IP" : "连接后可检查出口 IP")}</div>
                 </section>
                 <section className="panel">
@@ -611,7 +627,7 @@ function App() {
                   当前路由出口 IP：{exitIp || "尚未检查"}{" "}
                   <button
                     className="link"
-                    disabled={checking}
+                    disabled={checking || busy || recovering}
                     onClick={showExitIp}
                   >
                     检查出口 IP

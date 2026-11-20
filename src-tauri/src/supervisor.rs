@@ -105,6 +105,7 @@ pub struct Supervisor {
 pub struct Status {
     phase: &'static str,
     message: Option<&'static str>,
+    session_id: Option<String>,
 }
 
 pub struct Link {
@@ -179,6 +180,7 @@ impl Supervisor {
             return Status {
                 phase: "busy",
                 message: None,
+                session_id: None,
             };
         };
         let phase = match &slot.active {
@@ -191,7 +193,16 @@ impl Supervisor {
         } else {
             slot.message
         };
-        Status { phase, message }
+        let session_id = slot
+            .active
+            .as_ref()
+            .filter(|_| phase == "running")
+            .map(|active| active.session.id.clone());
+        Status {
+            phase,
+            message,
+            session_id,
+        }
     }
 
     pub fn live(&self) -> Result<Option<Link>, String> {
