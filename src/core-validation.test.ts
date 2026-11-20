@@ -7,10 +7,19 @@ import { buildConfig } from './config';
 import { parseSubscription } from './subscription';
 
 const core = process.env.SING_BOX;
+const uuid = '00000000-0000-4000-8000-000000000000';
 describe.skipIf(!core)('real sing-box config validation', () => {
   const examples = [
     'vless://00000000-0000-4000-8000-000000000000@host.test:443?security=tls&sni=host.test&type=ws&path=%2Fws#ws',
     'hysteria2://password@host.test:443?sni=host.test&mport=2000-3000#hy',
+    'trojan://password@host.test:443?sni=tls.host.test&type=grpc&serviceName=fixture#trojan',
+    `vmess://${btoa(JSON.stringify({v:'2',ps:'VMess',add:'vmess.test',port:443,id:uuid,aid:0,net:'ws',type:'none',host:'cdn.test',path:'/test',tls:'tls',sni:'tls.test'}))}`,
+    `ss://${btoa('aes-128-gcm:password')}@host.test:8388#ss`,
+    `tuic://${uuid}:password@host.test:443?sni=tls.test&congestion_control=bbr&udp_relay_mode=quic#tuic`,
+    `proxies:\n- { name: node, type: vless, server: host.test, port: 443, uuid: ${uuid}, tls: true, servername: tls.test, network: ws, ws-opts: { path: /relay, headers: { Host: cdn.test } } }`,
+    JSON.stringify({outbounds: [{tag:'hy2',type:'hysteria2',server:'host.test',server_ports:['2000:4000'],
+      password:'password',tls:{enabled:true,server_name:'tls.test'},up_mbps:10,down_mbps:20,
+      obfs:{type:'salamander',password:'obfs-test'}}]}),
   ];
   for (const example of examples) it('accepts a generated configuration', () => {
     expect(existsSync(core!)).toBe(true);

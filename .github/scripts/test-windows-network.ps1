@@ -86,9 +86,14 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
             config = @{
                 inbounds = @(@{type='mixed'; tag='local'; listen='127.0.0.1'; listen_port=$port})
                 outbounds = @(
-                    @{type='selector'; tag='proxy'; outbounds=@('node-0','node-1'); default='node-0'; interrupt_exist_connections=$false}
+                    @{type='selector'; tag='proxy'; outbounds=@('node-0','node-1','node-2','node-3','node-4','node-5','node-6'); default='node-0'; interrupt_exist_connections=$false}
                     @{type='vless'; tag='node-0'; server='127.0.0.1'; server_port=9; uuid='00000000-0000-4000-8000-000000000000'}
                     @{type='vless'; tag='node-1'; server='127.0.0.1'; server_port=10; uuid='00000000-0000-4000-8000-000000000000'}
+                    @{type='vmess'; tag='node-2'; server='127.0.0.1'; server_port=9; security='auto'; alter_id=0; uuid='00000000-0000-4000-8000-000000000000'}
+                    @{type='trojan'; tag='node-3'; server='127.0.0.1'; server_port=9; password='fixture'; tls=@{enabled=$true}}
+                    @{type='shadowsocks'; tag='node-4'; server='127.0.0.1'; server_port=9; method='aes-128-gcm'; password='fixture'}
+                    @{type='hysteria2'; tag='node-5'; server='127.0.0.1'; server_ports=@('9:10'); password='fixture'; tls=@{enabled=$true}; obfs=@{type='salamander'; password='fixture-obfs'}}
+                    @{type='tuic'; tag='node-6'; server='127.0.0.1'; server_port=9; password='fixture'; uuid='00000000-0000-4000-8000-000000000000'; congestion_control='bbr'; tls=@{enabled=$true}}
                     @{type='direct'; tag='direct'}
                 )
                 route = @{rules=@(); final=$outbound; auto_detect_interface=$true}

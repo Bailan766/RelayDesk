@@ -36,4 +36,22 @@ describe('sing-box configuration', () => {
     const hy = parseSubscription('hysteria2://password@host.test:443?mport=3000-2000#Test').nodes[0];
     expect(() => buildConfig(hy, 12345)).toThrow('端口');
   });
+  it('preserves legacy Shadowsocks credentials and percent-encoded modern credentials', () => {
+    for (const uri of [`ss://${btoa('aes-128-gcm:a:@b@host.test:8388')}#legacy`,
+      'ss://aes-128-gcm:a%3A%40b@host.test:8388#sip002']) {
+      const outbound = buildConfig(parseSubscription(uri).nodes[0], 12345).outbounds[0];
+      expect(outbound).toMatchObject({ type: 'shadowsocks', method: 'aes-128-gcm', password: 'a:@b', server: 'host.test' });
+    }
+  });
+  it('preserves structured TLS hostname and transport, and flags certificate semantics it cannot preserve', () => {
+    const source = 'proxies:\n- {name: test, type: vless, server: example.org, port: 443, uuid: id, tls: true, servername: tls.test, network: ws, ws-opts: {path: /a, headers: {Host: edge.test}}}';
+    const node = parseSubscription(source).nodes[0];
+    expect(buildConfig(node, 12345).outbounds[0]).toMatchObject({
+      uuid: 'id', tls: { enabled: true, server_name: 'tls.test' },
+      transport: { type: 'ws', path: '/a', headers: { Host: 'edge.test' } },
+    });
+    const outbound = { type: 'trojan', server: 'test.example.org', server_port: 443, password: 'fixture',
+      tls: { enabled: true, certificate_path: 'fixture.pem' } };
+    expect(() => buildConfig(parseSubscription(JSON.stringify([outbound])).nodes[0], 12345)).toThrow('certificate_path');
+  });
 });

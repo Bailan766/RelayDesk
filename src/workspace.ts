@@ -1,5 +1,5 @@
 import { connectionSupport, type RouteRule } from "./config";
-import { parseSubscription, type ImportResult, type NodeProfile } from "./subscription";
+import { nodeRevision, parseSubscription, type ImportResult, type NodeProfile } from "./subscription";
 
 export type EntryMode = "system" | "tun" | "local";
 export type RoutingMode = "rule" | "global" | "direct";
@@ -52,10 +52,19 @@ function validUsage(value: unknown): Usage | null {
 
 function parseProfile({ id, content, ...profile }: Omit<Subscription, "parsed">): Subscription {
   const parsed = parseSubscription(content);
-  const nodes = parsed.nodes.map(node => ({
-    ...node,
-    id: JSON.stringify([id, node.protocol, node.name, node.server.toLowerCase(), node.port]),
-  }));
+  const keys = parsed.nodes.map(node => JSON.stringify([id, node.protocol, node.name, node.server.toLowerCase(), node.port]));
+  const counts = new Map<string, number>();
+  for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
+  const nodes = parsed.nodes.map((node, index) => {
+    const key = keys[index];
+    if (counts.get(key) === 1) return { ...node, id: key };
+    // Keep credentials out of the UI key while distinguishing otherwise identical endpoints.
+    let hash = 0xcbf29ce484222325n;
+    for (const unit of nodeRevision(node)) {
+      hash = BigInt.asUintN(64, (hash ^ BigInt(unit.codePointAt(0)!)) * 0x100000001b3n);
+    }
+    return { ...node, id: `${key}:${hash.toString(16)}` };
+  });
   return { ...profile, id, content, parsed: { ...parsed, nodes } };
 }
 
@@ -90,7 +99,14 @@ export function replaceSubscription(state: Workspace, profile: Subscription): Wo
   const subscriptions = old
     ? state.subscriptions.map(item => item.id === profile.id ? { ...profile, name: item.name } : item)
     : [...state.subscriptions, profile];
-  return { ...state, subscriptions, selected: preferredNode(subscriptions, state.selected) };
+  const matches = new Map(profile.parsed.nodes.map(node => [nodeRevision(node), node.id]));
+  const remapped = new Map(old?.parsed.nodes.flatMap(node => {
+    const successor = matches.get(nodeRevision(node));
+    return successor ? [[node.id, successor] as const] : [];
+  }));
+  const selection = state.selected ? remapped.get(state.selected) ?? state.selected : undefined;
+  const favorites = Array.from(new Set(state.favorites.map(id => remapped.get(id) ?? id)));
+  return { ...state, subscriptions, selected: preferredNode(subscriptions, selection), favorites };
 }
 
 function isRule(value: unknown): value is RouteRule {
@@ -113,13 +129,21 @@ export function deserializeWorkspace(raw: string): Workspace {
       updatedAt: null,
       usage: null,
     });
-    const selected: NodeProfile | undefined = Number.isInteger(saved.selected) ? profile.parsed.nodes[saved.selected] : undefined;
+    // Earlier clients indexed the first appearance of each display name and endpoint.
+    const seen = new Set<string>();
+    const legacyNodes = profile.parsed.nodes.filter(node => {
+      const endpoint = JSON.stringify([node.protocol, node.server, node.port, node.name]);
+      if (seen.has(endpoint)) return false;
+      seen.add(endpoint);
+      return true;
+    });
+    const selected: NodeProfile | undefined = Number.isInteger(saved.selected) ? legacyNodes[saved.selected] : undefined;
     return { ...emptyWorkspace, subscriptions: [profile], selected: preferredNode([profile], selected?.id) };
   }
   if (saved?.version !== 2 || !Array.isArray(saved.subscriptions) || !Array.isArray(saved.rules)
       || !saved.rules.every(isRule)) throw new Error("工作区数据格式无效");
   const ids = new Set<string>();
-  const subscriptions = saved.subscriptions.map((profile: Omit<Subscription, "parsed">) => {
+  const subscriptions: Subscription[] = saved.subscriptions.map((profile: Omit<Subscription, "parsed">) => {
     if (!profile || typeof profile.id !== "string" || !profile.id || ids.has(profile.id)
         || typeof profile.name !== "string" || typeof profile.source !== "string"
         || typeof profile.content !== "string") throw new Error("订阅记录无效");
@@ -130,15 +154,27 @@ export function deserializeWorkspace(raw: string): Workspace {
       usage: validUsage(profile.usage),
     });
   });
+  const known = new Set<string>();
+  const firstByLegacyKey = new Map<string, string>();
+  for (const profile of subscriptions) {
+    for (const node of profile.parsed.nodes) {
+      known.add(node.id);
+      for (const server of node.server.includes(":") ? [node.server, `[${node.server}]`] : [node.server]) {
+        const legacy = JSON.stringify([profile.id, node.protocol, node.name, server.toLowerCase(), node.port]);
+        if (!firstByLegacyKey.has(legacy)) firstByLegacyKey.set(legacy, node.id);
+      }
+    }
+  }
+  const recoverId = (id: string) => known.has(id) ? id : firstByLegacyKey.get(id) ?? id;
   return {
     subscriptions,
-    selected: preferredNode(subscriptions, saved.selected),
+    selected: preferredNode(subscriptions, typeof saved.selected === "string" ? recoverId(saved.selected) : undefined),
     rules: saved.rules,
     entryMode: saved.entryMode === "local" || saved.entryMode === "tun" ? saved.entryMode : "system",
     routingMode: saved.routingMode === "direct" || saved.routingMode === "global" ? saved.routingMode : "rule",
     refreshHours: [1, 6, 24].includes(saved.refreshHours) ? saved.refreshHours : 0,
     favorites: Array.isArray(saved.favorites)
-      ? [...new Set<string>(saved.favorites.filter((id: unknown): id is string => typeof id === "string"))]
+      ? [...new Set<string>(saved.favorites.filter((id: unknown): id is string => typeof id === "string").map(recoverId))]
       : [],
   };
 }

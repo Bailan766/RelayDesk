@@ -133,88 +133,170 @@ fn checked_object<'a>(
         .filter(|map| map.keys().all(|key| allowed.contains(&key.as_str())))
 }
 
-fn validate_node(node: &Value, tag: &str) -> Option<()> {
-    let node = checked_object(
-        node,
+fn string_list(value: &Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.iter().all(Value::is_string))
+}
+
+fn validate_tls(value: &Value) -> Option<()> {
+    let tls = checked_object(
+        value,
         &[
-            "type",
-            "tag",
-            "server",
-            "server_port",
-            "server_ports",
-            "uuid",
-            "flow",
-            "password",
-            "tls",
-            "transport",
+            "enabled",
+            "server_name",
+            "insecure",
+            "disable_sni",
+            "alpn",
+            "min_version",
+            "max_version",
+            "certificate_public_key_sha256",
+            "utls",
+            "reality",
         ],
     )?;
-    if !matches!(node.get("type")?.as_str(), Some("vless" | "hysteria2"))
-        || node.get("tag")?.as_str()? != tag
-    {
-        return None;
-    }
-    if node.iter().any(|(key, value)| match key.as_str() {
-        "tls" | "transport" => false,
-        "server_port" => !value.is_u64(),
-        "server_ports" => !value
-            .as_array()
-            .is_some_and(|items| items.iter().all(Value::is_string)),
-        _ => !value.is_string(),
-    }) {
-        return None;
-    }
-    if let Some(tls) = node.get("tls") {
-        let tls = checked_object(
-            tls,
-            &[
-                "enabled",
-                "server_name",
-                "insecure",
-                "alpn",
-                "utls",
-                "reality",
-            ],
-        )?;
-        for (key, value) in tls {
-            match key.as_str() {
-                "enabled" | "insecure" if value.is_boolean() => (),
-                "server_name" if value.is_string() => (),
-                "alpn"
-                    if value
-                        .as_array()
-                        .is_some_and(|items| items.iter().all(Value::is_string)) =>
-                {
-                    ()
-                }
-                "utls"
-                    if checked_object(value, &["enabled", "fingerprint"])
-                        .is_some_and(|m| m.values().all(|v| v.is_string() || v.is_boolean())) =>
-                {
-                    ()
-                }
-                "reality"
-                    if checked_object(value, &["enabled", "public_key", "short_id"])
-                        .is_some_and(|m| m.values().all(|v| v.is_string() || v.is_boolean())) =>
-                {
-                    ()
-                }
-                _ => return None,
+    for (key, value) in tls {
+        let valid = match key.as_str() {
+            "enabled" | "insecure" | "disable_sni" => value.is_boolean(),
+            "alpn" | "certificate_public_key_sha256" => string_list(value),
+            "utls" | "reality" => {
+                let allowed: &[&str] = if key == "utls" {
+                    &["enabled", "fingerprint"]
+                } else {
+                    &["enabled", "public_key", "short_id"]
+                };
+                checked_object(value, allowed).is_some_and(|fields| {
+                    fields.iter().all(|(key, value)| {
+                        if key == "enabled" {
+                            value.is_boolean()
+                        } else {
+                            value.is_string()
+                        }
+                    })
+                })
             }
-        }
-    }
-    if let Some(transport) = node.get("transport") {
-        let transport = checked_object(transport, &["type", "path", "service_name", "headers"])?;
-        if !matches!(transport.get("type")?.as_str(), Some("ws" | "grpc")) {
+            _ => value.is_string(),
+        };
+        if !valid {
             return None;
         }
-        if transport.iter().any(|(key, value)| {
-            if key == "headers" {
-                !checked_object(value, &["Host"]).is_some_and(|m| m.values().all(Value::is_string))
-            } else {
-                !value.is_string()
+    }
+    Some(())
+}
+
+fn validate_transport(value: &Value) -> Option<()> {
+    let allowed: &[&str] = match value.get("type")?.as_str()? {
+        "ws" => &[
+            "type",
+            "path",
+            "headers",
+            "max_early_data",
+            "early_data_header_name",
+        ],
+        "grpc" => &["type", "service_name"],
+        "httpupgrade" => &["type", "host", "path"],
+        _ => return None,
+    };
+    checked_object(value, allowed)?
+        .iter()
+        .all(|(key, value)| match key.as_str() {
+            "headers" => checked_object(value, &["Host"])
+                .is_some_and(|headers| headers.values().all(Value::is_string)),
+            "max_early_data" => value.is_u64(),
+            _ => value.is_string(),
+        })
+        .then_some(())
+}
+
+fn validate_node(node: &Value, tag: &str) -> Option<()> {
+    let fields = node.as_object()?;
+    let common = ["type", "tag", "server", "server_port", "network"];
+    let specific: &[&str] = match node.get("type")?.as_str()? {
+        "vless" => &["uuid", "flow", "packet_encoding", "transport", "tls"],
+        "vmess" => &[
+            "uuid",
+            "security",
+            "alter_id",
+            "global_padding",
+            "authenticated_length",
+            "packet_encoding",
+            "transport",
+            "tls",
+        ],
+        "trojan" => &["password", "transport", "tls"],
+        "shadowsocks" => &[
+            "method",
+            "password",
+            "plugin",
+            "plugin_opts",
+            "udp_over_tcp",
+        ],
+        "hysteria2" => &[
+            "password",
+            "server_ports",
+            "hop_interval",
+            "up_mbps",
+            "down_mbps",
+            "obfs",
+            "tls",
+        ],
+        "tuic" => &[
+            "uuid",
+            "password",
+            "congestion_control",
+            "udp_relay_mode",
+            "udp_over_stream",
+            "zero_rtt_handshake",
+            "heartbeat",
+            "tls",
+        ],
+        _ => return None,
+    };
+    if node.get("tag")?.as_str()? != tag || node.get("server")?.as_str()?.is_empty() {
+        return None;
+    }
+    for (key, value) in fields {
+        if !common.contains(&key.as_str()) && !specific.contains(&key.as_str()) {
+            return None;
+        }
+        let valid = match key.as_str() {
+            "tls" => validate_tls(value).is_some(),
+            "transport" => validate_transport(value).is_some(),
+            "server_ports" => string_list(value),
+            "network" => matches!(value.as_str(), Some("tcp" | "udp")),
+            "server_port" => value
+                .as_u64()
+                .is_some_and(|port| (1..=65535).contains(&port)),
+            "up_mbps" | "down_mbps" | "alter_id" => value.is_u64(),
+            "global_padding"
+            | "authenticated_length"
+            | "udp_over_tcp"
+            | "udp_over_stream"
+            | "zero_rtt_handshake" => value.is_boolean(),
+            "plugin" => matches!(value.as_str(), Some("obfs-local" | "v2ray-plugin")),
+            "plugin_opts" => {
+                fields.contains_key("plugin")
+                    && value.as_str().is_some_and(|options| {
+                        options.split(';').all(|option| {
+                            option.is_empty()
+                                || option == "tls"
+                                || option.split_once('=').is_some_and(|(key, value)| {
+                                    matches!(key, "mode" | "host" | "path" | "obfs" | "obfs-host")
+                                        && !value.contains(['\r', '\n'])
+                                })
+                        })
+                    })
             }
-        }) {
+            "obfs" => checked_object(value, &["type", "password"]).is_some_and(|obfs| {
+                obfs.get("type").and_then(Value::as_str) == Some("salamander")
+                    && obfs
+                        .get("password")
+                        .and_then(Value::as_str)
+                        .is_some_and(|password| !password.is_empty())
+            }),
+            _ => value.is_string(),
+        };
+        if !valid {
             return None;
         }
     }

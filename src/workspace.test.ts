@@ -36,12 +36,31 @@ describe("encrypted workspace data", () => {
   it("preserves an existing usable source when the replacement contains no usable nodes", () => {
     const original = receiveSubscription(primary, source, null);
     const workspace = replaceSubscription(emptyWorkspace, original);
-    const candidate = receiveSubscription("trojan://sample@example.com:443#unsupported", source, null, original);
+    const candidate = receiveSubscription("vless://sample@example.com:443?encryption=unsupported#unsupported", source, null, original);
     expect(() => replaceSubscription(workspace, candidate)).toThrow("已保留原订阅");
     expect(workspace.subscriptions[0]).toBe(original);
   });
 
   it("rejects unknown workspace versions so they cannot be overwritten by an empty default", () => {
     expect(() => deserializeWorkspace('{"version":13,"subscriptions":[],"rules":[]}')).toThrow();
+  });
+
+  it("preserves same-name transport variants and remaps the selected node and bookmark when a variant appears", () => {
+    const profile = receiveSubscription(primary, source, null);
+    const original = replaceSubscription(emptyWorkspace, profile);
+    const variant = primary.replace("security=tls", "security=tls&type=ws&path=%2Fvariant");
+    const updated = receiveSubscription([variant, primary, primary].join("\n"), source, null, profile);
+    const saved = { ...original, favorites: [original.selected!] };
+    const result = replaceSubscription(saved, updated);
+    expect(result.subscriptions[0].parsed.nodes).toHaveLength(2);
+    expect(updated.parsed.nodes[0].id).not.toBe(updated.parsed.nodes[1].id);
+    expect(result.selected).toBe(updated.parsed.nodes[1].id);
+    expect(result.favorites).toEqual([updated.parsed.nodes[1].id]);
+  });
+
+  it("preserves the legacy selected index when an earlier subscription line is a transport variant", () => {
+    const legacy = deserializeWorkspace(JSON.stringify({ source, selected: 1,
+      content: [primary, primary.replace("security=tls", "security=tls&type=ws"), backup].join("\n") }));
+    expect(legacy.subscriptions[0].parsed.nodes.find(node => node.id === legacy.selected)?.name).toBe("backup");
   });
 });

@@ -19,7 +19,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import type { NodeProfile } from "./subscription";
+import { nodeRevision, type NodeProfile } from "./subscription";
 import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleDomain, withSelectedOutbound, type RouteRule, type SessionPlan } from "./config";
 import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
 import { SubscriptionCard } from "./SubscriptionCard";
@@ -32,7 +32,7 @@ import "./rules.css";
 import "./dashboard.css";
 
 type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "诊断" | "设置";
-type Probe = { uri?: string; label: string; milliseconds?: number };
+type Probe = { revision: string; label: string; milliseconds?: number };
 const entryModes: { value: EntryMode; label: string }[] = [
   { value: "system", label: "系统代理" },
   { value: "tun", label: "TUN" },
@@ -125,7 +125,7 @@ function App() {
   const starred = useMemo(() => new Set(favorites), [favorites]);
   function probe(node: NodeProfile) {
     const value = latencies[node.id];
-    return value?.uri === node.uri ? value : undefined;
+    return value?.revision === nodeRevision(node) ? value : undefined;
   }
   const filtered = (activeFilter?.parsed.nodes ?? nodes).filter((n) =>
     (!onlyFavorites || starred.has(n.id)) && `#${n.sourceIndex ?? ""} ${n.name} ${n.protocol} ${n.server}`
@@ -156,7 +156,7 @@ function App() {
   const preferred = nodes.find(n => n.id === selected);
   const current = running ? runningNode ?? preferred : preferred;
   const isSelected = (node: NodeProfile) => running
-    ? runningNode?.id === node.id && runningNode.uri === node.uri
+    ? runningNode?.id === node.id && nodeRevision(runningNode) === nodeRevision(node)
     : node.id === selected;
   async function checkProxy() {
     if (!port) return;
@@ -214,7 +214,7 @@ function App() {
     setExitIp("");
     try {
       const loaded = previous.loaded.get(node.id);
-      if (loaded && loaded.uri === node.uri) {
+      if (loaded && loaded.revision === nodeRevision(node)) {
         await invoke("switch_proxy_node", { tag: loaded.tag });
         session.current = withSelectedOutbound(previous, loaded.tag);
         setRunningNode(node);
@@ -258,7 +258,7 @@ function App() {
       async function testQueue() {
         while (next < queue.length && !cancelTesting.current) {
           const node = queue[next++];
-          setLatencies((previous) => ({ ...previous, [node.id]: { uri: node.uri, label: "测试中" } }));
+          setLatencies((previous) => ({ ...previous, [node.id]: { revision: nodeRevision(node), label: "测试中" } }));
           let label: string;
           let milliseconds: number | undefined;
           try {
@@ -275,7 +275,7 @@ function App() {
           }
           setLatencies((previous) => ({
             ...previous,
-            [node.id]: { uri: node.uri, label: `${label} · ${new Date().toLocaleTimeString()}`, milliseconds },
+            [node.id]: { revision: nodeRevision(node), label: `${label} · ${new Date().toLocaleTimeString()}`, milliseconds },
           }));
         }
       }

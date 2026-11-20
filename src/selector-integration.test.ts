@@ -69,28 +69,37 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
   });
   const sockets: Socket[] = [];
   const children: ChildProcess[] = [];
+  const coreErrors: string[] = [];
   const secret = "selector-fixture";
   const user = "00000000-0000-4000-8000-000000000000";
   function start(config: object) {
-    const process = spawn(core!, ["run", "-c", "stdin"], { stdio: ["pipe", "ignore", "ignore"], windowsHide: true });
+    const process = spawn(core!, ["run", "-c", "stdin"], { stdio: ["pipe", "ignore", "pipe"], windowsHide: true });
     children.push(process);
     process.stdin.on("error", () => {});
+    process.stderr.on("data", output => coreErrors.push(String(output)));
     process.stdin.end(JSON.stringify(config));
   }
 
   try {
     const target = await open(server);
-    const [firstNode, secondNode, mixed, api] = await availablePorts(4);
+    const [firstNode, secondNode, vmessPort, trojanPort, shadowsocksPort, mixed, api] = await availablePorts(7);
     start({
-      inbounds: [firstNode, secondNode].map((port, index) => ({
+      inbounds: [...[firstNode, secondNode].map((port, index) => ({
         type: "vless", tag: `server-${index}`, listen: "127.0.0.1", listen_port: port,
         users: [{ uuid: user }],
       })),
+      { type: "vmess", listen: "127.0.0.1", listen_port: vmessPort, users: [{ uuid: user }] },
+      { type: "trojan", listen: "127.0.0.1", listen_port: trojanPort, users: [{ password: "fixture-proxy" }] },
+      { type: "shadowsocks", listen: "127.0.0.1", listen_port: shadowsocksPort, method: "aes-128-gcm", password: "fixture-proxy" }],
       outbounds: [{ type: "direct", tag: "direct" }],
     });
-    await Promise.all([waitForListener(firstNode), waitForListener(secondNode)]);
-    const nodes = parseSubscription([firstNode, secondNode].map((port, index) =>
-      `vless://${user}@127.0.0.1:${port}#node-${index}`).join("\n")).nodes;
+    await Promise.all([firstNode, secondNode, vmessPort, trojanPort, shadowsocksPort].map(waitForListener));
+    const yaml = `proxies:\n- {name: first, type: vless, server: 127.0.0.1, port: ${firstNode}, uuid: ${user}}`;
+    const json = JSON.stringify({ outbounds: [{ type: "vless", tag: "second", server: "127.0.0.1", server_port: secondNode, uuid: user }] });
+    const vmess = btoa(JSON.stringify({ v: '2', ps: 'vmess', add: '127.0.0.1', port: vmessPort, id: user, aid: 0, net: 'tcp', type: 'none' }));
+    const uri = [`vmess://${vmess}`, `trojan://fixture-proxy@127.0.0.1:${trojanPort}?security=none#trojan`,
+      `ss://${btoa('aes-128-gcm:fixture-proxy')}@127.0.0.1:${shadowsocksPort}#ss`].join('\n');
+    const nodes = [yaml, json, uri].flatMap(source => parseSubscription(source).nodes);
     const { config } = buildSessionConfig(nodes[0], nodes, mixed, []);
     start({ ...config, route: { ...config.route, rules: [
       { clash_mode: "direct", outbound: "direct" },
@@ -141,6 +150,10 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
     const body = await response.json() as { connections: { chains: string[] }[] };
     expect(body.connections.some(connection => connection.chains.includes("node-0"))).toBe(true);
     expect(body.connections.some(connection => connection.chains.includes("node-1"))).toBe(true);
+    for (const index of [2, 3, 4]) {
+      expect((await controller("/proxies/proxy", { method: "PUT", body: JSON.stringify({ name: `node-${index}` }) })).status).toBe(204);
+      await echo(await tunnel(), `protocol-${index}`);
+    }
 
     const setMode = async (mode: string) => {
       expect((await controller("/configs", { method: "PATCH", body: JSON.stringify({ mode }) })).status).toBe(204);
@@ -154,6 +167,8 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
     await setMode("rule");
     await expect(tunnel().then(socket => echo(socket, "blocked"))).rejects.toThrow();
     expect(peerFailures).toEqual([]);
+  } catch (error) {
+    throw new Error(coreErrors.join("").slice(-2400), { cause: error });
   } finally {
     closing = true;
     sockets.forEach(socket => socket.destroy());
