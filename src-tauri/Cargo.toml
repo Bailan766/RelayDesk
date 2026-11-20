@@ -7,11 +7,12 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 url = "2"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["time", "net"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-winapi = { version = "0.3", features = ["dpapi", "wincrypt", "winbase", "minwinbase", "winerror"] }
+winapi = { version = "0.3", features = ["dpapi", "wincrypt", "winbase", "minwinbase", "winerror", "handleapi", "processthreadsapi", "synchapi", "shellapi", "jobapi2", "winnt", "consoleapi", "wincon", "minwindef", "errhandlingapi"] }

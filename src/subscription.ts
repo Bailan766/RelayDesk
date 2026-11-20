@@ -1,6 +1,6 @@
 import { parse as parseYaml } from 'yaml';
 
-export interface NodeProfile { id: string; name: string; protocol: string; server: string; port: number; transport: string; security: string; uri?: string }
+export interface NodeProfile { id: string; sourceIndex?: number; name: string; protocol: string; server: string; port: number; transport: string; security: string; uri?: string }
 export interface ImportResult { nodes: NodeProfile[]; warnings: string[]; format: string }
 const protocols = new Set(['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'hy2', 'tuic', 'shadowsocks']);
 const decode = (value: string) => new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(value.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)));
@@ -48,7 +48,7 @@ export function parseSubscription(input: string): ImportResult {
     try {
       const n = typeof entry === 'string' ? { ...fromUri(entry), uri: entry } : fromObject(entry as Record<string, unknown>);
       const key = `${n.protocol}|${n.server}|${n.port}|${n.name}`;
-      if (!seen.has(key)) { nodes.push(n); seen.add(key); }
+      if (!seen.has(key)) { nodes.push({ ...n, sourceIndex: index + 1 }); seen.add(key); }
     } catch { warnings.push(`第 ${index + 1} 项未导入：格式无效或协议不支持`); }
   });
   if (!nodes.length) throw new Error(`没有找到可识别的节点（${entries.length} 项）`);
