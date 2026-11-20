@@ -105,6 +105,23 @@ impl Controller {
         Err("内核未接受节点切换".into())
     }
 
+    pub async fn probe_outbound(&self, tag: &str, url: &str) -> Option<bool> {
+        let path = format!("/proxies/{tag}/delay");
+        let response = self
+            .request(reqwest::Method::GET, &path)
+            .ok()?
+            .query(&[("timeout", "4200"), ("url", url)])
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .ok()?;
+        match response.status().as_u16() {
+            200 => Some(true),
+            503 | 504 => Some(false),
+            _ => None,
+        }
+    }
+
     pub async fn routing_mode(&self, mode: &str) -> Result<(), String> {
         let response = self
             .request(reqwest::Method::PATCH, "/configs")?

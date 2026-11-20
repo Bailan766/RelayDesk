@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 use tauri::Manager;
+mod failover;
 mod network;
 mod probes;
 mod storage;
@@ -120,6 +121,8 @@ async fn start_proxy(
     mode: Option<String>,
     routing_mode: Option<network::RoutingMode>,
     auto_reconnect: Option<bool>,
+    auto_failover: Option<bool>,
+    fallback_groups: Option<Vec<Vec<String>>>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -144,6 +147,8 @@ async fn start_proxy(
             mode: mode.unwrap_or_else(|| "local".into()),
             routing_mode: routing_mode.unwrap_or_default(),
             recover: auto_reconnect.unwrap_or(true),
+            failover: auto_failover.unwrap_or(false),
+            fallback_groups: fallback_groups.unwrap_or_default(),
         })
     })
     .await
@@ -181,23 +186,16 @@ async fn configure_recovery(enabled: bool, app: tauri::AppHandle) -> Result<(), 
 }
 #[tauri::command]
 async fn switch_proxy_node(tag: String, state: tauri::State<'_, ProxyState>) -> Result<(), String> {
-    if !tag
-        .strip_prefix("node-")
-        .is_some_and(|index| index.parse::<usize>().is_ok_and(|number| number < 2048))
-    {
-        return Err("节点标识无效".into());
-    }
-    let active = state.live()?.ok_or("代理内核未运行")?;
-    active.controller.switch(&tag).await?;
-    if !state.update_plan(&active.id, "已切换代理节点", |plan| {
-        let selector = &mut plan.config["outbounds"][0];
-        if selector["type"].as_str() == Some("selector") {
-            selector["default"] = tag.into();
-        }
-    }) {
-        return Err("代理会话已变化，请重新切换节点".into());
-    }
-    Ok(())
+    state.switch_node(tag).await
+}
+
+#[tauri::command]
+async fn configure_failover(
+    enabled: bool,
+    fallback_groups: Vec<Vec<String>>,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<(), String> {
+    state.configure_failover(enabled, fallback_groups).await
 }
 
 #[tauri::command]
@@ -205,14 +203,7 @@ async fn set_routing_mode(
     mode: network::RoutingMode,
     state: tauri::State<'_, ProxyState>,
 ) -> Result<(), String> {
-    let active = state.live()?.ok_or("代理内核未运行")?;
-    active.controller.routing_mode(mode.name()).await?;
-    if !state.update_plan(&active.id, "已切换路由模式", |plan| {
-        plan.routing_mode = mode
-    }) {
-        return Err("代理会话已变化，请重新切换路由模式".into());
-    }
-    Ok(())
+    state.change_mode(mode).await
 }
 
 #[tauri::command]
@@ -456,6 +447,7 @@ fn main() {
             let handle = app.handle().clone();
             std::thread::spawn(move || ProxyState::run(handle));
             tauri::async_runtime::spawn(ProxyState::watch_core_logs(app.handle().clone()));
+            tauri::async_runtime::spawn(ProxyState::watch_nodes(app.handle().clone()));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -473,6 +465,7 @@ fn main() {
             proxy_status,
             proxy_events,
             configure_recovery,
+            configure_failover,
             switch_proxy_node,
             set_routing_mode,
             proxy_telemetry,

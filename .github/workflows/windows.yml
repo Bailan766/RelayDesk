@@ -68,6 +68,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installed WireGuard TUN test failed' }
           cargo test --manifest-path src-tauri/Cargo.toml supervisor::tests::installed_worker_recovers_and_explicit_stop_cancels_it -- --exact --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Installed worker recovery test failed' }
+          cargo test --manifest-path src-tauri/Cargo.toml supervisor::tests::installed_worker_switches_failed_node_and_keeps_the_same_session -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Installed worker node failover test failed' }
           $upgrade = Start-Process -FilePath (Resolve-Path relaydesk-windows-x64-setup.exe) -ArgumentList '/S', "/D=$install" -Wait -PassThru
           if ($upgrade.ExitCode -ne 0) { throw "In-place reinstall failed: $($upgrade.ExitCode)" }
           $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'uninstall*.exe' | Select-Object -First 1

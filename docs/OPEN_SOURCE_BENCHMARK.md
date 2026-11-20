@@ -14,6 +14,7 @@
 | A01/A02 协议与格式 | `v0.1.6-preview.1` 通过 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44823102754)。本地用真实内核验证 Clash YAML、sing-box JSON 的 VLESS 节点，以及分享链接的 VMess、Trojan、Shadowsocks，均传输了 TCP 数据。Hysteria2 与 TUIC v5 用自建 QUIC 对端验证认证、公钥固定及 HTTP 数据。正式包另复测了第 5、9 条线路的 TUN HTTPS、DNS 和退出恢复。 | WireGuard 和更多协议扩展，完整 Mihomo 配置与其中的 DNS、策略组、规则集和提供者，以及每个协议的 UDP、全部支持的传输和证书变体。 |
 | A05/A06 崩溃恢复与分流 | `v0.1.7-preview.1` 的 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44825851263) 强制结束已安装的本地端口工作进程，恢复后再次成功转发，主动停止后监听消失。正式包实机区分了访问同一目标的两个 Windows 进程。CIDR 指定另一个节点的夹具通过连接详情确认出站。 | 网络仍运行但节点失联的健康检查与故障切换，切网、休眠唤醒、一次授权的 TUN 服务，原系统 PAC 和 WPAD 的完整恢复矩阵。 |
 | A07/A08 连通性与诊断 | `v0.1.6-preview.1` 接入四个网站的 HTTP 状态和耗时。界面标注检查使用当前路由策略。用同一测量线路实际收到 Apple、GitHub、YouTube 的 200 及 Google 的 204。后续界面用模拟 IPC 复测固定端口、网站测试、事件筛选和复制。 | 吞吐测试、断网分层诊断、更多日志级别、解锁结果与登录验证，及诊断的跨平台实测。 |
+| A01/A02 WireGuard | `v0.1.9-preview.1` 使用本机 WireGuard 对端跑通 IP 与域名握手和完整 HTTP 流量。由 Windows 安装包创建 TUN 后，未配置显式代理的 TCP 请求通过 WireGuard 对端，停止后清除 TUN 网卡地址。校验官方便携包哈希后在实机重跑通过。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44831533299) | 远程服务商的双栈、UDP 和多对端组合，及不同 Windows 版本。 |
 
 ## 优先解决的用户风险
 

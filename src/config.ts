@@ -67,12 +67,12 @@ export function buildConfig(node: NodeProfile, port: number, rules: RouteRule[] 
 
 export type SessionPlan = {
   config: ReturnType<typeof compileConfig>;
-  loaded: Map<string, { tag: string; revision: string }>;
+  loaded: Map<string, { tag: string; revision: string; node: NodeProfile }>;
 };
 
 export function buildSessionConfig(selected: NodeProfile, candidates: NodeProfile[], port: number, rules: RouteRule[]): SessionPlan {
   const outbounds = [compileOutbound(selected, 'node-0')];
-  const loaded = new Map([[selected.id, { tag: 'node-0', revision: nodeRevision(selected) }]]);
+  const loaded = new Map([[selected.id, { tag: 'node-0', revision: nodeRevision(selected), node: selected }]]);
   let wireguardCount = selected.protocol === 'wireguard' ? 1 : 0;
   for (const candidate of candidates) {
     if (loaded.has(candidate.id) || outbounds.length >= 2048) continue;
@@ -80,7 +80,7 @@ export function buildSessionConfig(selected: NodeProfile, candidates: NodeProfil
     const tag = `node-${outbounds.length}`;
     try {
       outbounds.push(compileOutbound(candidate, tag));
-      loaded.set(candidate.id, { tag, revision: nodeRevision(candidate) });
+      loaded.set(candidate.id, { tag, revision: nodeRevision(candidate), node: candidate });
       if (candidate.protocol === 'wireguard') wireguardCount++;
     } catch { /* Unsupported nodes remain visible in the node list. */ }
   }

@@ -1,7 +1,11 @@
-use crate::{network, telemetry::Controller};
+use crate::{
+    failover::{self, Health, Reachability},
+    network,
+    telemetry::Controller,
+};
 use serde_json::Value;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
@@ -24,6 +28,8 @@ pub struct Plan {
     pub mode: String,
     pub routing_mode: network::RoutingMode,
     pub recover: bool,
+    pub failover: bool,
+    pub fallback_groups: Vec<Vec<String>>,
 }
 
 impl Plan {
@@ -35,6 +41,47 @@ impl Plan {
             self.routing_mode,
         )
     }
+
+    fn selector(&self) -> Option<&Value> {
+        let selector = self.config.get("outbounds")?.as_array()?.first()?;
+        (selector.get("type")?.as_str()? == "selector").then_some(selector)
+    }
+
+    fn selected_node(&self) -> Option<&str> {
+        self.selector()?
+            .get("default")?
+            .as_str()
+            .filter(|tag| valid_tag(tag))
+    }
+
+    fn standbys(&self, selected: &str) -> Vec<String> {
+        let Some(loaded) = self
+            .selector()
+            .and_then(|selector| selector["outbounds"].as_array())
+        else {
+            return Vec::new();
+        };
+        let mut loaded: HashSet<_> = loaded.iter().filter_map(Value::as_str).collect();
+        self.fallback_groups
+            .iter()
+            .find(|group| group.iter().any(|tag| tag == selected))
+            .into_iter()
+            .flatten()
+            .filter(|tag| tag.as_str() != selected && valid_tag(tag) && loaded.remove(tag.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    fn monitors_node(&self) -> bool {
+        self.failover && !matches!(self.routing_mode, network::RoutingMode::Direct)
+    }
+}
+
+fn valid_tag(tag: &str) -> bool {
+    tag.strip_prefix("node-").is_some_and(|index| {
+        index.parse::<usize>().is_ok_and(|value| value < 2048)
+            && index.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 struct Running {
@@ -43,6 +90,7 @@ struct Running {
     since: Instant,
     failures: usize,
     retry_at: Option<Instant>,
+    health: Health,
 }
 
 impl Running {
@@ -99,6 +147,7 @@ impl Slot {
 pub struct Supervisor {
     slot: Mutex<Slot>,
     closing: AtomicBool,
+    control: tokio::sync::Mutex<()>,
 }
 
 #[derive(serde::Serialize)]
@@ -106,6 +155,24 @@ pub struct Status {
     phase: &'static str,
     message: Option<&'static str>,
     session_id: Option<String>,
+    node_tag: Option<String>,
+    node_health: Option<&'static str>,
+}
+
+struct NodeCheck {
+    session: String,
+    revision: u64,
+    tag: String,
+    controller: Controller,
+}
+
+impl NodeCheck {
+    fn is_current(&self, active: &Running) -> bool {
+        active.session.id == self.session
+            && active.session.running()
+            && active.plan.monitors_node()
+            && active.health.revision == self.revision
+    }
 }
 
 pub struct Link {
@@ -148,6 +215,7 @@ impl Supervisor {
             since: Instant::now(),
             failures: 0,
             retry_at: None,
+            health: Health::default(),
         });
         slot.message = None;
         slot.record("info", "本地网络入口已就绪");
@@ -181,6 +249,8 @@ impl Supervisor {
                 phase: "busy",
                 message: None,
                 session_id: None,
+                node_tag: None,
+                node_health: None,
             };
         };
         let phase = match &slot.active {
@@ -193,15 +263,17 @@ impl Supervisor {
         } else {
             slot.message
         };
-        let session_id = slot
-            .active
-            .as_ref()
-            .filter(|_| phase == "running")
-            .map(|active| active.session.id.clone());
+        let running = slot.active.as_ref().filter(|_| phase == "running");
         Status {
             phase,
             message,
-            session_id,
+            session_id: running.map(|active| active.session.id.clone()),
+            node_tag: running
+                .and_then(|active| active.plan.selected_node())
+                .map(str::to_owned),
+            node_health: running
+                .filter(|active| active.plan.monitors_node())
+                .map(|active| active.health.state.name()),
         }
     }
 
@@ -218,10 +290,11 @@ impl Supervisor {
             }))
     }
 
-    pub fn update_plan(
+    fn update_plan(
         &self,
         id: &str,
         event: &'static str,
+        notice: Option<&'static str>,
         update: impl FnOnce(&mut Plan),
     ) -> bool {
         if let Ok(mut slot) = self.slot.lock() {
@@ -231,11 +304,158 @@ impl Supervisor {
                 .filter(|active| active.session.id == id)
             {
                 update(&mut active.plan);
+                active.health.reset();
+                slot.message = notice;
                 slot.record("info", event);
                 return true;
             }
         }
         false
+    }
+
+    pub async fn switch_node(&self, tag: String) -> Result<(), String> {
+        if !valid_tag(&tag) {
+            return Err("节点标识无效".into());
+        }
+        let _guard = self.control.lock().await;
+        let active = self.live()?.ok_or("代理内核未运行")?;
+        active.controller.switch(&tag).await?;
+        if !self.update_plan(&active.id, "已切换代理节点", None, |plan| {
+            plan.config["outbounds"][0]["default"] = tag.into();
+        }) {
+            return Err("代理会话已变化，请重新切换节点".into());
+        }
+        Ok(())
+    }
+
+    pub async fn change_mode(&self, mode: network::RoutingMode) -> Result<(), String> {
+        let _guard = self.control.lock().await;
+        let active = self.live()?.ok_or("代理内核未运行")?;
+        active.controller.routing_mode(mode.name()).await?;
+        if !self.update_plan(&active.id, "已切换路由模式", None, |plan| {
+            plan.routing_mode = mode
+        }) {
+            return Err("代理会话已变化，请重新切换路由模式".into());
+        }
+        Ok(())
+    }
+
+    pub async fn configure_failover(
+        &self,
+        enabled: bool,
+        groups: Vec<Vec<String>>,
+    ) -> Result<(), String> {
+        let _guard = self.control.lock().await;
+        let mut slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
+        if let Some(active) = slot.active.as_mut().filter(|active| {
+            active.plan.failover != enabled || active.plan.fallback_groups != groups
+        }) {
+            active.plan.failover = enabled;
+            active.plan.fallback_groups = groups;
+            active.health.reset();
+        }
+        Ok(())
+    }
+
+    fn node_check(&self) -> Option<NodeCheck> {
+        let slot = self.slot.try_lock().ok()?;
+        let active = slot.active.as_ref()?;
+        if !active.session.running()
+            || !active.plan.monitors_node()
+            || Instant::now() < active.health.next_check
+        {
+            return None;
+        }
+        Some(NodeCheck {
+            session: active.session.id.clone(),
+            revision: active.health.revision,
+            tag: active.plan.selected_node().unwrap_or("proxy").to_owned(),
+            controller: active.session.controller.clone(),
+        })
+    }
+
+    fn record_check(&self, check: &NodeCheck, result: Reachability) -> Vec<String> {
+        let Ok(mut slot) = self.slot.lock() else {
+            return Vec::new();
+        };
+        let Some(active) = slot
+            .active
+            .as_mut()
+            .filter(|active| check.is_current(active))
+        else {
+            return Vec::new();
+        };
+        let previous = active.health.state;
+        active.health.record(result);
+        let down = active.health.state == Reachability::Unreachable;
+        let candidates = if down {
+            active
+                .health
+                .next_standbys(&active.plan.standbys(&check.tag))
+        } else {
+            Vec::new()
+        };
+        if down && previous != Reachability::Unreachable {
+            slot.record("warn", "当前节点连续两次探测失败");
+        }
+        candidates
+    }
+
+    async fn check_node(&self, check: NodeCheck) {
+        self.check_node_using(check, |controller, tag| async move {
+            failover::probe(&controller, &tag).await
+        })
+        .await;
+    }
+
+    async fn check_node_using<P, F>(&self, check: NodeCheck, probe: P)
+    where
+        P: Fn(Controller, String) -> F,
+        F: std::future::Future<Output = Reachability> + Send + 'static,
+    {
+        let result = probe(check.controller.clone(), check.tag.clone()).await;
+        let candidates = self.record_check(&check, result);
+        let mut search = tokio::task::JoinSet::new();
+        for (priority, tag) in candidates.into_iter().enumerate() {
+            let pending = probe(check.controller.clone(), tag.clone());
+            search.spawn(async move { (priority, pending.await, tag) });
+        }
+        let mut best = None;
+        while let Some(outcome) = search.join_next().await {
+            if let Ok((priority, Reachability::Healthy, tag)) = outcome {
+                if best.as_ref().is_none_or(|(index, _)| priority < *index) {
+                    best = Some((priority, tag));
+                }
+            }
+        }
+        let Some((_, tag)) = best else { return };
+        let _guard = self.control.lock().await;
+        let current = self.slot.lock().ok().is_some_and(|slot| {
+            slot.active
+                .as_ref()
+                .is_some_and(|active| check.is_current(active))
+        });
+        if current && check.controller.switch(&tag).await.is_ok() {
+            self.update_plan(
+                &check.session,
+                "当前节点失联，已切换到同订阅的可用节点",
+                Some("原节点失联，已自动换线"),
+                |plan| {
+                    plan.config["outbounds"][0]["default"] = tag.into();
+                },
+            );
+        }
+    }
+
+    pub async fn watch_nodes(app: tauri::AppHandle) {
+        use tauri::Manager;
+        let state = app.state::<Self>();
+        while !state.closing.load(Ordering::Acquire) {
+            if let Some(check) = state.node_check() {
+                state.check_node(check).await;
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
     }
 
     pub fn events(&self) -> Result<Vec<Event>, String> {
@@ -354,6 +574,7 @@ impl Supervisor {
             Ok(session) => {
                 active.session = session;
                 active.since = Instant::now();
+                active.health.reset();
                 slot.message = Some("代理已自动恢复");
                 slot.record("info", "检测到内核中断，代理已自动恢复");
             }
@@ -401,6 +622,147 @@ mod tests {
         assert_eq!(slot.events.back().unwrap().sequence, 165);
     }
 
+    #[tokio::test]
+    async fn installed_worker_switches_failed_node_and_keeps_the_same_session() {
+        use std::{
+            io::{BufRead, BufReader, Read, Write},
+            net::{TcpListener, TcpStream},
+            path::PathBuf,
+        };
+        let Some(executable) = std::env::var_os("RELAYDESK_INSTALLED_SMOKE_APP").map(PathBuf::from)
+        else {
+            return;
+        };
+        let loopback = || TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let unavailable = loopback();
+        let first = unavailable.local_addr().unwrap().port();
+        let standby = loopback();
+        standby.set_nonblocking(true).unwrap();
+        let second = standby.local_addr().unwrap().port();
+        let port = loopback().local_addr().unwrap().port();
+        let supervisor = Supervisor::default();
+        let plan = Plan {
+            config: serde_json::json!({
+                "inbounds":[{"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port}],
+                "outbounds":[
+                    {"type":"selector","tag":"proxy","outbounds":["node-0","node-1"],"default":"node-0","interrupt_exist_connections":false},
+                    {"type":"http","tag":"node-0","server":"127.0.0.1","server_port":first},
+                    {"type":"http","tag":"node-1","server":"127.0.0.1","server_port":second},
+                    {"type":"direct","tag":"direct"}
+                ],
+                "route":{"rules":[],"final":"proxy"}
+            }),
+            port,
+            mode: "local".into(),
+            routing_mode: network::RoutingMode::Global,
+            recover: true,
+            failover: true,
+            fallback_groups: vec![vec!["node-0".into(), "node-1".into()]],
+        };
+        supervisor
+            .start_using(plan, |plan| {
+                network::Session::start_using(
+                    plan.config.clone(),
+                    plan.port,
+                    &plan.mode,
+                    plan.routing_mode,
+                    &executable,
+                )
+            })
+            .unwrap();
+        let original = supervisor.status().session_id.unwrap();
+        let next_check = || {
+            supervisor
+                .slot
+                .lock()
+                .unwrap()
+                .active
+                .as_mut()
+                .unwrap()
+                .health
+                .next_check = Instant::now();
+            supervisor.node_check().unwrap()
+        };
+        let probe = |_, tag: String| async move {
+            if tag == "node-1" {
+                Reachability::Healthy
+            } else {
+                Reachability::Unreachable
+            }
+        };
+        supervisor.check_node_using(next_check(), probe).await;
+        assert_eq!(supervisor.status().node_tag.as_deref(), Some("node-0"));
+        supervisor.check_node_using(next_check(), probe).await;
+        let status = supervisor.status();
+        assert_eq!(status.node_tag.as_deref(), Some("node-1"));
+        assert_eq!(status.session_id.as_deref(), Some(original.as_str()));
+        assert_eq!(status.message, Some("原节点失联，已自动换线"));
+
+        let upstream = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(6);
+            let mut socket = loop {
+                match standby.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => panic!("standby proxy was never reached: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(4)))
+                .unwrap();
+            fn headers(socket: &mut TcpStream) -> String {
+                let mut reader = BufReader::new(socket);
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                for line in reader.lines() {
+                    if line.unwrap().is_empty() {
+                        break;
+                    }
+                }
+                first
+            }
+            assert!(headers(&mut socket).starts_with("CONNECT fixture.test:80 "));
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            assert!(headers(&mut socket).starts_with("GET /hello "));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 7\r\n\r\nstandby",
+                )
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"GET http://fixture.test/hello HTTP/1.1\r\nHost: fixture.test\r\nConnection: close\r\n\r\n").unwrap();
+        let mut body = String::new();
+        client.read_to_string(&mut body).unwrap();
+        upstream.join().unwrap();
+        assert!(body.ends_with("standby"));
+
+        let stale = next_check();
+        supervisor.switch_node("node-0".into()).await.unwrap();
+        supervisor
+            .check_node_using(stale, |_, _| async { Reachability::Unreachable })
+            .await;
+        assert_eq!(supervisor.status().node_tag.as_deref(), Some("node-0"));
+        supervisor
+            .change_mode(network::RoutingMode::Direct)
+            .await
+            .unwrap();
+        assert!(supervisor.status().node_health.is_none());
+        assert!(supervisor.node_check().is_none());
+        supervisor.stop().unwrap();
+        assert_eq!(supervisor.status().phase, "stopped");
+    }
+
     #[test]
     fn installed_worker_recovers_and_explicit_stop_cancels_it() {
         use std::{
@@ -440,6 +802,8 @@ mod tests {
             mode: "local".into(),
             routing_mode: network::RoutingMode::Rule,
             recover: true,
+            failover: false,
+            fallback_groups: Vec::new(),
         };
         let check_listener = || {
             let endpoint = TcpListener::bind(("127.0.0.1", 0)).unwrap();

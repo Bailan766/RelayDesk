@@ -34,7 +34,27 @@ import "./dashboard.css";
 
 type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "诊断" | "设置";
 type Probe = { revision: string; label: string; milliseconds?: number };
-type ProxyStatus = { phase: "running" | "recovering" | "stopped" | "busy"; message: string | null; session_id: string | null };
+const nodeHealthLabels = {
+  checking: "正在确认节点连通性",
+  healthy: "节点探测成功",
+  unreachable: "节点连续两次探测失败",
+  unavailable: "暂时无法检测节点",
+};
+type ProxyStatus = {
+  phase: "running" | "recovering" | "stopped" | "busy";
+  message: string | null;
+  session_id: string | null;
+  node_tag?: string | null;
+  node_health?: keyof typeof nodeHealthLabels | null;
+};
+
+function fallbackGroups(plan: SessionPlan | undefined, subscriptions: Workspace["subscriptions"], favorites: Set<string>) {
+  if (!plan) return [];
+  return subscriptions.map(profile => [...profile.parsed.nodes]
+    .sort((first, second) => Number(favorites.has(second.id)) - Number(favorites.has(first.id)))
+    .flatMap(node => plan.loaded.get(node.id)?.tag ?? []))
+    .filter(group => group.length > 1);
+}
 const entryModes: { value: EntryMode; label: string }[] = [
   { value: "system", label: "系统代理" },
   { value: "tun", label: "TUN" },
@@ -59,7 +79,8 @@ const nav: { name: Page; icon: typeof Activity }[] = [
 function App() {
   const [page, setPage] = useState<Page>("概览");
   const work = useWorkspace();
-  const { subscriptions, rules, selected, favorites, autoReconnect, proxyPort, entryMode: mode } = work.workspace;
+  const { subscriptions, rules, selected, favorites, autoReconnect, autoFailover, proxyPort, entryMode: mode } = work.workspace;
+  const starred = useMemo(() => new Set(favorites), [favorites]);
   const nodes = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes), [subscriptions]);
   const unavailableNodes = useMemo(() => new Map(nodes.map(node => [node.id, connectionSupport(node)])), [nodes]);
   const ruleTargets = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes
@@ -79,6 +100,7 @@ function App() {
   const [running, setRunning] = useState(false);
   const [recovering, setRecovering] = useState(false);
   const [recoveryMessage, setRecoveryMessage] = useState("");
+  const [nodeHealth, setNodeHealth] = useState<ProxyStatus["node_health"]>(null);
   const [runningNode, setRunningNode] = useState<NodeProfile>();
   const [liveRouting, setLiveRouting] = useState<RoutingMode>();
   const routingMode = running ? liveRouting ?? work.workspace.routingMode : work.workspace.routingMode;
@@ -119,6 +141,7 @@ function App() {
     setRunning(false);
     setRecovering(false);
     setRecoveryMessage("");
+    setNodeHealth(null);
     setRunningNode(undefined);
     setLiveRouting(undefined);
     setPort(undefined);
@@ -136,9 +159,19 @@ function App() {
         if (status.phase === "running" && status.session_id) {
           if (confirmedSession.current && confirmedSession.current !== status.session_id) resetDiagnostics();
           confirmedSession.current = status.session_id;
+          const plan = session.current;
+          if (plan && status.node_tag && plan.config.outbounds[0].default !== status.node_tag) {
+            const standby = Array.from(plan.loaded.values()).find(node => node.tag === status.node_tag);
+            if (standby) {
+              session.current = withSelectedOutbound(plan, standby.tag);
+              setRunningNode(standby.node);
+              resetDiagnostics();
+            }
+          }
         }
         setRecovering(status.phase === "recovering");
         setRecoveryMessage(status.message ?? "");
+        setNodeHealth(status.node_health ?? null);
         if (status.phase === "recovering" && confirmedSession.current) {
           confirmedSession.current = null;
           resetDiagnostics();
@@ -160,8 +193,12 @@ function App() {
     void invoke("configure_recovery", { enabled: autoReconnect }).catch(() =>
       setSettingsError("无法更新当前会话的自动恢复设置"));
   }, [autoReconnect, work.ready]);
+  useEffect(() => {
+    if (!isTauri() || !running || !work.ready) return;
+    void invoke("configure_failover", { enabled: autoFailover, fallbackGroups: fallbackGroups(session.current, subscriptions, starred) })
+      .catch(() => setSettingsError("无法更新当前会话的自动换线设置"));
+  }, [autoFailover, running, starred, subscriptions, work.ready]);
   const activeFilter = subscriptions.find(profile => profile.id === subscriptionFilter);
-  const starred = useMemo(() => new Set(favorites), [favorites]);
   function probe(node: NodeProfile) {
     const value = latencies[node.id];
     return value?.revision === nodeRevision(node) ? value : undefined;
@@ -220,6 +257,12 @@ function App() {
     }
     return { config: single, loaded: new Map() };
   }
+  function startProxy(plan: SessionPlan) {
+    return invoke("start_proxy", {
+      config: plan.config, mode, routingMode, autoReconnect, autoFailover,
+      fallbackGroups: fallbackGroups(plan, subscriptions, starred),
+    });
+  }
   async function changeRouting(value: RoutingMode) {
     if (busy || recovering || value === routingMode) return;
     setBusy(true);
@@ -263,14 +306,14 @@ function App() {
       confirmedSession.current = null;
       await invoke("stop_proxy");
       try {
-        await invoke("start_proxy", { config: next.config, mode, routingMode, autoReconnect });
+        await startProxy(next);
         session.current = next;
         setRunningNode(node);
         setRunning(true);
         await remember();
       } catch (failure) {
         try {
-          await invoke("start_proxy", { config: previous.config, mode, routingMode, autoReconnect });
+          await startProxy(previous);
           setRunning(true);
         } catch {
           clearSession();
@@ -372,7 +415,7 @@ function App() {
         if (!preferred) throw new Error("请先导入并选择节点");
         const localPort = proxyPort ?? await invoke<number>("allocate_port");
         const next = await prepareSession(preferred, localPort);
-        await invoke("start_proxy", { config: next.config, mode, routingMode, autoReconnect });
+        await startProxy(next);
         session.current = next;
         setRunningNode(preferred);
         setLiveRouting(routingMode);
@@ -505,6 +548,7 @@ function App() {
                       ? current.protocol.toUpperCase()
                       : "导入订阅后选择节点"}
                   </small>
+                  {nodeHealth && <small role="status">{nodeHealthLabels[nodeHealth]}</small>}
                 </div>
                 <div>
                   <span>代理模式</span>
@@ -785,6 +829,16 @@ function App() {
                 </label>
               </div>
               <p className="rule-hint">适用于系统代理和本地端口。TUN 重新连接时需要管理员授权。</p>
+              <div className="env-row">
+                <label>
+                  <input type="checkbox" checked={autoFailover} disabled={!work.ready} onChange={event => {
+                    const enabled = event.target.checked;
+                    void saveSettings(state => ({ ...state, autoFailover: enabled }));
+                  }} />
+                  节点失联时自动换线
+                </label>
+              </div>
+              <p className="rule-hint">后台检查两个网站。连续失败后尝试同订阅的其他节点，优先选择收藏。</p>
               <FixedPortSetting key={String(proxyPort)} value={proxyPort} disabled={!work.ready || busy || running}
                 onChange={changed => saveSettings(state => ({ ...state, proxyPort: changed }))} />
             </section>
