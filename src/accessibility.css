@@ -1,0 +1,4 @@
+.title p, .connection p, .modal p, .stats span, .stats small, .empty, .node-name small, .muted, .toolbar, .table-head { color: #586768; }
+.empty, .connection p, .stats span, .stats small { font-size: 13px; }
+.brand small, .side-bottom small, .notice { color: #536365; }
+.connect:not(:disabled) { background: #1c2b2d; color: #fff; cursor: pointer; }
