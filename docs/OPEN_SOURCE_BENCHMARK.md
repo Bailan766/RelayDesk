@@ -15,6 +15,7 @@
 | A05/A06 崩溃恢复与分流 | `v0.1.7-preview.1` 的 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44825851263) 强制结束已安装的本地端口工作进程，恢复后再次成功转发，主动停止后监听消失。正式包实机区分了访问同一目标的两个 Windows 进程。CIDR 指定另一个节点的夹具通过连接详情确认出站。 | 网络仍运行但节点失联的健康检查与故障切换，切网、休眠唤醒、一次授权的 TUN 服务，原系统 PAC 和 WPAD 的完整恢复矩阵。 |
 | A07/A08 连通性与诊断 | `v0.1.6-preview.1` 接入四个网站的 HTTP 状态和耗时。界面标注检查使用当前路由策略。用同一测量线路实际收到 Apple、GitHub、YouTube 的 200 及 Google 的 204。后续界面用模拟 IPC 复测固定端口、网站测试、事件筛选和复制。 | 吞吐测试、断网分层诊断、更多日志级别、解锁结果与登录验证，及诊断的跨平台实测。 |
 | A01/A02 WireGuard | `v0.1.9-preview.1` 使用本机 WireGuard 对端跑通 IP 与域名握手和完整 HTTP 流量。由 Windows 安装包创建 TUN 后，未配置显式代理的 TCP 请求通过 WireGuard 对端，停止后清除 TUN 网卡地址。校验官方便携包哈希后在实机重跑通过。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44831533299) | 远程服务商的双栈、UDP 和多对端组合，及不同 Windows 版本。 |
+| A05/A09 节点自动换线 | `v0.1.10-preview.2` 通过安装后的进程验证。夹具模拟连续探测失败，确认同一会话切到可用备用节点，后续 HTTP 走备用出站，旧探测结果也未覆盖手动选择。真实内核的单节点探测另用两条 VLESS 路径验证，一条可达 HTTPS，另一条握手失败。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44833248433) | 长时间全链路自动探测、切网和休眠，以及跨内核策略组。 |
 
 ## 优先解决的用户风险
 

@@ -70,6 +70,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installed worker recovery test failed' }
           cargo test --manifest-path src-tauri/Cargo.toml supervisor::tests::installed_worker_switches_failed_node_and_keeps_the_same_session -- --exact --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Installed worker node failover test failed' }
+          $env:RELAYDESK_WINDOWS_PROXY_SMOKE = '1'
+          cargo test --manifest-path src-tauri/Cargo.toml system_proxy::tests::windows_restores_pac_and_keeps_user_changes_to_auto_detection -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Windows system proxy preservation test failed' }
           $upgrade = Start-Process -FilePath (Resolve-Path relaydesk-windows-x64-setup.exe) -ArgumentList '/S', "/D=$install" -Wait -PassThru
           if ($upgrade.ExitCode -ne 0) { throw "In-place reinstall failed: $($upgrade.ExitCode)" }
           $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'uninstall*.exe' | Select-Object -First 1
