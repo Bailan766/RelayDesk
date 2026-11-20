@@ -1,0 +1,4 @@
+.rule-hint { color: #667473; font-size: 13px; line-height: 1.6; }
+.rule-form { display: flex; gap: 8px; flex-wrap: wrap; margin: 18px 0; }
+.rule-form input, .rule-form select, .rule-form button { border: 1px solid #dbe2e2; border-radius: 6px; padding: 9px; background: white; }
+.rule-form input { flex: 1; min-width: 160px; }
