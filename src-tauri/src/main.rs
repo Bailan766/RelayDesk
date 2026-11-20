@@ -60,6 +60,20 @@ fn proxy_running(state: tauri::State<'_, ProxyState>) -> bool {
 }
 
 #[tauri::command]
+async fn check_connection(port: u16, state: tauri::State<'_, ProxyState>) -> Result<u128, String> {
+    if !proxy_running(state) { return Err("代理内核未运行".into()); }
+    let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))
+        .map_err(|_| "本地代理地址无效")?;
+    let client = reqwest::Client::builder().proxy(proxy).timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "无法启动连接检查")?;
+    let started = std::time::Instant::now();
+    let response = client.get("https://www.gstatic.com/generate_204").send().await
+        .map_err(|_| "代理请求失败或超时，请检查节点和网络")?;
+    if response.status() != reqwest::StatusCode::NO_CONTENT { return Err("检查地址返回异常状态，连接未确认".into()); }
+    Ok(started.elapsed().as_millis())
+}
+
+#[tauri::command]
 async fn fetch_subscription(address: String) -> Result<String, String> {
     let parsed = url::Url::parse(&address).map_err(|_| "订阅地址无效")?;
     if parsed.scheme() != "https" || parsed.host_str().is_none() || !parsed.username().is_empty() || parsed.password().is_some() {
@@ -86,7 +100,7 @@ async fn fetch_subscription(address: String) -> Result<String, String> {
 fn main() {
     let app = tauri::Builder::default()
         .manage(ProxyState::default())
-        .invoke_handler(tauri::generate_handler![fetch_subscription, allocate_port, start_proxy, stop_proxy, proxy_running])
+        .invoke_handler(tauri::generate_handler![fetch_subscription, allocate_port, start_proxy, stop_proxy, proxy_running, check_connection])
         .build(tauri::generate_context!()).expect("failed to build RelayDesk");
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {

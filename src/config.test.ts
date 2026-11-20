@@ -18,4 +18,10 @@ describe('sing-box configuration', () => {
     expect(outbound.server_ports).toEqual(['2000:3000', '4000']);
     expect(outbound.server_port).toBeUndefined();
   });
+  it('refuses unsupported encryption and invalid port ranges', () => {
+    const vless = parseSubscription('vless://id@host.test:443?encryption=custom#Test').nodes[0];
+    expect(() => buildConfig(vless, 12345)).toThrow('加密');
+    const hy = parseSubscription('hysteria2://password@host.test:443?mport=3000-2000#Test').nodes[0];
+    expect(() => buildConfig(hy, 12345)).toThrow('端口');
+  });
 });
