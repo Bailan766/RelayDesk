@@ -100,11 +100,14 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
     const uri = [`vmess://${vmess}`, `trojan://fixture-proxy@127.0.0.1:${trojanPort}?security=none#trojan`,
       `ss://${btoa('aes-128-gcm:fixture-proxy')}@127.0.0.1:${shadowsocksPort}#ss`].join('\n');
     const nodes = [yaml, json, uri].flatMap(source => parseSubscription(source).nodes);
-    const { config } = buildSessionConfig(nodes[0], nodes, mixed, []);
+    const { config } = buildSessionConfig(nodes[0], nodes, mixed, [
+      { type: "domain", value: "blocked.test", action: "reject" },
+      { type: "ip_cidr", value: "127.0.0.1", action: "proxy", target: nodes[1].id },
+    ]);
     start({ ...config, route: { ...config.route, rules: [
       { clash_mode: "direct", outbound: "direct" },
       { clash_mode: "global", outbound: "proxy" },
-      { ip_cidr: ["127.0.0.1/32"], action: "reject" },
+      ...config.route.rules,
       { clash_mode: "rule", outbound: "proxy" },
     ] }, experimental: { clash_api: {
       external_controller: `127.0.0.1:${api}`, secret, default_mode: "global",
@@ -123,13 +126,13 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
     expect(ready).toBe(true);
     await waitForListener(mixed);
 
-    async function tunnel(): Promise<Socket> {
+    async function tunnel(host = "127.0.0.1"): Promise<Socket> {
       const socket = connect(mixed, "127.0.0.1");
       sockets.push(socket);
       await once(socket, "connect");
       socket.on("error", () => {});
       const headers = read(socket, value => value.includes("\r\n\r\n"));
-      socket.write(`CONNECT 127.0.0.1:${target} HTTP/1.1\r\nHost: 127.0.0.1:${target}\r\n\r\n`);
+      socket.write(`CONNECT ${host}:${target} HTTP/1.1\r\nHost: ${host}:${target}\r\n\r\n`);
       expect(await headers).toMatch(/^HTTP\/1\.1 200/);
       return socket;
     }
@@ -165,7 +168,14 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
     const snapshot = await (await controller("/connections")).json() as { connections: { chains: string[] }[] };
     expect(snapshot.connections.some(connection => connection.chains.includes("direct"))).toBe(true);
     await setMode("rule");
-    await expect(tunnel().then(socket => echo(socket, "blocked"))).rejects.toThrow();
+    const pinned = await tunnel();
+    await echo(pinned, "pinned");
+    const after = await (await controller("/connections")).json() as { connections: {
+      metadata: { sourcePort: string }; chains: string[]; rule: string;
+    }[] };
+    const matching = after.connections.find(connection => connection.metadata.sourcePort === String(pinned.localPort));
+    expect(matching).toMatchObject({ chains: ["node-1"], rule: expect.stringContaining("ip_cidr") });
+    await expect(tunnel("blocked.test").then(socket => echo(socket, "blocked"))).rejects.toThrow();
     expect(peerFailures).toEqual([]);
   } catch (error) {
     throw new Error(coreErrors.join("").slice(-2400), { cause: error });

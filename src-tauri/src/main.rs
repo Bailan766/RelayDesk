@@ -5,13 +5,13 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Mutex,
     time::Duration,
 };
 use tauri::Manager;
 mod network;
 mod probes;
 mod storage;
+mod supervisor;
 mod system_proxy;
 mod telemetry;
 
@@ -26,8 +26,7 @@ fn core_command(path: &std::path::Path) -> Command {
     command
 }
 
-#[derive(Default)]
-struct ProxyState(Mutex<Option<network::Session>>);
+type ProxyState = supervisor::Supervisor;
 
 struct TemporaryConfig(PathBuf);
 impl Drop for TemporaryConfig {
@@ -120,14 +119,10 @@ async fn start_proxy(
     config: serde_json::Value,
     mode: Option<String>,
     routing_mode: Option<network::RoutingMode>,
+    auto_reconnect: Option<bool>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<ProxyState>();
-        let mut active = state.0.lock().map_err(|_| "代理状态不可用")?;
-        if active.as_ref().is_some_and(network::Session::running) {
-            return Err("代理已经运行".into());
-        }
         let inbound = config
             .get("inbounds")
             .and_then(|x| x.as_array())
@@ -143,43 +138,42 @@ async fn start_proxy(
         {
             return Err("本地入口配置无效".into());
         }
-        *active = Some(network::Session::start(
+        app.state::<ProxyState>().start(supervisor::Plan {
             config,
             port,
-            mode.as_deref().unwrap_or("local"),
-            routing_mode.unwrap_or_default(),
-        )?);
-        Ok(())
+            mode: mode.unwrap_or_else(|| "local".into()),
+            routing_mode: routing_mode.unwrap_or_default(),
+            recover: auto_reconnect.unwrap_or(true),
+        })
     })
     .await
     .map_err(|_| "启动代理任务异常".to_string())?
 }
 
 #[tauri::command]
-fn stop_proxy(state: tauri::State<'_, ProxyState>) -> Result<(), String> {
-    stop_session(&state)
-}
-
-fn stop_session(state: &ProxyState) -> Result<(), String> {
-    let mut active = state.0.lock().map_err(|_| "代理状态不可用")?;
-    active.take().map(network::Session::stop).unwrap_or(Ok(()))
+async fn stop_proxy(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<ProxyState>().stop())
+        .await
+        .map_err(|_| "停止代理任务异常".to_string())?
 }
 
 fn running_port(state: &ProxyState) -> Option<u16> {
-    state
-        .0
-        .lock()
-        .ok()?
-        .as_ref()
-        .filter(|session| session.running())
-        .map(|session| session.port)
+    state.live().ok().flatten().map(|active| active.port)
 }
 
 #[tauri::command]
-fn proxy_running(state: tauri::State<'_, ProxyState>) -> bool {
-    running_port(&state).is_some()
+fn proxy_status(state: tauri::State<'_, ProxyState>) -> supervisor::Status {
+    state.status()
 }
 
+#[tauri::command]
+async fn configure_recovery(enabled: bool, app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ProxyState>().configure_recovery(enabled)
+    })
+    .await
+    .map_err(|_| "更新自动恢复设置异常".to_string())?
+}
 #[tauri::command]
 async fn switch_proxy_node(tag: String, state: tauri::State<'_, ProxyState>) -> Result<(), String> {
     if !tag
@@ -188,16 +182,17 @@ async fn switch_proxy_node(tag: String, state: tauri::State<'_, ProxyState>) -> 
     {
         return Err("节点标识无效".into());
     }
-    active_controller(&state)?.switch(&tag).await
-}
-
-fn active_controller(state: &ProxyState) -> Result<telemetry::Controller, String> {
-    let active = state.0.lock().map_err(|_| "代理状态不可用")?;
-    active
-        .as_ref()
-        .filter(|session| session.running())
-        .map(|session| session.controller.clone())
-        .ok_or_else(|| "代理内核未运行".into())
+    let active = state.live()?.ok_or("代理内核未运行")?;
+    active.controller.switch(&tag).await?;
+    if !state.update_plan(&active.id, |plan| {
+        let selector = &mut plan.config["outbounds"][0];
+        if selector["type"].as_str() == Some("selector") {
+            selector["default"] = tag.into();
+        }
+    }) {
+        return Err("代理会话已变化，请重新切换节点".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -205,37 +200,32 @@ async fn set_routing_mode(
     mode: network::RoutingMode,
     state: tauri::State<'_, ProxyState>,
 ) -> Result<(), String> {
-    active_controller(&state)?.routing_mode(mode.name()).await
+    let active = state.live()?.ok_or("代理内核未运行")?;
+    active.controller.routing_mode(mode.name()).await?;
+    if !state.update_plan(&active.id, |plan| plan.routing_mode = mode) {
+        return Err("代理会话已变化，请重新切换路由模式".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn proxy_telemetry(
     state: tauri::State<'_, ProxyState>,
 ) -> Result<Option<telemetry::SessionSnapshot>, String> {
-    let controller = || {
-        state
-            .0
-            .lock()
-            .ok()?
-            .as_ref()
-            .filter(|session| session.running())
-            .map(|session| (session.id.clone(), session.controller.clone()))
-    };
-    let Some((session_id, active)) = controller() else {
+    let Some(active) = state.live()? else {
         return Ok(None);
     };
-    let snapshot = active.snapshot().await;
-    if !controller().is_some_and(|(current, _)| current == session_id) {
+    let snapshot = active.controller.snapshot().await;
+    if !state.live()?.is_some_and(|current| current.id == active.id) {
         return Ok(None);
     }
     snapshot.map(|snapshot| {
         Some(telemetry::SessionSnapshot {
-            session_id,
+            session_id: active.id,
             snapshot,
         })
     })
 }
-
 #[tauri::command]
 async fn check_connection(port: u16, state: tauri::State<'_, ProxyState>) -> Result<u128, String> {
     if running_port(&state) != Some(port) {
@@ -434,8 +424,10 @@ fn main() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => show_main(app),
                     "stop" => {
-                        let state = app.state::<ProxyState>();
-                        let _ = stop_session(&state);
+                        let app = app.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            let _ = app.state::<ProxyState>().stop();
+                        });
                     }
                     "quit" => app.exit(0),
                     _ => (),
@@ -454,6 +446,8 @@ fn main() {
                 tray = tray.icon(icon.clone());
             }
             tray.build(app)?;
+            let handle = app.handle().clone();
+            std::thread::spawn(move || ProxyState::run(handle));
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -468,7 +462,8 @@ fn main() {
             validate_proxy_config,
             start_proxy,
             stop_proxy,
-            proxy_running,
+            proxy_status,
+            configure_recovery,
             switch_proxy_node,
             set_routing_mode,
             proxy_telemetry,
@@ -487,7 +482,7 @@ fn main() {
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
             let state = handle.state::<ProxyState>();
-            let _ = stop_session(&state);
+            let _ = state.shutdown();
         }
     });
 }

@@ -29,6 +29,8 @@ describe.skipIf(!core)('real sing-box config validation', () => {
       writeFileSync(configPath, JSON.stringify(buildConfig(parseSubscription(example).nodes[0], 32123, [
         { type: 'domain', value: 'example.com', action: 'direct' },
         { type: 'domain_suffix', value: 'blocked.test', action: 'reject' },
+        { type: 'ip_cidr', value: '2001:db8::/32', action: 'direct' },
+        { type: 'process_name', value: 'Network Fixture.EXE', action: 'reject' },
       ])));
       const result = spawnSync(core!, ['check', '-c', configPath], { encoding: 'utf8' });
       expect(result.status, result.stderr).toBe(0);

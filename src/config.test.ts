@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildConfig } from './config';
+import { buildConfig, buildSessionConfig, normalizeRuleValue } from './config';
 import { parseSubscription } from './subscription';
 
 describe('sing-box configuration', () => {
@@ -53,5 +53,20 @@ describe('sing-box configuration', () => {
     const outbound = { type: 'trojan', server: 'test.example.org', server_port: 443, password: 'fixture',
       tls: { enabled: true, certificate_path: 'fixture.pem' } };
     expect(() => buildConfig(parseSubscription(JSON.stringify([outbound])).nodes[0], 12345)).toThrow('certificate_path');
+  });
+  it('pins matching destinations to a loaded outbound and rejects rather than falling back when unavailable', () => {
+    const nodes = parseSubscription('trojan://password@a.test:443#A\ntrojan://password@b.test:443#B').nodes;
+    const rules = [
+      { type: 'ip_cidr', value: '192.0.2.3', action: 'proxy', target: nodes[1].id },
+      { type: 'process_name', value: 'Example (Test).EXE', action: 'direct' },
+    ] as const;
+    expect(buildSessionConfig(nodes[0], nodes, 12345, [...rules]).config.route.rules).toEqual([
+      { ip_cidr: ['192.0.2.3/32'], outbound: 'node-1' },
+      { process_path_regex: ['(?i)(?:^|[\\\\/])Example \\(Test\\)\\.EXE$'], outbound: 'direct' },
+    ]);
+    expect(buildConfig(nodes[0], 12345, [...rules]).route.rules[0]).toEqual({ ip_cidr: ['192.0.2.3/32'], action: 'reject' });
+    expect(normalizeRuleValue('ip_cidr', '2001:db8:0::/48')).toBe('2001:db8::/48');
+    expect(() => normalizeRuleValue('ip_cidr', '255.1.1.256/24')).toThrow('IP');
+    expect(() => normalizeRuleValue('ip_cidr', '2001:db8::/129')).toThrow('IP');
   });
 });

@@ -20,7 +20,7 @@ import {
   X,
 } from "lucide-react";
 import { nodeRevision, type NodeProfile } from "./subscription";
-import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleDomain, withSelectedOutbound, type RouteRule, type SessionPlan } from "./config";
+import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleValue, ruleTypes, withSelectedOutbound, type RouteRule, type SessionPlan } from "./config";
 import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
 import { SubscriptionCard } from "./SubscriptionCard";
 import { WebsiteChecks } from "./WebsiteChecks";
@@ -33,6 +33,7 @@ import "./dashboard.css";
 
 type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "诊断" | "设置";
 type Probe = { revision: string; label: string; milliseconds?: number };
+type ProxyStatus = { phase: "running" | "recovering" | "stopped" | "busy"; message: string | null };
 const entryModes: { value: EntryMode; label: string }[] = [
   { value: "system", label: "系统代理" },
   { value: "tun", label: "TUN" },
@@ -57,9 +58,12 @@ const nav: { name: Page; icon: typeof Activity }[] = [
 function App() {
   const [page, setPage] = useState<Page>("概览");
   const work = useWorkspace();
-  const { subscriptions, rules, selected, favorites, entryMode: mode } = work.workspace;
+  const { subscriptions, rules, selected, favorites, autoReconnect, entryMode: mode } = work.workspace;
   const nodes = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes), [subscriptions]);
   const unavailableNodes = useMemo(() => new Map(nodes.map(node => [node.id, connectionSupport(node)])), [nodes]);
+  const ruleTargets = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes
+    .filter(node => !unavailableNodes.get(node.id))
+    .map(node => ({ id: node.id, label: `${profile.name} · #${node.sourceIndex} ${node.name}` }))), [subscriptions, unavailableNodes]);
   const [subscriptionFilter, setSubscriptionFilter] = useState("");
   const [nodeSort, setNodeSort] = useState("source");
   const [onlyFavorites, setOnlyFavorites] = useState(false);
@@ -72,11 +76,13 @@ function App() {
   const [search, setSearch] = useState("");
   const file = useRef<HTMLInputElement>(null);
   const [running, setRunning] = useState(false);
+  const [recovering, setRecovering] = useState(false);
+  const [recoveryMessage, setRecoveryMessage] = useState("");
   const [runningNode, setRunningNode] = useState<NodeProfile>();
   const [liveRouting, setLiveRouting] = useState<RoutingMode>();
   const routingMode = running ? liveRouting ?? work.workspace.routingMode : work.workspace.routingMode;
   const session = useRef<SessionPlan>();
-  const telemetry = useTelemetry(running);
+  const telemetry = useTelemetry(running && !recovering);
   const [port, setPort] = useState<number>();
   const [connectionError, setConnectionError] = useState("");
   const [checkResult, setCheckResult] = useState("");
@@ -99,6 +105,8 @@ function App() {
   function clearSession() {
     session.current = undefined;
     setRunning(false);
+    setRecovering(false);
+    setRecoveryMessage("");
     setRunningNode(undefined);
     setLiveRouting(undefined);
     setPort(undefined);
@@ -108,19 +116,35 @@ function App() {
   useEffect(() => {
     if (!isTauri() || busy || !running) return;
     let cancelled = false;
-    const timer = window.setInterval(() => {
-      invoke<boolean>("proxy_running")
-        .then((active) => {
-          if (cancelled) return;
-          if (!active) clearSession();
-        })
-        .catch(() => { /* IPC failure does not prove that the core has stopped. */ });
-    }, 2000);
+    let timer: number;
+    async function poll() {
+      try {
+        const status = await invoke<ProxyStatus>("proxy_status");
+        if (cancelled || status.phase === "busy") return;
+        if (status.phase === "stopped") clearSession();
+        setRecovering(status.phase === "recovering");
+        setRecoveryMessage(status.message ?? "");
+        if (status.phase === "recovering") {
+          setCheckResult("");
+          setExitIp("");
+        }
+      } catch {
+        // A transient IPC failure leaves the last confirmed status visible.
+      } finally {
+        if (!cancelled) timer = window.setTimeout(poll, 1000);
+      }
+    }
+    timer = window.setTimeout(poll, 600);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
   }, [busy, running]);
+  useEffect(() => {
+    if (!isTauri() || !work.ready) return;
+    void invoke("configure_recovery", { enabled: autoReconnect }).catch(() =>
+      setSettingsError("无法更新当前会话的自动恢复设置"));
+  }, [autoReconnect, work.ready]);
   const activeFilter = subscriptions.find(profile => profile.id === subscriptionFilter);
   const starred = useMemo(() => new Set(favorites), [favorites]);
   function probe(node: NodeProfile) {
@@ -181,7 +205,7 @@ function App() {
     return { config: single, loaded: new Map() };
   }
   async function changeRouting(value: RoutingMode) {
-    if (busy || value === routingMode) return;
+    if (busy || recovering || value === routingMode) return;
     setBusy(true);
     setConnectionError("");
     try {
@@ -199,7 +223,7 @@ function App() {
     }
   }
   async function selectNode(node: NodeProfile) {
-    if (busy || testing || isSelected(node)) return;
+    if (busy || recovering || testing || isSelected(node)) return;
     const remember = () => saveSettings(state => ({ ...state,
       selected: preferredNode(state.subscriptions, node.id),
     }));
@@ -224,14 +248,14 @@ function App() {
       const next = await prepareSession(node, port);
       await invoke("stop_proxy");
       try {
-        await invoke("start_proxy", { config: next.config, mode, routingMode });
+        await invoke("start_proxy", { config: next.config, mode, routingMode, autoReconnect });
         session.current = next;
         setRunningNode(node);
         setRunning(true);
         await remember();
       } catch (failure) {
         try {
-          await invoke("start_proxy", { config: previous.config, mode, routingMode });
+          await invoke("start_proxy", { config: previous.config, mode, routingMode, autoReconnect });
           setRunning(true);
         } catch {
           clearSession();
@@ -321,6 +345,7 @@ function App() {
     setBusy(true);
     setConnectionError("");
     setCheckResult("");
+    setRecoveryMessage("");
     try {
       if (!isTauri()) throw new Error("请在桌面应用中连接");
       if (running) {
@@ -330,7 +355,7 @@ function App() {
         if (!preferred) throw new Error("请先导入并选择节点");
         const localPort = await invoke<number>("allocate_port");
         const next = await prepareSession(preferred, localPort);
-        await invoke("start_proxy", { config: next.config, mode, routingMode });
+        await invoke("start_proxy", { config: next.config, mode, routingMode, autoReconnect });
         session.current = next;
         setRunningNode(preferred);
         setLiveRouting(routingMode);
@@ -375,7 +400,7 @@ function App() {
           <span>个人工作区</span>
           <span className="header-right">
             <span className="dot" />
-            {running ? "内核运行中" : "内核未运行"}
+            {recovering ? "正在恢复代理" : running ? "内核运行中" : "内核未运行"}
           </span>
         </header>
         <main>
@@ -411,14 +436,14 @@ function App() {
                   <div className="section-label">连接状态</div>
                   <div className="status">
                     <span className="status-dot" />
-                    {running ? "内核运行中" : "未连接"}
+                    {recovering ? "正在恢复代理" : running ? "内核运行中" : "未连接"}
                   </div>
                   <p>
-                    {connectionError ||
+                    {connectionError || recoveryMessage ||
                       (running
                         ? `本地 HTTP / SOCKS5：127.0.0.1:${port}`
                         : "代理未运行")}
-                    {running && (
+                    {running && !recovering && (
                       <>
                         <br />
                         {checkResult || "尚未验证远程连接"}{" "}
@@ -471,9 +496,9 @@ function App() {
                 </div>
               </div>
               <div className="columns">
-                <WebsiteChecks key={JSON.stringify([telemetry.snapshot?.sessionId, current?.id, routingMode])} port={running ? port : undefined} />
+                <WebsiteChecks key={JSON.stringify([telemetry.snapshot?.sessionId, current?.id, routingMode])} port={running && !recovering ? port : undefined} />
                 <section className="panel">
-                  <div className="panel-head"><h2>当前路由出口 IP</h2><button className="link" disabled={!running || checking} onClick={showExitIp}>刷新</button></div>
+                  <div className="panel-head"><h2>当前路由出口 IP</h2><button className="link" disabled={!running || recovering || checking} onClick={showExitIp}>刷新</button></div>
                   <div className="empty">{exitIp || (running ? "尚未检查出口 IP" : "连接后可检查出口 IP")}</div>
                 </section>
                 <section className="panel">
@@ -570,7 +595,7 @@ function App() {
                 <span>{filtered.length} 个节点</span>
                 <div className="mode-switch" role="group" aria-label="路由模式">
                   {routingModes.map(option => <button className="link" key={option.value}
-                    aria-pressed={routingMode === option.value} disabled={busy || !work.ready}
+                    aria-pressed={routingMode === option.value} disabled={busy || recovering || !work.ready}
                     onClick={() => void changeRouting(option.value)}>{option.label}</button>)}
                 </div>
               </div>
@@ -624,6 +649,7 @@ function App() {
                       className="link"
                       disabled={
                         busy ||
+                        recovering ||
                         testing ||
                         !!unavailableNodes.get(n.id) ||
                         isSelected(n)
@@ -700,7 +726,7 @@ function App() {
           {page === "连接" && <ConnectionMonitor telemetry={telemetry} running={running} />}
           {page === "日志" && <section className="panel"><h2>内核日志</h2><p className="empty">日志查看尚未接入。</p></section>}
           {page === "规则" && (
-            <RulesEditor rules={rules} onChange={edit => void saveSettings(state => ({ ...state, rules: edit(state.rules) }))} running={running} />
+            <RulesEditor rules={rules} targets={ruleTargets} onChange={edit => void saveSettings(state => ({ ...state, rules: edit(state.rules) }))} running={running} />
           )}
           {page === "诊断" && (
             <section className="panel">
@@ -732,6 +758,16 @@ function App() {
               <div className="empty">
                 系统代理适用于遵循 Windows 代理设置的应用。TUN 接管 TCP/UDP 和 DNS，启动时需要管理员授权。本地端口模式需要在目标应用中手动填写代理地址。
               </div>
+              <div className="env-row">
+                <label>
+                  <input type="checkbox" checked={autoReconnect} disabled={!work.ready} onChange={event => {
+                    const enabled = event.target.checked;
+                    void saveSettings(state => ({ ...state, autoReconnect: enabled }));
+                  }} />
+                  内核意外退出时自动恢复
+                </label>
+              </div>
+              <p className="rule-hint">适用于系统代理和本地端口。TUN 重新连接时需要管理员授权。</p>
             </section>
           )}
         </main>
@@ -807,38 +843,50 @@ function TestCard({serviceName}:{serviceName:string}) {
 }
 function RulesEditor({
   rules,
+  targets,
   onChange,
   running,
 }: {
   rules: RouteRule[];
+  targets: { id: string; label: string }[];
   onChange: (edit: (rules: RouteRule[]) => RouteRule[]) => void;
   running: boolean;
 }) {
   const [type, setType] = useState<RouteRule["type"]>("domain_suffix");
   const [action, setAction] = useState<RouteRule["action"]>("direct");
+  const [target, setTarget] = useState("");
   const [value, setValue] = useState("");
   const [validationError, setValidationError] = useState("");
+  function move(rule: RouteRule, offset: number) {
+    onChange(current => {
+      const index = current.indexOf(rule);
+      const destination = index + offset;
+      if (index < 0 || destination < 0 || destination >= current.length) return current;
+      const reordered = [...current];
+      [reordered[destination], reordered[index]] = [reordered[index], reordered[destination]];
+      return reordered;
+    });
+  }
   return (
     <section className="panel">
       <div className="panel-head">
         <h2>路由规则</h2>
       </div>
       <p className="rule-hint">
-        按顺序匹配，未命中时使用当前节点。
+        规则模式按顺序匹配，未命中时使用当前节点。指定的节点无法加载时，匹配该规则的流量会被拦截。
         {running ? "修改将在重新连接后生效。" : ""}
       </p>
       <div className="rule-form">
         <select
           aria-label="规则类型"
           value={type}
-          onChange={(e) => setType(e.target.value as RouteRule["type"])}
+          onChange={(e) => { setType(e.target.value as RouteRule["type"]); setValidationError(""); }}
         >
-          <option value="domain">域名</option>
-          <option value="domain_suffix">域名后缀</option>
+          {ruleTypes.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </select>
         <input
           aria-label="规则内容"
-          placeholder="example.com"
+          placeholder={ruleTypes.find(option => option.value === type)?.example}
           value={value}
           onChange={(e) => { setValue(e.target.value); setValidationError(""); }}
         />
@@ -851,12 +899,18 @@ function RulesEditor({
           <option value="proxy">代理</option>
           <option value="reject">拦截</option>
         </select>
+        {action === "proxy" && <select aria-label="规则使用的节点" className="rule-target" value={target}
+          onChange={event => setTarget(event.target.value)}>
+          <option value="">当前节点</option>
+          {targets.map(node => <option key={node.id} value={node.id}>{node.label}</option>)}
+        </select>}
         <button
           disabled={!value.trim()}
           onClick={() => {
             try {
-              const domain = normalizeRuleDomain(value);
-              onChange(current => [...current, { type, value: domain, action }]);
+              const match = normalizeRuleValue(type, value);
+              if (action === "proxy" && target && !targets.some(node => node.id === target)) throw new Error("请选择可用节点");
+              onChange(current => [...current, { type, value: match, action, target: action === "proxy" && target ? target : undefined }]);
               setValue("");
               setValidationError("");
             } catch (error) {
@@ -868,19 +922,19 @@ function RulesEditor({
         </button>
       </div>
       {validationError && <p className="error" role="alert">{validationError}</p>}
-      {rules.map((rule, index) => (
-        <div className="env-row" key={index}>
-          <span>
-            {rule.type} · {rule.value} · {rule.action}
-          </span>
-          <button
-            className="link"
-            onClick={() => onChange(current => current.filter(item => item !== rule))}
-          >
-            删除
-          </button>
-        </div>
-      ))}
+      {rules.map((rule, index) => {
+        const label = ruleTypes.find(option => option.value === rule.type)?.label;
+        const route = rule.action === "direct" ? "直连" : rule.action === "reject" ? "拦截"
+          : rule.target ? targets.find(node => node.id === rule.target)?.label ?? "指定节点已不可用" : "当前节点";
+        return <div className="env-row rule-row" key={index}>
+          <span>{label} · {rule.value} · {route}</span>
+          <div className="rule-actions">
+            <button className="link" disabled={index === 0} onClick={() => move(rule, -1)} aria-label={`上移规则 ${rule.value}`}>上移</button>
+            <button className="link" disabled={index === rules.length - 1} onClick={() => move(rule, 1)} aria-label={`下移规则 ${rule.value}`}>下移</button>
+            <button className="link" onClick={() => onChange(current => current.filter(item => item !== rule))}>删除</button>
+          </div>
+        </div>;
+      })}
     </section>
   );
 }

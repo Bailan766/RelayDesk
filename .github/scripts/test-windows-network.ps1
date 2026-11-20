@@ -96,7 +96,10 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
                     @{type='tuic'; tag='node-6'; server='127.0.0.1'; server_port=9; password='fixture'; uuid='00000000-0000-4000-8000-000000000000'; congestion_control='bbr'; tls=@{enabled=$true}}
                     @{type='direct'; tag='direct'}
                 )
-                route = @{rules=@(); final=$outbound; auto_detect_interface=$true}
+                route = @{rules=@(
+                    @{ip_cidr=@('203.0.113.0/24','2001:db8::/32');outbound='node-1'}
+                    @{process_path_regex=@('(?i)(?:^|[\\/])relaydesk-fixture-absent\.exe$');action='reject'}
+                ); final=$outbound; auto_detect_interface=$true}
             }
             controller = @{port=$controllerPort; secret=$secret}
         } | ConvertTo-Json -Depth 12 -Compress | Set-Content -Encoding utf8NoBOM -LiteralPath $configPath

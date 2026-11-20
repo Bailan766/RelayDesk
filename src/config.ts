@@ -1,7 +1,14 @@
 import { nodeRevision, type NodeProfile } from './subscription';
 import { compileOutbound } from './outbound';
 
-export type RouteRule = { type: 'domain' | 'domain_suffix'; value: string; action: 'direct' | 'proxy' | 'reject' };
+export type RuleType = 'domain' | 'domain_suffix' | 'ip_cidr' | 'process_name';
+export type RouteRule = { type: RuleType; value: string; action: 'direct' | 'proxy' | 'reject'; target?: string };
+export const ruleTypes: { value: RuleType; label: string; example: string }[] = [
+  { value: 'domain', label: '域名', example: 'example.com' },
+  { value: 'domain_suffix', label: '域名后缀', example: 'example.com' },
+  { value: 'ip_cidr', label: 'IP 地址或网段', example: '192.0.2.0/24' },
+  { value: 'process_name', label: 'Windows 进程', example: 'chrome.exe' },
+];
 
 export function normalizeRuleDomain(input: string): string {
   const domain = input.trim().toLowerCase().replace(/\.$/, '');
@@ -10,16 +17,46 @@ export function normalizeRuleDomain(input: string): string {
   return domain;
 }
 
-function compileConfig(outbounds: object[], port: number, rules: RouteRule[]) {
+export function normalizeRuleValue(type: RuleType, input: string): string {
+  if (type === 'domain' || type === 'domain_suffix') return normalizeRuleDomain(type === 'domain_suffix' ? input.replace(/^\s*\./, '') : input);
+  const value = input.trim();
+  if (type === 'process_name') {
+    if (!/^[^<>:"/\\|?*\u0000-\u001f]{1,128}\.exe$/i.test(value)) throw new Error('请填写 .exe 文件名');
+    return value;
+  }
+  const [host, rawPrefix, extra] = value.split('/');
+  const ipv6 = host.includes(':');
+  const bits = ipv6 ? 128 : 32;
+  if (extra !== undefined || (rawPrefix !== undefined && (!/^\d{1,3}$/.test(rawPrefix) || Number(rawPrefix) > bits))) {
+    throw new Error('请输入有效的 IP 地址或 CIDR 网段');
+  }
+  if (ipv6 && /^[\da-f:.]+$/i.test(host)) {
+    try { return `${new URL(`http://[${host}]/`).hostname.slice(1,-1)}/${rawPrefix === undefined ? bits : Number(rawPrefix)}`; }
+    catch { throw new Error('IPv6 地址格式无效'); }
+  }
+  const octets = host.split('.');
+  if (octets.length !== 4 || octets.some(part => !/^(?:0|[1-9]\d{0,2})$/.test(part) || Number(part) > 255)) {
+    throw new Error('请输入有效的 IP 地址或 CIDR 网段');
+  }
+  return `${host}/${rawPrefix === undefined ? bits : Number(rawPrefix)}`;
+}
+
+type LoadedOutbounds = ReadonlyMap<string, { tag: string }>;
+
+function compileConfig(outbounds: object[], port: number, rules: RouteRule[], loaded: LoadedOutbounds) {
   const compiledRules = rules.map(rule => {
-    const value = normalizeRuleDomain(rule.value);
-    return rule.action === 'reject' ? { [rule.type]: [value], action: 'reject' } : { [rule.type]: [value], outbound: rule.action };
+    const value = normalizeRuleValue(rule.type, rule.value);
+    const match = rule.type === 'process_name'
+      ? { process_path_regex: [`(?i)(?:^|[\\\\/])${value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`] }
+      : { [rule.type]: [value] };
+    const outbound = rule.action === 'proxy' && rule.target ? loaded.get(rule.target)?.tag : rule.action;
+    return !outbound || outbound === 'reject' ? { ...match, action: 'reject' } : { ...match, outbound };
   });
   return { log: { level: 'warn' }, inbounds: [{ type: 'mixed', tag: 'local', listen: '127.0.0.1', listen_port: port }], outbounds: [...outbounds, { type: 'direct', tag: 'direct' }], route: { rules: compiledRules, final: 'proxy', auto_detect_interface: true } };
 }
 
 export function buildConfig(node: NodeProfile, port: number, rules: RouteRule[] = []) {
-  return compileConfig([compileOutbound(node, 'proxy')], port, rules);
+  return compileConfig([compileOutbound(node, 'proxy')], port, rules, new Map([[node.id, { tag: 'proxy' }]]));
 }
 
 export type SessionPlan = {
@@ -42,7 +79,7 @@ export function buildSessionConfig(selected: NodeProfile, candidates: NodeProfil
     config: compileConfig([{
       type: 'selector', tag: 'proxy', outbounds: outbounds.map(outbound => outbound.tag),
       default: 'node-0', interrupt_exist_connections: false,
-    }, ...outbounds], port, rules),
+    }, ...outbounds], port, rules, loaded),
     loaded,
   };
 }

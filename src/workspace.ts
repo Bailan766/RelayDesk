@@ -1,4 +1,4 @@
-import { connectionSupport, type RouteRule } from "./config";
+import { connectionSupport, ruleTypes, type RouteRule } from "./config";
 import { nodeRevision, parseSubscription, type ImportResult, type NodeProfile } from "./subscription";
 
 export type EntryMode = "system" | "tun" | "local";
@@ -24,6 +24,7 @@ export type Workspace = {
   routingMode: RoutingMode;
   refreshHours: number;
   favorites: string[];
+  autoReconnect: boolean;
 };
 
 export const emptyWorkspace: Workspace = {
@@ -33,6 +34,7 @@ export const emptyWorkspace: Workspace = {
   routingMode: "rule",
   refreshHours: 0,
   favorites: [],
+  autoReconnect: true,
 };
 
 export function subscriptionHost(source: string): string {
@@ -106,15 +108,17 @@ export function replaceSubscription(state: Workspace, profile: Subscription): Wo
   }));
   const selection = state.selected ? remapped.get(state.selected) ?? state.selected : undefined;
   const favorites = Array.from(new Set(state.favorites.map(id => remapped.get(id) ?? id)));
-  return { ...state, subscriptions, selected: preferredNode(subscriptions, selection), favorites };
+  const rules = state.rules.map(rule => rule.target && remapped.has(rule.target)
+    ? { ...rule, target: remapped.get(rule.target)! } : rule);
+  return { ...state, subscriptions, selected: preferredNode(subscriptions, selection), favorites, rules };
 }
 
 function isRule(value: unknown): value is RouteRule {
   if (value == null || typeof value !== "object") return false;
-  const { type, value: domain, action } = value as Record<string, unknown>;
-  return (type === "domain" || type === "domain_suffix")
-    && typeof domain === "string"
-    && (action === "direct" || action === "proxy" || action === "reject");
+  const { type, value: key, action, target } = value as Record<string, unknown>;
+  return ruleTypes.some(rule => rule.value === type) && typeof key === "string"
+    && (action === "direct" || action === "proxy" || action === "reject")
+    && (target === undefined || (action === "proxy" && typeof target === "string"));
 }
 
 export function deserializeWorkspace(raw: string): Workspace {
@@ -169,13 +173,14 @@ export function deserializeWorkspace(raw: string): Workspace {
   return {
     subscriptions,
     selected: preferredNode(subscriptions, typeof saved.selected === "string" ? recoverId(saved.selected) : undefined),
-    rules: saved.rules,
+    rules: (saved.rules as RouteRule[]).map(rule => rule.target ? { ...rule, target: recoverId(rule.target) } : rule),
     entryMode: saved.entryMode === "local" || saved.entryMode === "tun" ? saved.entryMode : "system",
     routingMode: saved.routingMode === "direct" || saved.routingMode === "global" ? saved.routingMode : "rule",
     refreshHours: [1, 6, 24].includes(saved.refreshHours) ? saved.refreshHours : 0,
     favorites: Array.isArray(saved.favorites)
       ? [...new Set<string>(saved.favorites.filter((id: unknown): id is string => typeof id === "string").map(recoverId))]
       : [],
+    autoReconnect: saved.autoReconnect !== false,
   };
 }
 

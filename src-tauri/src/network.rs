@@ -344,6 +344,63 @@ fn validate_outbounds(outbounds: &[Value]) -> Option<()> {
     Some(())
 }
 
+fn validate_rule(rule: &Value, outbounds: &[Value]) -> Option<()> {
+    const MATCHES: [&str; 4] = ["domain", "domain_suffix", "ip_cidr", "process_path_regex"];
+    let fields = checked_object(
+        rule,
+        &[
+            "domain",
+            "domain_suffix",
+            "ip_cidr",
+            "process_path_regex",
+            "outbound",
+            "action",
+        ],
+    )?;
+    let mut selectors = MATCHES
+        .into_iter()
+        .filter_map(|key| fields.get(key).map(|value| (key, value)));
+    let (key, values) = selectors.next()?;
+    if selectors.next().is_some() {
+        return None;
+    }
+    let values = values.as_array()?;
+    if values.is_empty()
+        || !values.iter().all(|value| {
+            let Some(text) = value.as_str() else {
+                return false;
+            };
+            match key {
+                "ip_cidr" => text.split_once('/').is_some_and(|(address, prefix)| {
+                    let limit = match address.parse::<std::net::IpAddr>() {
+                        Ok(std::net::IpAddr::V4(_)) => 32,
+                        Ok(std::net::IpAddr::V6(_)) => 128,
+                        _ => return false,
+                    };
+                    prefix.parse::<u8>().is_ok_and(|prefix| prefix <= limit)
+                }),
+                "process_path_regex" => {
+                    text.len() <= 512 && text.starts_with("(?i)(?:^|[") && text.ends_with('$')
+                }
+                _ => !text.is_empty() && text.len() <= 253,
+            }
+        })
+    {
+        return None;
+    }
+    match (fields.get("action"), fields.get("outbound")) {
+        (Some(action), None) if action.as_str() == Some("reject") => Some(()),
+        (None, Some(outbound))
+            if outbounds.iter().any(|item| {
+                item.get("tag").and_then(Value::as_str) == outbound.as_str() && outbound.is_string()
+            }) =>
+        {
+            Some(())
+        }
+        _ => None,
+    }
+}
+
 // The elevated worker constructs its own inbound, DNS and interface settings.
 fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> {
     let root = checked_object(config, &["log", "inbounds", "outbounds", "route"])?;
@@ -359,19 +416,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         json!({"protocol":"dns","action":"hijack-dns"}),
     ];
     for rule in rules {
-        let fields = checked_object(rule, &["domain", "domain_suffix", "outbound", "action"])?;
-        let destination = fields
-            .get("domain")
-            .or_else(|| fields.get("domain_suffix"))?
-            .as_array()?;
-        if !destination.iter().all(Value::is_string) {
-            return None;
-        }
-        match (fields.get("action"), fields.get("outbound")) {
-            (Some(action), None) if action.as_str() == Some("reject") => (),
-            (None, Some(outbound)) if matches!(outbound.as_str(), Some("direct" | "proxy")) => (),
-            _ => return None,
-        }
+        validate_rule(rule, outbounds)?;
         output_rules.push(rule.clone());
     }
     Some(json!({
@@ -752,5 +797,27 @@ mod tests {
                 {"clash_mode":"rule","outbound":"proxy"}
             ])
         );
+    }
+
+    #[test]
+    fn elevated_rules_accept_only_present_outbounds_and_valid_networks() {
+        let outbounds = vec![json!({"tag":"direct"}), json!({"tag":"node-1"})];
+        let rule = json!({"ip_cidr":["2001:db8::/32","192.0.2.0/24"],"outbound":"node-1"});
+        assert!(validate_rule(&rule, &outbounds).is_some());
+        assert!(validate_rule(
+            &json!({"ip_cidr":["2001:db8::/129"],"outbound":"node-1"}),
+            &outbounds
+        )
+        .is_none());
+        assert!(validate_rule(
+            &json!({"domain":["example.org"],"outbound":"absent"}),
+            &outbounds
+        )
+        .is_none());
+        assert!(validate_rule(
+            &json!({"ip_cidr":["127.0.0.1/32"],"domain":["example.org"],"action":"reject"}),
+            &outbounds
+        )
+        .is_none());
     }
 }
