@@ -1,6 +1,8 @@
 param([Parameter(Mandatory)][string]$App, [Parameter(Mandatory)][int]$Port)
 
 $ErrorActionPreference = 'Stop'
+[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $profileJson = [Console]::ReadLine()
 $token = [Guid]::NewGuid().ToString('N')
 $ready = [Threading.EventWaitHandle]::new($false, 'ManualReset', "Local\RelayDesk.$token.ready")

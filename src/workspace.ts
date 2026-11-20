@@ -16,6 +16,8 @@ export type Subscription = {
   updatedAt: number | null;
   usage: Usage | null;
   request: SubscriptionRequest;
+  mihomoSelections: Record<string, string>;
+  mihomoMode?: RoutingMode;
   parsed: ImportResult;
 };
 
@@ -57,6 +59,13 @@ function subscriptionRequest(value: unknown): SubscriptionRequest {
     userAgent: typeof settings?.userAgent === "string" && /^[\x20-\x7e]{0,256}$/.test(settings.userAgent)
       ? settings.userAgent.trim() : "",
   };
+}
+
+function mihomoSelections(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([name, target]) =>
+    name.length > 0 && name.length <= 512 && typeof target === "string" && target.length > 0 && target.length <= 512,
+  ).slice(0, 128));
 }
 
 function validUsage(value: unknown): Usage | null {
@@ -102,6 +111,8 @@ export function receiveSubscription(
     updatedAt: Date.now(),
     usage: validUsage(usage),
     request: request ?? previous?.request ?? defaultSubscriptionRequest,
+    mihomoSelections: previous?.mihomoSelections ?? {},
+    mihomoMode: previous?.mihomoMode,
   });
 }
 
@@ -155,6 +166,7 @@ export function deserializeWorkspace(raw: string): Workspace {
       updatedAt: null,
       usage: null,
       request: defaultSubscriptionRequest,
+      mihomoSelections: {},
     });
     // Earlier clients indexed the first appearance of each display name and endpoint.
     const seen = new Set<string>();
@@ -181,6 +193,8 @@ export function deserializeWorkspace(raw: string): Workspace {
       updatedAt: Number.isSafeInteger(profile.updatedAt) ? profile.updatedAt : null,
       usage: validUsage(profile.usage),
       request: subscriptionRequest(profile.request),
+      mihomoSelections: mihomoSelections(profile.mihomoSelections),
+      mihomoMode: ["global", "direct", "rule"].includes(profile.mihomoMode ?? "") ? profile.mihomoMode : undefined,
     });
   });
   const known = new Set<string>();

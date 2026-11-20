@@ -147,8 +147,7 @@ async fn start_proxy(
             return Err("本地入口配置无效".into());
         }
         app.state::<ProxyState>().start(supervisor::Plan {
-            core: network::Core::Singbox,
-            config,
+            settings: network::CoreSettings::singbox(config),
             port,
             mode: mode.unwrap_or_else(|| "local".into()),
             routing_mode: routing_mode.unwrap_or_default(),
@@ -168,6 +167,7 @@ async fn start_mihomo(
     mode: String,
     routing_mode: network::RoutingMode,
     auto_reconnect: bool,
+    selections: Option<std::collections::BTreeMap<String, String>>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     if port < 1024 {
@@ -176,8 +176,21 @@ async fn start_mihomo(
     bundled_binary("mihomo.exe")?;
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<ProxyState>().start(supervisor::Plan {
-            core: network::Core::Mihomo,
-            config,
+            settings: network::CoreSettings {
+                core: network::Core::Mihomo,
+                config,
+                selections: selections
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(group, choice)| {
+                        !group.is_empty()
+                            && group.len() <= 512
+                            && !choice.is_empty()
+                            && choice.len() <= 512
+                    })
+                    .take(128)
+                    .collect(),
+            },
             port,
             mode,
             routing_mode,

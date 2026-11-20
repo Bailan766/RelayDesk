@@ -12,7 +12,7 @@ export function MihomoGroups({ mode, disabled, onMode, onChange }: {
   mode: RoutingMode;
   disabled: boolean;
   onMode: (mode: RoutingMode) => void;
-  onChange: () => void;
+  onChange: (group: string, choice: string) => Promise<void>;
 }) {
   const [groups, setGroups] = useState<Group[]>();
   const [readError, setReadError] = useState("");
@@ -46,7 +46,7 @@ export function MihomoGroups({ mode, disabled, onMode, onChange }: {
     try {
       await invoke("switch_mihomo_group", { group: group.name, choice });
       setGroups(current => current?.map(item => item.name === group.name ? { ...item, selected: choice } : item));
-      onChange();
+      await onChange(group.name, choice);
     } catch (error) {
       setSwitchError(typeof error === "string" ? error : "策略组切换失败");
     } finally {

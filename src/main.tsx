@@ -105,7 +105,7 @@ function App() {
   const [recoveryMessage, setRecoveryMessage] = useState("");
   const [nodeHealth, setNodeHealth] = useState<ProxyStatus["node_health"]>(null);
   const [runningNode, setRunningNode] = useState<NodeProfile>();
-  const [runningOriginal, setRunningOriginal] = useState<string>();
+  const [runningOriginal, setRunningOriginal] = useState<{ id: string; name: string; content: string }>();
   const [liveRouting, setLiveRouting] = useState<RoutingMode>();
   const routingMode = running ? liveRouting ?? work.workspace.routingMode : work.workspace.routingMode;
   const session = useRef<SessionPlan>();
@@ -239,7 +239,9 @@ function App() {
   const preferred = nodes.find(n => n.id === selected);
   const current = running ? runningNode ?? preferred : preferred;
   const originalProfile = subscriptions.find(profile => profile.id === work.workspace.mihomoProfile && profile.parsed.mihomo);
-  const originalName = running ? runningOriginal : originalProfile?.name;
+  const liveOriginalProfile = runningOriginal && subscriptions.find(profile => profile.id === runningOriginal.id);
+  const originalName = running ? (liveOriginalProfile?.name ?? runningOriginal?.name) : originalProfile?.name;
+  const originalUpdated = runningOriginal && liveOriginalProfile && runningOriginal.content !== liveOriginalProfile.content;
   const isSelected = (node: NodeProfile) => !originalName && (running
     ? runningNode?.id === node.id && nodeRevision(runningNode) === nodeRevision(node)
     : node.id === selected);
@@ -282,7 +284,9 @@ function App() {
         setLiveRouting(value);
         resetDiagnostics();
       }
-      if (!runningOriginal) await saveSettings(state => ({ ...state, routingMode: value }));
+      await saveSettings(state => runningOriginal ? { ...state, subscriptions: state.subscriptions.map(profile =>
+        profile.id === runningOriginal.id ? { ...profile, mihomoMode: value } : profile,
+      ) } : { ...state, routingMode: value });
     } catch (error) {
       setConnectionError(typeof error === "string" ? error : "路由模式切换失败");
     } finally {
@@ -426,9 +430,11 @@ function App() {
         if (!original && !preferred) throw new Error("请先导入并选择节点或原配置");
         const localPort = proxyPort ?? await invoke<number>("allocate_port");
         if (original && originalProfile) {
-          const originalMode = original.mode === "global" || original.mode === "direct" ? original.mode : "rule";
-          await invoke("start_mihomo", { config: original, port: localPort, mode, routingMode: originalMode, autoReconnect });
-          setRunningOriginal(originalProfile.name);
+          const originalMode = originalProfile.mihomoMode ??
+            (original.mode === "global" || original.mode === "direct" ? original.mode : "rule");
+          await invoke("start_mihomo", { config: original, port: localPort, mode, routingMode: originalMode, autoReconnect,
+            selections: originalProfile.mihomoSelections });
+          setRunningOriginal({ id: originalProfile.id, name: originalProfile.name, content: originalProfile.content });
           setLiveRouting(originalMode);
         } else if (preferred) {
           const next = await prepareSession(preferred, localPort);
@@ -570,6 +576,7 @@ function App() {
                   {originalName && !running && <button className="link" disabled={busy}
                     onClick={() => void saveSettings(state => ({ ...state, mihomoProfile: undefined }))}>切回节点模式</button>}
                   {nodeHealth && <small role="status">{nodeHealthLabels[nodeHealth]}</small>}
+                  {originalUpdated && <small role="status">订阅已更新，重连后使用新配置。</small>}
                 </div>
                 <div>
                   <span>代理模式</span>
@@ -578,7 +585,14 @@ function App() {
                 </div>
               </div>
               {runningOriginal && <MihomoGroups mode={routingMode} disabled={busy || recovering}
-                onMode={value => void changeRouting(value)} onChange={resetDiagnostics} />}
+                onMode={value => void changeRouting(value)} onChange={async (group, choice) => {
+                  resetDiagnostics();
+                  await saveSettings(state => ({ ...state, subscriptions: state.subscriptions.map(profile =>
+                    profile.id === runningOriginal.id
+                      ? { ...profile, mihomoSelections: { ...profile.mihomoSelections, [group]: choice } }
+                      : profile,
+                  ) }));
+                }} />}
               <div className="columns">
                 <WebsiteChecks key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
                 <section className="panel">

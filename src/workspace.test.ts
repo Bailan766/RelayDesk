@@ -43,6 +43,21 @@ describe("encrypted workspace data", () => {
       .toEqual({ route: "automatic", userAgent: "" });
   });
 
+  it("retains a provider-only original and its strategy after reload and refresh", () => {
+    const raw = "proxy-providers:\n  Inlined:\n    type: inline\n    payload: []\nproxy-groups:\n- {name: Choice, type: select, use: [Inlined]}";
+    const initial = { ...receiveSubscription(raw, source, null),
+      mihomoMode: "global" as const, mihomoSelections: { Choice: "DIRECT" } };
+    const workspace = { ...replaceSubscription(emptyWorkspace, initial), mihomoProfile: initial.id };
+    const updated = receiveSubscription(raw + "\nrules: ['MATCH,Choice']", source, null, initial);
+    const loaded = deserializeWorkspace(serializeWorkspace(replaceSubscription(workspace, updated)));
+    expect(loaded.mihomoProfile).toBe(initial.id);
+    expect(loaded.subscriptions[0].parsed.nodes).toHaveLength(0);
+    expect(loaded.subscriptions[0].mihomoSelections).toEqual(initial.mihomoSelections);
+    expect(loaded.subscriptions[0].mihomoMode).toBe("global");
+    expect(() => replaceSubscription(workspace, receiveSubscription(primary, source, null, initial)))
+      .toThrow("已保留原订阅");
+  });
+
   it("preserves an existing usable source when the replacement contains no usable nodes", () => {
     const original = receiveSubscription(primary, source, null);
     const workspace = replaceSubscription(emptyWorkspace, original);

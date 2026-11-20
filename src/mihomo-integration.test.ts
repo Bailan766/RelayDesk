@@ -28,9 +28,14 @@ async function freePort() {
 async function verifyProfile(executable: string, pack = false) {
   let targetCalls = 0;
   let dnsQueries = 0;
+  let providerRequests = 0;
   const origin = createServer((req, res) => {
-    if (req.url === "/rules") return res.end(`payload:\n  - DOMAIN,${hostname}\n`);
+    if (req.url === "/rules") {
+      providerRequests++;
+      return res.end(`payload:\n  - DOMAIN,${hostname}\n`);
+    }
     if (req.url === "/proxies") {
+      providerRequests++;
       return res.end("proxies:\n  - {name: FromProvider, type: ss, server: 127.0.0.1, port: 9, cipher: aes-128-gcm, password: fixture}\n");
     }
     targetCalls++;
@@ -62,6 +67,7 @@ async function verifyProfile(executable: string, pack = false) {
   });
   const secret = randomUUID();
   const log: string[] = [];
+  let readiness = "";
   let worker: ChildProcess | undefined;
   let exited: Promise<unknown[]> | undefined;
   let home: string | undefined;
@@ -90,7 +96,8 @@ async function verifyProfile(executable: string, pack = false) {
     if (pack) {
       const harness = fileURLToPath(new URL("../.github/scripts/test-mihomo-worker.ps1", import.meta.url));
       args = ["-NoProfile", "-NonInteractive", "-File", harness, "-App", executable, "-Port", String(port)];
-      payload = { config: imported.mihomo, core: "mihomo", routing_mode: "rule", controller: { port: controllerPort, secret } };
+      payload = { config: imported.mihomo, core: "mihomo", routing_mode: "rule",
+        controller: { port: controllerPort, secret }, selections: { [selector]: "FromProvider" } };
     } else {
       home = await mkdtemp(join(tmpdir(), "relaydesk-mihomo-"));
       args = ["-d", home, "-f", "-"];
@@ -102,7 +109,11 @@ async function verifyProfile(executable: string, pack = false) {
     worker = spawn(pack ? "pwsh" : executable, args, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     exited = once(worker, "exit");
     exited.catch(() => {});
-    worker.stdout?.on("data", (chunk: Buffer) => log.push(chunk.toString().replaceAll(secret, "[redacted]")));
+    worker.stdout?.on("data", (chunk: Buffer) => {
+      const line = chunk.toString().replaceAll(secret, "[redacted]");
+      if (pack) readiness = (readiness + line).slice(-256);
+      log.push(line);
+    });
     worker.stderr?.on("data", (chunk: Buffer) => log.push(chunk.toString().replaceAll(secret, "[redacted]")));
     worker.stdin?.on("error", () => {});
     if (pack) worker.stdin?.write(JSON.stringify(payload) + "\n");
@@ -116,15 +127,31 @@ async function verifyProfile(executable: string, pack = false) {
     );
     const groupPath = `/proxies/${encodeURIComponent(selector)}`;
     let providersReady = false;
+    let providerState = "controller unavailable";
     for (let attempt = 0; attempt < 160 && worker.exitCode === null; attempt++) {
       providersReady = await Promise.all([call(groupPath), call("/providers/rules")]).then(async ([group, rules]) => {
-        if (!group.ok || !rules.ok) return false;
-        return (await group.json()).all?.includes("FromProvider") && (await rules.json()).providers.RemoteRules?.ruleCount === 1;
+        if (!group.ok || !rules.ok) {
+          providerState = `group HTTP ${group.status}, rule provider HTTP ${rules.status}`;
+          return false;
+        }
+        const [groupBody, ruleBody] = await Promise.all([group.json(), rules.json()]);
+        const hasProxy = groupBody.all?.includes("FromProvider");
+        const count = ruleBody.providers.RemoteRules?.ruleCount ?? 0;
+        providerState = `proxy loaded: ${hasProxy}, rule count: ${count}`;
+        return hasProxy && count === 1;
       }).catch(() => false);
       if (providersReady) break;
       await delay(120);
     }
-    expect(providersReady).toBe(true);
+    expect(providersReady, `${providerState}; origin requests: ${providerRequests}`).toBe(true);
+    if (pack) {
+      for (let attempt = 0; attempt < 80 && worker.exitCode === null && !readiness.split(/\r?\n/).includes("ready"); attempt++) {
+        await delay(100);
+      }
+      expect(readiness.split(/\r?\n/)).toContain("ready");
+      expect((await call(groupPath).then(result => result.json())).now).toBe("FromProvider");
+      expect((await call(groupPath, { method: "PUT", body: '{"name":"DIRECT"}' })).status).toBe(204);
+    }
     expect((await call("/version", {}, false)).status).toBe(401);
     const through = () => new Promise<{ status: number | undefined; text: string }>((resolve, reject) => {
       const host = `${hostname}:${upstream}`;

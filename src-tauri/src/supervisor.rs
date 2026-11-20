@@ -23,8 +23,7 @@ const HEALTHY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Plan {
-    pub core: network::Core,
-    pub config: Value,
+    pub settings: network::CoreSettings,
     pub port: u16,
     pub mode: String,
     pub routing_mode: network::RoutingMode,
@@ -36,16 +35,15 @@ pub struct Plan {
 impl Plan {
     fn start(&self) -> Result<network::Session, String> {
         network::Session::start(
-            self.config.clone(),
+            self.settings.clone(),
             self.port,
             &self.mode,
             self.routing_mode,
-            self.core,
         )
     }
 
     fn selector(&self) -> Option<&Value> {
-        let selector = self.config.get("outbounds")?.as_array()?.first()?;
+        let selector = self.settings.config.get("outbounds")?.as_array()?.first()?;
         (selector.get("type")?.as_str()? == "selector").then_some(selector)
     }
 
@@ -75,7 +73,7 @@ impl Plan {
     }
 
     fn monitors_node(&self) -> bool {
-        self.core == network::Core::Singbox
+        self.settings.core == network::Core::Singbox
             && self.failover
             && !matches!(self.routing_mode, network::RoutingMode::Direct)
     }
@@ -294,7 +292,7 @@ impl Supervisor {
                 port: active.session.port,
                 controller: active.session.controller.clone(),
                 route_revision: active.health.revision,
-                core: active.plan.core,
+                core: active.plan.settings.core,
             }))
     }
 
@@ -332,7 +330,7 @@ impl Supervisor {
             .ok_or("节点模式未运行")?;
         active.controller.switch(&tag).await?;
         if !self.update_plan(&active.id, "已切换代理节点", None, |plan| {
-            plan.config["outbounds"][0]["default"] = tag.into();
+            plan.settings.config["outbounds"][0]["default"] = tag.into();
         }) {
             return Err("代理会话已变化，请重新切换节点".into());
         }
@@ -357,8 +355,18 @@ impl Supervisor {
             .live()?
             .filter(|active| active.core == network::Core::Mihomo)
             .ok_or("Mihomo 原配置模式未运行")?;
+        let groups = active.controller.groups().await?;
+        if !groups.iter().any(|candidate| {
+            candidate.manual
+                && candidate.name == group
+                && candidate.choices.iter().any(|target| target == choice)
+        }) {
+            return Err("此策略组的可选出站已变化，请重新选择".into());
+        }
         active.controller.switch_group(group, choice).await?;
-        if !self.update_plan(&active.id, "已切换 Mihomo 策略组", None, |_| {}) {
+        if !self.update_plan(&active.id, "已切换 Mihomo 策略组", None, |plan| {
+            plan.settings.selections.insert(group.into(), choice.into());
+        }) {
             return Err("Mihomo 会话已变化，请重新选择".into());
         }
         Ok(())
@@ -477,7 +485,7 @@ impl Supervisor {
                 "当前节点失联，已切换到同订阅的可用节点",
                 Some("原节点失联，已自动换线"),
                 |plan| {
-                    plan.config["outbounds"][0]["default"] = tag.into();
+                    plan.settings.config["outbounds"][0]["default"] = tag.into();
                 },
             );
         }
@@ -678,8 +686,7 @@ mod tests {
         let port = loopback().local_addr().unwrap().port();
         let supervisor = Supervisor::default();
         let plan = Plan {
-            core: network::Core::Singbox,
-            config: serde_json::json!({
+            settings: network::CoreSettings::singbox(serde_json::json!({
                 "inbounds":[{"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port}],
                 "outbounds":[
                     {"type":"selector","tag":"proxy","outbounds":["node-0","node-1"],"default":"node-0","interrupt_exist_connections":false},
@@ -688,7 +695,7 @@ mod tests {
                     {"type":"direct","tag":"direct"}
                 ],
                 "route":{"rules":[],"final":"proxy"}
-            }),
+            })),
             port,
             mode: "local".into(),
             routing_mode: network::RoutingMode::Global,
@@ -699,11 +706,10 @@ mod tests {
         supervisor
             .start_using(plan, |plan| {
                 network::Session::start_using(
-                    plan.config.clone(),
+                    plan.settings.clone(),
                     plan.port,
                     &plan.mode,
                     plan.routing_mode,
-                    plan.core,
                     &executable,
                 )
             })
@@ -821,24 +827,22 @@ mod tests {
         let supervisor = Supervisor::default();
         let launch = |plan: &Plan| {
             network::Session::start_using(
-                plan.config.clone(),
+                plan.settings.clone(),
                 plan.port,
                 &plan.mode,
                 plan.routing_mode,
-                plan.core,
                 &executable,
             )
         };
         let plan = Plan {
-            core: network::Core::Singbox,
-            config: serde_json::json!({
+            settings: network::CoreSettings::singbox(serde_json::json!({
                 "inbounds":[{"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port}],
                 "outbounds":[
                     {"type":"vless","tag":"proxy","server":"127.0.0.1","server_port":9,"uuid":"00000000-0000-4000-8000-000000000000"},
                     {"type":"direct","tag":"direct"}
                 ],
                 "route":{"rules":[],"final":"direct","auto_detect_interface":true}
-            }),
+            })),
             port,
             mode: "local".into(),
             routing_mode: network::RoutingMode::Rule,

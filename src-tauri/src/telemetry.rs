@@ -274,11 +274,11 @@ impl Controller {
 
 #[derive(Serialize)]
 pub struct ProxyGroup {
-    name: String,
+    pub name: String,
     kind: String,
-    selected: String,
-    choices: Vec<String>,
-    manual: bool,
+    pub selected: String,
+    pub choices: Vec<String>,
+    pub manual: bool,
 }
 
 #[derive(Deserialize)]

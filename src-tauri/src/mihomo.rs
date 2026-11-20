@@ -1,5 +1,6 @@
-use crate::network::RoutingMode;
+use crate::{network::RoutingMode, telemetry::Controller};
 use serde_json::{json, Map, Value};
+use std::{collections::BTreeMap, time::Duration};
 
 const TRAFFIC_FIELDS: &[&str] = &[
     "proxies",
@@ -95,6 +96,35 @@ pub fn prepare(config: &Value, port: u16, mode: RoutingMode) -> Result<Value, St
     config.insert("mode".into(), json!(mode.name()));
     config.insert("log-level".into(), json!("warning"));
     Ok(Value::Object(config))
+}
+
+pub async fn restore_selections(
+    controller: &Controller,
+    selections: BTreeMap<String, String>,
+    budget: Duration,
+) {
+    let mut pending = selections;
+    let _ = tokio::time::timeout(budget, async {
+        while !pending.is_empty() {
+            if let Ok(groups) = controller.groups().await {
+                for group in groups.into_iter().filter(|group| group.manual) {
+                    let Some(choice) = pending.get(&group.name) else {
+                        continue;
+                    };
+                    if group.selected == *choice
+                        || (group.choices.contains(choice)
+                            && controller.switch_group(&group.name, choice).await.is_ok())
+                    {
+                        pending.remove(&group.name);
+                    }
+                }
+            }
+            if !pending.is_empty() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    })
+    .await;
 }
 
 #[cfg(test)]

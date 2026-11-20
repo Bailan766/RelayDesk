@@ -1,6 +1,7 @@
 use crate::{core_command, core_path, mihomo, system_proxy};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     env, fs,
     os::windows::ffi::OsStrExt,
     path::PathBuf,
@@ -40,6 +41,25 @@ pub enum Core {
     #[default]
     Singbox,
     Mihomo,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct CoreSettings {
+    pub config: Value,
+    #[serde(default)]
+    pub core: Core,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub selections: BTreeMap<String, String>,
+}
+
+impl CoreSettings {
+    pub fn singbox(config: Value) -> Self {
+        Self {
+            config,
+            core: Core::Singbox,
+            selections: BTreeMap::new(),
+        }
+    }
 }
 
 fn tun_interface(token: &str) -> String {
@@ -628,12 +648,11 @@ pub struct Session {
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct WorkerInput {
-    config: Value,
+    #[serde(flatten)]
+    settings: CoreSettings,
     controller: crate::telemetry::Controller,
     #[serde(default)]
     routing_mode: RoutingMode,
-    #[serde(default)]
-    core: Core,
 }
 
 struct MihomoHome(PathBuf);
@@ -645,32 +664,31 @@ impl Drop for MihomoHome {
 
 impl Session {
     pub fn start(
-        config: Value,
+        settings: CoreSettings,
         port: u16,
         mode: &str,
         routing_mode: RoutingMode,
-        core: Core,
     ) -> Result<Self, String> {
         let executable = env::current_exe().map_err(|_| "无法定位当前应用")?;
-        Self::start_using(config, port, mode, routing_mode, core, &executable)
+        Self::start_using(settings, port, mode, routing_mode, &executable)
     }
 
     pub(crate) fn start_using(
-        config: Value,
+        settings: CoreSettings,
         port: u16,
         mode: &str,
         routing_mode: RoutingMode,
-        core: Core,
         executable: &std::path::Path,
     ) -> Result<Self, String> {
         if !matches!(mode, "local" | "system" | "tun") {
             return Err("代理入口模式无效".into());
         }
+        let core = settings.core;
         if core == Core::Mihomo {
             if mode == "tun" {
                 return Err("Mihomo 原配置模式目前使用系统代理或本地端口".into());
             }
-            mihomo::prepare(&config, port, routing_mode)?;
+            mihomo::prepare(&settings.config, port, routing_mode)?;
         }
         ensure_port_available(port)?;
         let directory = runtime_dir()?;
@@ -695,10 +713,9 @@ impl Session {
         let _cleanup = crate::TemporaryConfig(path.clone());
         let controller = crate::telemetry::Controller::new(port)?;
         let input = WorkerInput {
-            config,
+            settings,
             controller: controller.clone(),
             routing_mode,
-            core,
         };
         fs::write(
             &path,
@@ -892,10 +909,14 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let input = directory.join(format!("{token}.json"));
     let config = fs::read(input).map_err(|_| "无法读取内核配置")?;
     let WorkerInput {
-        mut config,
+        settings:
+            CoreSettings {
+                mut config,
+                core,
+                selections,
+            },
         controller,
         routing_mode,
-        core,
     } = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
     let home = if core == Core::Mihomo {
         if mode == "tun" {
@@ -1009,6 +1030,25 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             break;
         }
         thread::sleep(Duration::from_millis(70));
+    }
+    if core == Core::Mihomo && !selections.is_empty() {
+        let budget = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(6));
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            runtime.block_on(mihomo::restore_selections(&controller, selections, budget));
+        }
+        if stop.signaled(0)
+            || parent.signaled(0)
+            || child.try_wait().map_err(|_| "无法读取内核状态")?.is_some()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Mihomo 在恢复策略选择时已停止".into());
+        }
     }
     if mode == "system" {
         system_proxy::enable(&journal, port).map_err(|_| "无法设置系统代理")?;
