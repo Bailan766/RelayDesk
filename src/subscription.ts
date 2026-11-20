@@ -8,7 +8,7 @@ export interface NodeProfile {
   revision?: string;
 }
 export interface ImportResult { nodes: NodeProfile[]; warnings: string[]; format: string; policySections?: string[] }
-const protocols = new Set(['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'hy2', 'tuic', 'shadowsocks']);
+const protocols = new Set(['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'hy2', 'tuic', 'shadowsocks', 'wireguard']);
 export const decodeSubscriptionText = (value: string) => new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(value.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)));
 const clean = (value: unknown) => typeof value === 'string' ? value : '';
 function node(name: string, protocol: string, server: string, port: unknown, transport = 'tcp', security = 'none'): NodeProfile {
@@ -18,7 +18,7 @@ function node(name: string, protocol: string, server: string, port: unknown, tra
 }
 function fromUri(line: string): NodeProfile {
   const scheme = line.slice(0, line.indexOf('://')).toLowerCase();
-  if (!protocols.has(scheme)) throw new Error('不支持的协议');
+  if (!protocols.has(scheme) || scheme === 'wireguard') throw new Error('不支持的分享链接');
   if (scheme === 'vmess') {
     const v = JSON.parse(decodeSubscriptionText(line.slice(line.indexOf('://') + 3)));
     return { ...node(clean(v.ps), 'vmess', clean(v.add), v.port, clean(v.net) || 'tcp', clean(v.tls) || 'none'),
@@ -41,9 +41,12 @@ function fromObject(v: Fields, format: 'clash' | 'sing-box'): NodeProfile {
   const protocol = clean(v.type).toLowerCase(); if (!protocols.has(protocol)) throw new Error('不支持的协议');
   const transport = v.transport && typeof v.transport === 'object' ? v.transport as Record<string, unknown> : {};
   const tls = v.tls && typeof v.tls === 'object' ? v.tls as Record<string, unknown> : {};
+  const firstPeer = Array.isArray(v.peers) && v.peers[0] && typeof v.peers[0] === 'object' ? v.peers[0] as Fields : undefined;
   const firstHop = (Array.isArray(v.server_ports) ? clean(v.server_ports[0]) : clean(v.ports)).split(/[:,\-]/)[0];
-  const profile = node(clean(v.name) || clean(v.tag), protocol, clean(v.server),
-    v.port ?? v.server_port ?? firstHop, clean(transport.type) || clean(v.network) || 'tcp',
+  const profile = node(clean(v.name) || clean(v.tag), protocol,
+    protocol === 'wireguard' ? clean(firstPeer?.address ?? firstPeer?.server ?? v.server) : clean(v.server),
+    protocol === 'wireguard' ? firstPeer?.port ?? v.port : v.port ?? v.server_port ?? firstHop,
+    protocol === 'wireguard' ? 'udp' : clean(transport.type) || clean(v.network) || 'tcp',
     tls.reality || v['reality-opts'] ? 'reality' : tls.enabled || v.tls === true || ['trojan','tuic','hysteria2','hy2'].includes(protocol) ? 'tls' : 'none');
   return { ...profile, definition: { format, fields: v } };
 }
@@ -69,7 +72,6 @@ function policySections(document: unknown): string[] | undefined {
     ['分流', ['rules', 'route', 'rule-providers', 'rule_set']],
     ['DNS', ['dns']],
     ['入站', ['inbounds', 'listeners']],
-    ['端点', ['endpoints']],
   ] as const;
   const selected = known.filter(([, keys]) => keys.some(key => Object.hasOwn(value, key))).map(([name]) => name);
   return selected.length ? selected : undefined;
@@ -78,18 +80,18 @@ export function parseSubscription(input: string): ImportResult {
   let text = input.trim(); if (!text) throw new Error('订阅内容为空');
   let format = 'URI'; let entries: unknown[]; let schema: 'clash' | 'sing-box' = 'sing-box';
   let sections: string[] | undefined;
-  if (!text.includes('://') && !text.startsWith('{') && !text.startsWith('[') && !/^\s*(proxies|outbounds):/m.test(text)) {
+  if (!text.includes('://') && !text.startsWith('{') && !text.startsWith('[') && !/^\s*(proxies|outbounds|endpoints):/m.test(text)) {
     try { text = decodeSubscriptionText(text).trim(); format = 'Base64'; } catch { throw new Error('无法识别订阅格式'); }
   }
   if (text.startsWith('{') || text.startsWith('[')) {
     const data = JSON.parse(text);
     schema = Array.isArray(data?.proxies) ? 'clash' : 'sing-box';
-    entries = Array.isArray(data) ? data : schema === 'clash' ? data.proxies : data?.outbounds;
+    entries = Array.isArray(data) ? data : schema === 'clash' ? data.proxies : singBoxEntries(data);
     sections = policySections(data);
     format = schema === 'clash' ? 'Clash JSON' : 'sing-box JSON';
     if (!Array.isArray(entries)) throw new Error('JSON 中没有代理节点列表');
-  } else if (/^\s*(proxies|outbounds):/m.test(text)) {
-    const data = parseYaml(text, { maxAliasCount: 100 }); entries = data?.proxies ?? data?.outbounds;
+  } else if (/^\s*(proxies|outbounds|endpoints):/m.test(text)) {
+    const data = parseYaml(text, { maxAliasCount: 100 }); entries = data?.proxies ?? singBoxEntries(data);
     sections = policySections(data);
     schema = data?.proxies ? 'clash' : 'sing-box'; format = schema === 'clash' ? 'Clash YAML' : 'sing-box YAML';
     if (!Array.isArray(entries)) throw new Error('YAML 中没有代理节点列表');
@@ -104,4 +106,14 @@ export function parseSubscription(input: string): ImportResult {
   });
   if (!nodes.length) throw new Error(`没有找到可识别的节点（${entries.length} 项）`);
   return { nodes, warnings, format, policySections: sections };
+}
+
+function singBoxEntries(document: unknown): unknown[] {
+  if (!document || typeof document !== 'object' || Array.isArray(document)) throw new Error('配置不是对象');
+  const { outbounds, endpoints } = document as Fields;
+  if (!Array.isArray(outbounds) && !Array.isArray(endpoints)) throw new Error('配置中没有 outbounds 或 endpoints 列表');
+  return [
+    ...(Array.isArray(outbounds) ? outbounds : []),
+    ...(Array.isArray(endpoints) ? endpoints : []),
+  ];
 }

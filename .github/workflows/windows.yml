@@ -64,6 +64,8 @@ jobs:
           }
           & .github/scripts/test-windows-network.ps1 -App (Join-Path $install 'relaydesk.exe')
           $env:RELAYDESK_INSTALLED_SMOKE_APP = Join-Path $install 'relaydesk.exe'
+          npm test -- src/wireguard-integration.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Installed WireGuard TUN test failed' }
           cargo test --manifest-path src-tauri/Cargo.toml supervisor::tests::installed_worker_recovers_and_explicit_stop_cancels_it -- --exact --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Installed worker recovery test failed' }
           $upgrade = Start-Process -FilePath (Resolve-Path relaydesk-windows-x64-setup.exe) -ArgumentList '/S', "/D=$install" -Wait -PassThru

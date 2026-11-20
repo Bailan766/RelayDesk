@@ -1,4 +1,5 @@
 import { decodeSubscriptionText, type Fields, type NodeProfile } from './subscription';
+import { normalizeIpCidr } from './ip';
 
 const protocolFields: Record<string, string> = {
   vless: 'uuid flow packet_encoding transport tls',
@@ -286,7 +287,96 @@ function validate(value: Fields, protocol: string) {
   for (const key of ['alter_id','up_mbps','down_mbps']) if (value[key] !== undefined) value[key] = integer(value[key], key);
 }
 
+function wireguardKey(value: unknown): string {
+  const key = requiredString(value, 'WireGuard 密钥');
+  if (!/^[A-Za-z0-9+/]{43}=$/.test(key) || atob(key).length !== 32) throw new Error('WireGuard 密钥格式无效');
+  return key;
+}
+
+function wireguardAddresses(value: unknown): string[] {
+  const addresses = strings(value, 'WireGuard 地址');
+  if (!addresses?.length || addresses.length > 64) throw new Error('WireGuard 地址列表无效');
+  return addresses.map(normalizeIpCidr);
+}
+
+function wireguardPeer(data: Fields, clash: boolean, defaultAddresses?: string[], keepaliveDefault?: unknown): Fields {
+  fieldsOnly(data, clash ? 'server port public-key pre-shared-key allowed-ips reserved persistent-keepalive'
+    : 'address port public_key pre_shared_key allowed_ips reserved persistent_keepalive_interval', 'WireGuard 对端');
+  const destination = requiredString(clash ? data.server : data.address, 'WireGuard 对端地址')
+    .replace(/^\[([^\]]+)\]$/, '$1');
+  if (destination.length > 253 || !/^[A-Za-z0-9:._-]+$/.test(destination)) {
+    throw new Error('WireGuard 对端地址无效');
+  }
+  const port = integer(data.port, 'WireGuard 端口');
+  if (!port || port > 65535) throw new Error('WireGuard 端口无效');
+  const preshared = clash ? data['pre-shared-key'] : data.pre_shared_key;
+  if (destination.includes(':')) normalizeIpCidr(destination);
+  const keepalive = integer(clash ? data['persistent-keepalive'] ?? keepaliveDefault : data.persistent_keepalive_interval, 'WireGuard 保活间隔');
+  if (keepalive !== undefined && keepalive > 65535) throw new Error('WireGuard 保活间隔无效');
+  const reserved = typeof data.reserved === 'string' ? Array.from(atob(data.reserved), byte => byte.charCodeAt(0)) : data.reserved;
+  if (reserved != null && (!Array.isArray(reserved) || reserved.length !== 3
+      || reserved.some(value => !Number.isInteger(value) || value < 0 || value > 255))) {
+    throw new Error('WireGuard 保留字段须为 3 字节');
+  }
+  return {
+    address: destination, port,
+    public_key: wireguardKey(clash ? data['public-key'] : data.public_key),
+    pre_shared_key: preshared == null || preshared === '' ? undefined : wireguardKey(preshared),
+    allowed_ips: (clash ? data['allowed-ips'] : data.allowed_ips) == null && defaultAddresses
+      ? defaultAddresses : wireguardAddresses(clash ? data['allowed-ips'] : data.allowed_ips),
+    reserved,
+    persistent_keepalive_interval: keepalive,
+  };
+}
+
+function wireguardEndpoint(node: NodeProfile, tag: string): Fields {
+  const source = node.definition;
+  if (!source || source.format === 'vmess-uri') throw new Error('缺少 WireGuard 配置');
+  const data = source.fields;
+  const clash = source.format === 'clash';
+  let addresses: string[];
+  let peers: unknown[];
+  let defaultKeepalive: unknown;
+  let singleClashPeer = false;
+  if (clash) {
+    const { name: _name, type: _type, ip, ipv6, 'private-key': _key, mtu: _mtu, udp,
+      'persistent-keepalive': keepalive, peers: explicitPeers, ...peer } = data;
+    defaultKeepalive = keepalive;
+    if (optionalBool(udp) === false) throw new Error('当前内核无法关闭此 WireGuard 节点的 UDP 转发');
+    addresses = wireguardAddresses([ip, ipv6].filter(value => value != null && value !== ''));
+    if (explicitPeers != null) {
+      if (Object.keys(peer).length) throw new Error('WireGuard 配置混用了单对端和多对端参数');
+      if (!Array.isArray(explicitPeers)) throw new Error('WireGuard 对端列表格式有误');
+      peers = explicitPeers;
+    } else {
+      peers = [peer];
+      singleClashPeer = true;
+    }
+  } else {
+    fieldsOnly(data, 'type tag system mtu address private_key peers', 'WireGuard 端点');
+    if (optionalBool(data.system) === true) throw new Error('独立节点仅支持 WireGuard 用户态端点');
+    addresses = wireguardAddresses(data.address);
+    if (!Array.isArray(data.peers)) throw new Error('WireGuard 对端列表格式有误');
+    peers = data.peers;
+  }
+  if (!peers.length || peers.length > 32) throw new Error('WireGuard 对端列表大小无效');
+  const allowed = [
+    ...(addresses.some(address => !address.includes(':')) ? ['0.0.0.0/0'] : []),
+    ...(addresses.some(address => address.includes(':')) ? ['::/0'] : []),
+  ];
+  const outputPeers = peers.map(peer => cleanFields(wireguardPeer(object(peer, 'WireGuard 对端'), clash,
+    singleClashPeer ? allowed : undefined, defaultKeepalive)));
+  const mtu = integer(data.mtu, 'WireGuard MTU');
+  if (mtu !== undefined && (mtu < 576 || mtu > 65535)) throw new Error('WireGuard MTU 无效');
+  return cleanFields({
+    // Dial the peer through the physical interface without opening unsolicited UDP listeners.
+    type: 'wireguard', tag, system: false, detour: 'wireguard-uplink', address: addresses, peers: outputPeers,
+    private_key: wireguardKey(clash ? data['private-key'] : data.private_key), mtu,
+  });
+}
+
 export function compileOutbound(node: NodeProfile, tag: string): Fields {
+  if (node.protocol === 'wireguard') return wireguardEndpoint(node, tag);
   if (!protocolFields[node.protocol]) throw new Error('此节点类型尚不支持连接');
   const source = node.definition;
   let settings: Fields;

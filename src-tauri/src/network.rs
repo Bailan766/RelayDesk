@@ -303,13 +303,135 @@ fn validate_node(node: &Value, tag: &str) -> Option<()> {
     Some(())
 }
 
-fn validate_outbounds(outbounds: &[Value]) -> Option<()> {
+fn valid_cidr(text: &str) -> bool {
+    text.split_once('/').is_some_and(|(address, prefix)| {
+        let limit = match address.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(_)) => 32,
+            Ok(std::net::IpAddr::V6(_)) => 128,
+            _ => return false,
+        };
+        prefix.parse::<u8>().is_ok_and(|prefix| prefix <= limit)
+    })
+}
+
+fn valid_wireguard_prefixes(value: &Value) -> bool {
+    value.as_array().is_some_and(|prefixes| {
+        !prefixes.is_empty()
+            && prefixes.len() <= 64
+            && prefixes
+                .iter()
+                .all(|prefix| prefix.as_str().is_some_and(valid_cidr))
+    })
+}
+
+fn valid_wireguard_key(value: &Value) -> bool {
+    value.as_str().is_some_and(|key| {
+        key.len() == 44
+            && key.ends_with('=')
+            && key.as_bytes()[..43]
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+    })
+}
+
+fn validate_endpoint(endpoint: &Value, tag: &str) -> Option<()> {
+    let fields = checked_object(
+        endpoint,
+        &[
+            "type",
+            "tag",
+            "system",
+            "detour",
+            "address",
+            "private_key",
+            "mtu",
+            "peers",
+        ],
+    )?;
+    if fields.get("tag")?.as_str()? != tag
+        || fields.get("type")?.as_str()? != "wireguard"
+        || fields.get("system")?.as_bool()?
+        || fields.get("detour")?.as_str()? != "wireguard-uplink"
+        || !valid_wireguard_prefixes(fields.get("address")?)
+        || !valid_wireguard_key(fields.get("private_key")?)
+        || fields.get("mtu").is_some_and(|value| {
+            !value
+                .as_u64()
+                .is_some_and(|mtu| (576..=65535).contains(&mtu))
+        })
+    {
+        return None;
+    }
+    let peers = fields.get("peers")?.as_array()?;
+    if peers.is_empty() || peers.len() > 32 {
+        return None;
+    }
+    for peer in peers {
+        let fields = checked_object(
+            peer,
+            &[
+                "address",
+                "port",
+                "public_key",
+                "pre_shared_key",
+                "allowed_ips",
+                "reserved",
+                "persistent_keepalive_interval",
+            ],
+        )?;
+        let address = fields.get("address")?.as_str()?;
+        if address.is_empty()
+            || address.len() > 253
+            || !address.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'-')
+            })
+            || !fields
+                .get("port")?
+                .as_u64()
+                .is_some_and(|port| (1..=65535).contains(&port))
+            || !valid_wireguard_key(fields.get("public_key")?)
+            || !valid_wireguard_prefixes(fields.get("allowed_ips")?)
+            || fields
+                .get("pre_shared_key")
+                .is_some_and(|value| !valid_wireguard_key(value))
+            || fields
+                .get("persistent_keepalive_interval")
+                .is_some_and(|value| !value.as_u64().is_some_and(|n| n <= 65535))
+            || fields.get("reserved").is_some_and(|value| {
+                !value.as_array().is_some_and(|bytes| {
+                    bytes.len() == 3
+                        && bytes
+                            .iter()
+                            .all(|byte| byte.as_u64().is_some_and(|n| n <= 255))
+                })
+            })
+        {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn validate_outbounds(outbounds: &[Value], endpoints: &[Value]) -> Option<()> {
     let (direct, group) = outbounds.split_last()?;
     if *direct != json!({"type":"direct","tag":"direct"}) {
         return None;
     }
+    let group = if endpoints.is_empty() {
+        group
+    } else {
+        let (uplink, group) = group.split_last()?;
+        if endpoints.len() > 32
+            || *uplink != json!({"type":"direct","tag":"wireguard-uplink","connect_timeout":"5s"})
+        {
+            return None;
+        }
+        group
+    };
     if let [node] = group {
-        return validate_node(node, "proxy");
+        if endpoints.is_empty() && node.get("type").and_then(Value::as_str) != Some("selector") {
+            return validate_node(node, "proxy");
+        }
     }
     let (selector, nodes) = group.split_first()?;
     let selector = checked_object(
@@ -325,26 +447,46 @@ fn validate_outbounds(outbounds: &[Value]) -> Option<()> {
     if selector.get("type")?.as_str()? != "selector"
         || selector.get("tag")?.as_str()? != "proxy"
         || selector.get("interrupt_exist_connections")?.as_bool()?
-        || nodes.len() > 2048
+        || nodes.len() + endpoints.len() > 2048
     {
         return None;
     }
     let tags = selector.get("outbounds")?.as_array()?;
     let default = selector.get("default")?.as_str()?;
-    if tags.len() != nodes.len() || !tags.iter().any(|tag| tag.as_str() == Some(default)) {
+    if tags.len() != nodes.len() + endpoints.len()
+        || !tags.iter().any(|tag| tag.as_str() == Some(default))
+    {
         return None;
     }
-    for (index, (tag, node)) in tags.iter().zip(nodes).enumerate() {
+    let mut tagged = std::collections::HashMap::new();
+    for (node, is_endpoint) in nodes
+        .iter()
+        .map(|node| (node, false))
+        .chain(endpoints.iter().map(|node| (node, true)))
+    {
+        if tagged
+            .insert(node.get("tag")?.as_str()?, (node, is_endpoint))
+            .is_some()
+        {
+            return None;
+        }
+    }
+    for (index, tag) in tags.iter().enumerate() {
         let expected = format!("node-{index}");
         if tag.as_str()? != expected {
             return None;
         }
-        validate_node(node, &expected)?;
+        let (node, is_endpoint) = tagged.remove(expected.as_str())?;
+        if is_endpoint {
+            validate_endpoint(node, &expected)?;
+        } else {
+            validate_node(node, &expected)?;
+        }
     }
     Some(())
 }
 
-fn validate_rule(rule: &Value, outbounds: &[Value]) -> Option<()> {
+fn validate_rule(rule: &Value, outbounds: &[Value], endpoints: &[Value]) -> Option<()> {
     const MATCHES: [&str; 4] = ["domain", "domain_suffix", "ip_cidr", "process_path_regex"];
     let fields = checked_object(
         rule,
@@ -371,14 +513,7 @@ fn validate_rule(rule: &Value, outbounds: &[Value]) -> Option<()> {
                 return false;
             };
             match key {
-                "ip_cidr" => text.split_once('/').is_some_and(|(address, prefix)| {
-                    let limit = match address.parse::<std::net::IpAddr>() {
-                        Ok(std::net::IpAddr::V4(_)) => 32,
-                        Ok(std::net::IpAddr::V6(_)) => 128,
-                        _ => return false,
-                    };
-                    prefix.parse::<u8>().is_ok_and(|prefix| prefix <= limit)
-                }),
+                "ip_cidr" => valid_cidr(text),
                 "process_path_regex" => {
                     text.len() <= 512 && text.starts_with("(?i)(?:^|[") && text.ends_with('$')
                 }
@@ -391,9 +526,11 @@ fn validate_rule(rule: &Value, outbounds: &[Value]) -> Option<()> {
     match (fields.get("action"), fields.get("outbound")) {
         (Some(action), None) if action.as_str() == Some("reject") => Some(()),
         (None, Some(outbound))
-            if outbounds.iter().any(|item| {
-                item.get("tag").and_then(Value::as_str) == outbound.as_str() && outbound.is_string()
-            }) =>
+            if outbound.as_str() != Some("wireguard-uplink")
+                && outbounds.iter().chain(endpoints).any(|item| {
+                    item.get("tag").and_then(Value::as_str) == outbound.as_str()
+                        && outbound.is_string()
+                }) =>
         {
             Some(())
         }
@@ -403,20 +540,42 @@ fn validate_rule(rule: &Value, outbounds: &[Value]) -> Option<()> {
 
 // The elevated worker constructs its own inbound, DNS and interface settings.
 fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> {
-    let root = checked_object(config, &["log", "inbounds", "outbounds", "route"])?;
+    let root = checked_object(
+        config,
+        &["log", "inbounds", "outbounds", "endpoints", "route", "dns"],
+    )?;
     let outbounds = root.get("outbounds")?.as_array()?;
-    validate_outbounds(outbounds)?;
+    let endpoints: &[Value] = match root.get("endpoints") {
+        Some(list) => list.as_array()?,
+        None => &[],
+    };
+    validate_outbounds(outbounds, endpoints)?;
     let route = checked_object(
         root.get("route")?,
-        &["rules", "final", "auto_detect_interface"],
+        &[
+            "rules",
+            "final",
+            "auto_detect_interface",
+            "default_domain_resolver",
+        ],
     )?;
-    let rules = route.get("rules")?.as_array()?;
+    let mut rules = route.get("rules")?.as_array()?.as_slice();
     let mut output_rules = vec![
         json!({"action":"sniff"}),
         json!({"protocol":"dns","action":"hijack-dns"}),
     ];
+    if !endpoints.is_empty() {
+        let (front, rest) = rules.split_first()?;
+        let tags: Vec<_> = endpoints.iter().map(|endpoint| &endpoint["tag"]).collect();
+        let guard = json!({"inbound":tags,"action":"reject"});
+        if *front != guard {
+            return None;
+        }
+        output_rules.insert(0, guard);
+        rules = rest;
+    }
     for rule in rules {
-        validate_rule(rule, outbounds)?;
+        validate_rule(rule, outbounds, endpoints)?;
         output_rules.push(rule.clone());
     }
     Some(json!({
@@ -426,6 +585,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
             {"type":"tun","tag":"tun","interface_name":interface_name,"address":["172.28.254.1/30","fdfe:dcba:9876::1/126"],"auto_route":true,"strict_route":true,"stack":"mixed"}
         ],
         "outbounds": outbounds,
+        "endpoints": endpoints,
         "route":{"rules":output_rules,"final":"proxy","auto_detect_interface":true,"default_domain_resolver":"bootstrap"},
         "dns":{
             "servers":[{"type":"local","tag":"bootstrap"},{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","detour":"proxy"}],
@@ -626,6 +786,10 @@ fn ensure_port_available(port: u16) -> Result<(), String> {
 }
 
 fn add_routing_modes(config: &mut Value, tun: bool) -> Option<()> {
+    let has_wireguard = config
+        .get("endpoints")
+        .and_then(Value::as_array)
+        .is_some_and(|endpoints| !endpoints.is_empty());
     let route = config
         .as_object_mut()?
         .entry("route")
@@ -640,7 +804,7 @@ fn add_routing_modes(config: &mut Value, tun: bool) -> Option<()> {
         .entry("rules")
         .or_insert_with(|| json!([]))
         .as_array_mut()?;
-    let first = if tun { 2 } else { 0 };
+    let first = if tun { 2 } else { 0 } + usize::from(has_wireguard);
     rules.splice(
         first..first,
         [
@@ -837,21 +1001,56 @@ mod tests {
     fn elevated_rules_accept_only_present_outbounds_and_valid_networks() {
         let outbounds = vec![json!({"tag":"direct"}), json!({"tag":"node-1"})];
         let rule = json!({"ip_cidr":["2001:db8::/32","192.0.2.0/24"],"outbound":"node-1"});
-        assert!(validate_rule(&rule, &outbounds).is_some());
+        assert!(validate_rule(&rule, &outbounds, &[]).is_some());
         assert!(validate_rule(
             &json!({"ip_cidr":["2001:db8::/129"],"outbound":"node-1"}),
-            &outbounds
+            &outbounds,
+            &[]
         )
         .is_none());
         assert!(validate_rule(
             &json!({"domain":["example.org"],"outbound":"absent"}),
-            &outbounds
+            &outbounds,
+            &[]
         )
         .is_none());
         assert!(validate_rule(
             &json!({"ip_cidr":["127.0.0.1/32"],"domain":["example.org"],"action":"reject"}),
-            &outbounds
+            &outbounds,
+            &[]
         )
         .is_none());
+    }
+
+    #[test]
+    fn wireguard_is_an_unprivileged_endpoint_inside_tun_configuration() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let mut config = json!({
+            "outbounds":[{
+                "type":"selector","tag":"proxy","outbounds":["node-0"],"default":"node-0",
+                "interrupt_exist_connections":false
+            },{"type":"direct","tag":"wireguard-uplink","connect_timeout":"5s"},{"type":"direct","tag":"direct"}],
+            "endpoints":[{
+                "type":"wireguard","system":false,"tag":"node-0","detour":"wireguard-uplink",
+                "private_key":key,"address":["192.0.2.7/32"],
+                "peers":[{"address":"example.org","port":51820,"public_key":key,"allowed_ips":["0.0.0.0/0"]}]
+            }],
+            "route":{"rules":[{"inbound":["node-0"],"action":"reject"},{"domain":["example.org"],"outbound":"node-0"}]}
+        });
+        let mut trusted = tun_config(&config, 17771, "Fixture").unwrap();
+        add_routing_modes(&mut trusted, true).unwrap();
+        assert_eq!(
+            trusted["route"]["rules"][0],
+            json!({"inbound":["node-0"],"action":"reject"})
+        );
+        assert_eq!(trusted["route"]["rules"][3]["clash_mode"], "direct");
+        config["route"]["rules"][0]["action"] = json!("route");
+        assert!(tun_config(&config, 17771, "Fixture").is_none());
+        config["route"]["rules"][0]["action"] = json!("reject");
+        config["endpoints"][0]["detour"] = json!("proxy");
+        assert!(tun_config(&config, 17771, "Fixture").is_none());
+        config["endpoints"][0]["detour"] = json!("wireguard-uplink");
+        config["endpoints"][0]["system"] = json!(true);
+        assert!(tun_config(&config, 17771, "Fixture").is_none());
     }
 }

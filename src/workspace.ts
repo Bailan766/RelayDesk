@@ -138,6 +138,7 @@ export function deserializeWorkspace(raw: string): Workspace {
     // Earlier clients indexed the first appearance of each display name and endpoint.
     const seen = new Set<string>();
     const legacyNodes = profile.parsed.nodes.filter(node => {
+      if (node.protocol === "wireguard") return false;
       const endpoint = JSON.stringify([node.protocol, node.server, node.port, node.name]);
       if (seen.has(endpoint)) return false;
       seen.add(endpoint);
