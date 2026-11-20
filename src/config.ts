@@ -9,7 +9,7 @@ export function buildConfig(node: NodeProfile, port: number): object {
   const outbound: Record<string, unknown> = { type: node.protocol, tag: 'proxy', server: node.server, server_port: node.port };
   const security = query.get('security') || (node.protocol === 'hysteria2' ? 'tls' : 'none');
   const tls: Record<string, unknown> = { enabled: security !== 'none' };
-  const serverName = query.get('sni') || query.get('peer');
+  const serverName = query.get('sni') || query.get('servername') || query.get('peer');
   if (serverName) tls.server_name = serverName;
   if (query.get('insecure') === '1' || query.get('allowInsecure') === '1') tls.insecure = true;
   const alpn = query.get('alpn'); if (alpn) tls.alpn = alpn.split(',');
@@ -19,6 +19,7 @@ export function buildConfig(node: NodeProfile, port: number): object {
     tls.reality = { enabled: true, public_key: publicKey, short_id: query.get('sid') || '' };
   }
   if (node.protocol === 'vless') {
+    if (query.get('encryption') && query.get('encryption') !== 'none') throw new Error('暂不支持此 VLESS 加密方式');
     outbound.uuid = credential;
     const flow = query.get('flow'); if (flow) outbound.flow = flow;
     const type = query.get('type') || 'tcp';
@@ -33,11 +34,16 @@ export function buildConfig(node: NodeProfile, port: number): object {
     const multiPort = query.get('mport');
     if (multiPort) {
       const ports = multiPort.split(',').map(value => value.trim().replace('-', ':'));
-      if (ports.some(value => !/^\d{1,5}(:\d{1,5})?$/.test(value) || value.split(':').some(port => +port < 1 || +port > 65535))) throw new Error('Hysteria2 端口范围无效');
+      if (ports.some(value => !/^\d{1,5}(:\d{1,5})?$/.test(value) || value.split(':').some(port => +port < 1 || +port > 65535) || (value.includes(':') && +value.split(':')[0] > +value.split(':')[1]))) throw new Error('Hysteria2 端口范围无效');
       delete outbound.server_port;
       outbound.server_ports = ports;
     }
   }
   if (tls.enabled) outbound.tls = tls;
   return { log: { level: 'warn' }, inbounds: [{ type: 'mixed', tag: 'local', listen: '127.0.0.1', listen_port: port }], outbounds: [outbound, { type: 'direct', tag: 'direct' }], route: { final: 'proxy', auto_detect_interface: true } };
+}
+
+export function connectionSupport(node: NodeProfile): string | null {
+  try { buildConfig(node, 12345); return null; }
+  catch (error) { return error instanceof Error ? error.message : '此节点暂不支持连接'; }
 }

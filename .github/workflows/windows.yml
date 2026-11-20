@@ -17,16 +17,20 @@ jobs:
         with:
           workspaces: ./src-tauri -> target
       - run: npm ci
-      - run: npm test
-      - run: npm run build
-      - run: npm run tauri -- build --no-bundle
-      - name: Package pinned sing-box
+      - name: Download and verify sing-box
         shell: pwsh
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'sing-box.zip'
           Invoke-WebRequest 'https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-windows-amd64.zip' -OutFile $archive
           if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df') { throw 'sing-box checksum mismatch' }
           Expand-Archive $archive -DestinationPath (Join-Path $env:RUNNER_TEMP 'sing-box')
+          "SING_BOX=$(Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/sing-box.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - run: npm test
+      - run: npm run build
+      - run: npm run tauri -- build --no-bundle
+      - name: Package pinned sing-box
+        shell: pwsh
+        run: |
           New-Item -ItemType Directory -Path release | Out-Null
           Copy-Item src-tauri/target/release/relaydesk.exe release/
           Copy-Item (Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/sing-box.exe') release/
