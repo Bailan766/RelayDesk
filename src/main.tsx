@@ -24,6 +24,7 @@ import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleValue,
 import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
 import { SubscriptionCard, SubscriptionRequestFields } from "./SubscriptionCard";
 import { WebsiteChecks } from "./WebsiteChecks";
+import { DownloadCheck } from "./DownloadCheck";
 import { EventLog } from "./EventLog";
 import { useWorkspace } from "./useWorkspace";
 import { defaultSubscriptionRequest, preferredNode, type EntryMode, type RoutingMode, type SubscriptionRequest, type Workspace } from "./workspace";
@@ -787,7 +788,10 @@ function App() {
               </div> : <p className="empty">{work.ready ? "尚未导入订阅" : "等待本地订阅读取"}</p>}
             </section>
           )}
-          {page === "测试" && <UnlockTests />}
+          {page === "测试" && <>
+            <DownloadCheck key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
+            <UnlockTests />
+          </>}
           {page === "连接" && <ConnectionMonitor telemetry={telemetry} running={running} />}
           {page === "日志" && <EventLog />}
           {page === "规则" && (

@@ -303,6 +303,24 @@ async fn check_website(
     })
 }
 
+#[tauri::command]
+async fn measure_download(
+    port: u16,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<probes::DownloadMeasurement, String> {
+    let active = state
+        .live()?
+        .filter(|active| active.port == port)
+        .ok_or("代理内核未运行")?;
+    let measurement = probes::measure_download(port).await?;
+    if !state.live()?.is_some_and(|current| {
+        current.id == active.id && current.route_revision == active.route_revision
+    }) {
+        return Err("测试期间代理线路已变化，请重新测试".into());
+    }
+    Ok(measurement)
+}
+
 #[derive(Default, serde::Serialize)]
 struct SubscriptionUsage {
     upload: Option<u64>,
@@ -585,6 +603,7 @@ fn main() {
             proxy_telemetry,
             check_connection,
             check_website,
+            measure_download,
             probes::begin_probe_batch,
             probes::cancel_probe_batch,
             probes::probe_node,

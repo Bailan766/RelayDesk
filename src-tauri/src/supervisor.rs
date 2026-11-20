@@ -179,6 +179,7 @@ pub struct Link {
     pub id: String,
     pub port: u16,
     pub controller: Controller,
+    pub route_revision: u64,
 }
 
 impl Supervisor {
@@ -287,6 +288,7 @@ impl Supervisor {
                 id: active.session.id.clone(),
                 port: active.session.port,
                 controller: active.session.controller.clone(),
+                route_revision: active.health.revision,
             }))
     }
 
