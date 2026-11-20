@@ -11,6 +11,7 @@ describe("encrypted workspace data", () => {
   it("migrates the legacy selected index and keeps the source and rules across restarts", () => {
     const legacy = deserializeWorkspace(JSON.stringify({ content: [primary, backup].join("\n"), selected: 1, source }));
     const settings = { ...legacy, entryMode: "tun" as const, routingMode: "global" as const, refreshHours: 6,
+      favorites: [legacy.subscriptions[0].parsed.nodes[1].id],
       rules: [{ type: "domain" as const, value: "example.com", action: "reject" as const }] };
     const saved = serializeWorkspace(settings);
     const restored = deserializeWorkspace(saved);

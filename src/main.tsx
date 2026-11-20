@@ -15,6 +15,7 @@ import {
   Search,
   Settings2,
   Shield,
+  Star,
   Upload,
   X,
 } from "lucide-react";
@@ -30,6 +31,7 @@ import "./rules.css";
 import "./dashboard.css";
 
 type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "诊断" | "设置";
+type Probe = { uri?: string; label: string; milliseconds?: number };
 const entryModes: { value: EntryMode; label: string }[] = [
   { value: "system", label: "系统代理" },
   { value: "tun", label: "TUN" },
@@ -54,9 +56,12 @@ const nav: { name: Page; icon: typeof Activity }[] = [
 function App() {
   const [page, setPage] = useState<Page>("概览");
   const work = useWorkspace();
-  const { subscriptions, rules, selected, entryMode: mode } = work.workspace;
+  const { subscriptions, rules, selected, favorites, entryMode: mode } = work.workspace;
   const nodes = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes), [subscriptions]);
+  const unavailableNodes = useMemo(() => new Map(nodes.map(node => [node.id, connectionSupport(node)])), [nodes]);
   const [subscriptionFilter, setSubscriptionFilter] = useState("");
+  const [nodeSort, setNodeSort] = useState("source");
+  const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [dialog, setDialog] = useState(false);
   const [text, setText] = useState("");
   const [error, setError] = useState("");
@@ -75,12 +80,13 @@ function App() {
   const [connectionError, setConnectionError] = useState("");
   const [checkResult, setCheckResult] = useState("");
   const [checking, setChecking] = useState(false);
-  const [latencies, setLatencies] = useState<Record<string, string>>({});
+  const [latencies, setLatencies] = useState<Record<string, Probe>>({});
   const [testing, setTesting] = useState(false);
   const [exitIp, setExitIp] = useState("");
   const [localTcp, setLocalTcp] = useState("尚未测试");
   const [localTcpBusy, setLocalTcpBusy] = useState(false);
   const cancelTesting = useRef(false);
+  const probeBatch = useRef<string>();
   async function saveSettings(edit: (previous: Workspace) => Workspace) {
     setSettingsError("");
     try {
@@ -115,11 +121,20 @@ function App() {
     };
   }, [busy, running]);
   const activeFilter = subscriptions.find(profile => profile.id === subscriptionFilter);
+  const starred = useMemo(() => new Set(favorites), [favorites]);
+  function probe(node: NodeProfile) {
+    const value = latencies[node.id];
+    return value?.uri === node.uri ? value : undefined;
+  }
   const filtered = (activeFilter?.parsed.nodes ?? nodes).filter((n) =>
-    `#${n.sourceIndex ?? ""} ${n.name} ${n.protocol} ${n.server}`
+    (!onlyFavorites || starred.has(n.id)) && `#${n.sourceIndex ?? ""} ${n.name} ${n.protocol} ${n.server}`
       .toLowerCase()
       .includes(search.trim().toLowerCase()),
   );
+  if (nodeSort === "latency") {
+    filtered.sort((a, b) => (probe(a)?.milliseconds ?? Number.MAX_SAFE_INTEGER)
+      - (probe(b)?.milliseconds ?? Number.MAX_SAFE_INTEGER));
+  }
   async function add() {
     setImporting(true);
     setError("");
@@ -235,33 +250,48 @@ function App() {
     cancelTesting.current = false;
     setTesting(true);
     try {
-      const queue = items.filter((node) => !connectionSupport(node));
+      const batch = await invoke<string>("begin_probe_batch");
+      probeBatch.current = batch;
+      const queue = items.filter(node => !unavailableNodes.get(node.id));
       let next = 0;
       async function testQueue() {
         while (next < queue.length && !cancelTesting.current) {
           const node = queue[next++];
-          setLatencies((previous) => ({ ...previous, [node.id]: "测试中" }));
-          let result: string;
+          setLatencies((previous) => ({ ...previous, [node.id]: { uri: node.uri, label: "测试中" } }));
+          let label: string;
+          let milliseconds: number | undefined;
           try {
             const localPort = await invoke<number>("allocate_port");
-            const ms = await invoke<number>("probe_node", {
-              config: buildConfig(node, localPort),
-              port: localPort,
-            });
-            result = `${ms} ms`;
+            if (cancelTesting.current) {
+              label = "已取消";
+            } else {
+              const ms = await invoke<number>("probe_node", { config: buildConfig(node, localPort), port: localPort, batch });
+              milliseconds = ms;
+              label = `${ms} ms`;
+            }
           } catch (e) {
-            result = typeof e === "string" ? e : "代理请求失败";
+            label = typeof e === "string" ? e : "代理请求失败";
           }
           setLatencies((previous) => ({
             ...previous,
-            [node.id]: `${result} · ${new Date().toLocaleTimeString()}`,
+            [node.id]: { uri: node.uri, label: `${label} · ${new Date().toLocaleTimeString()}`, milliseconds },
           }));
         }
       }
       await Promise.all(Array.from({ length: Math.min(4, queue.length) }, testQueue));
+    } catch (error) {
+      setConnectionError(typeof error === "string" ? error : "启动测速失败");
     } finally {
+      const batch = probeBatch.current;
+      probeBatch.current = undefined;
+      if (batch) await invoke("cancel_probe_batch", { batch }).catch(() => {});
       setTesting(false);
     }
+  }
+  function stopNodeTests() {
+    cancelTesting.current = true;
+    const batch = probeBatch.current;
+    if (batch) void invoke("cancel_probe_batch", { batch }).catch(() => setConnectionError("无法取消正在运行的测速"));
   }
   async function showExitIp() {
     if (!port) return;
@@ -521,12 +551,19 @@ function App() {
                   <option value="">全部订阅</option>
                   {subscriptions.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
                 </select>}
+                <select className="toolbar-select" aria-label="排序节点" value={nodeSort} onChange={event => setNodeSort(event.target.value)}>
+                  <option value="source">订阅顺序</option>
+                  <option value="latency">延迟优先</option>
+                </select>
+                <button className="link" aria-pressed={onlyFavorites} onClick={() => setOnlyFavorites(value => !value)}>
+                  {onlyFavorites ? "显示全部" : "仅看收藏"}
+                </button>
                 <button
                   className="link"
-                  disabled={busy || !filtered.length || !isTauri()}
+                  disabled={busy || (!testing && !filtered.length) || !isTauri()}
                   onClick={() =>
                     testing
-                      ? (cancelTesting.current = true)
+                      ? stopNodeTests()
                       : testNodes(filtered)
                   }
                 >
@@ -579,28 +616,38 @@ function App() {
                     <span>
                       {n.protocol.toUpperCase()} · {n.transport}
                     </span>
-                    <span className="probe-result" title={connectionSupport(n) || latencies[n.id]}>
-                      {connectionSupport(n)
+                    <span className="probe-result" title={unavailableNodes.get(n.id) || probe(n)?.label}>
+                      {unavailableNodes.get(n.id)
                         ? "暂不支持"
-                        : latencies[n.id] || "未测试"}
+                        : probe(n)?.label || "未测试"}
                     </span>
-                    <button
+                    <div className="node-actions">
+                      <button
                       className="link"
                       disabled={
                         busy ||
                         testing ||
-                        !!connectionSupport(n) ||
+                        !!unavailableNodes.get(n.id) ||
                         isSelected(n)
                       }
-                      title={connectionSupport(n) || undefined}
+                      title={unavailableNodes.get(n.id) || undefined}
                       onClick={() => selectNode(n)}
                     >
                       {isSelected(n)
                         ? "已选择"
-                        : connectionSupport(n)
+                        : unavailableNodes.get(n.id)
                           ? "不可用"
                           : runningNode?.id === n.id ? "应用更新" : "切换"}
-                    </button>
+                      </button>
+                      <button className="link node-favorite" aria-pressed={starred.has(n.id)}
+                        aria-label={starred.has(n.id) ? `取消收藏 ${n.name}` : `收藏 ${n.name}`}
+                        onClick={() => void saveSettings(state => ({
+                          ...state,
+                          favorites: state.favorites.includes(n.id) ? state.favorites.filter(id => id !== n.id) : [...state.favorites, n.id],
+                        }))}>
+                        <Star size={16} aria-hidden />
+                      </button>
+                    </div>
                   </div>
                 ))}
                 {!filtered.length && (
@@ -638,12 +685,14 @@ function App() {
                   error={work.refreshStatus[profile.id]?.error}
                   refreshable={isTauri()}
                   onRefresh={() => void work.refresh(profile.id).catch(() => {})}
-                  onBrowse={() => { setSubscriptionFilter(profile.id); setSearch(""); setPage("节点"); }}
+                  onBrowse={() => { setSubscriptionFilter(profile.id); setSearch(""); setOnlyFavorites(false); setPage("节点"); }}
                   onRename={name => void saveSettings(state => ({ ...state, subscriptions:
                     state.subscriptions.map(item => item.id === profile.id ? { ...item, name } : item) }))}
                   onRemove={() => void saveSettings(state => {
                     const remaining = state.subscriptions.filter(item => item.id !== profile.id);
-                    return { ...state, subscriptions: remaining, selected: preferredNode(remaining, state.selected) };
+                    const nodeIds = new Set(profile.parsed.nodes.map(node => node.id));
+                    return { ...state, subscriptions: remaining, selected: preferredNode(remaining, state.selected),
+                      favorites: state.favorites.filter(id => !nodeIds.has(id)) };
                   })}
                 />)}
               </div> : <p className="empty">{work.ready ? "尚未导入订阅" : "等待本地订阅读取"}</p>}

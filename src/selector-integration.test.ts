@@ -24,6 +24,7 @@ function read(socket: Socket, expected: (value: string) => boolean): Promise<str
     let value = "";
     const timeout = setTimeout(() => finish(new Error("TCP read timed out")), 2500);
     const onClose = () => finish(new Error("TCP connection closed"));
+    const onError = (error: Error) => finish(error);
     const onData = (chunk: Buffer) => {
       value += chunk.toString();
       if (expected(value)) finish();
@@ -32,15 +33,25 @@ function read(socket: Socket, expected: (value: string) => boolean): Promise<str
       clearTimeout(timeout);
       socket.off("data", onData);
       socket.off("close", onClose);
+      socket.off("error", onError);
       if (error) reject(error); else resolve(value);
     }
     socket.on("data", onData);
     socket.once("close", onClose);
+    socket.once("error", onError);
   });
 }
 
 it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", async () => {
-  const server = createServer(socket => socket.pipe(socket));
+  let closing = false;
+  const peerFailures: Error[] = [];
+  const peers = new Set<Socket>();
+  const server = createServer(socket => {
+    peers.add(socket);
+    socket.once("close", () => peers.delete(socket));
+    socket.on("error", error => { if (!closing) peerFailures.push(error); });
+    socket.pipe(socket);
+  });
   const sockets: Socket[] = [];
   const children: ChildProcess[] = [];
   const secret = "selector-fixture";
@@ -122,8 +133,11 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
     expect(snapshot.connections.some(connection => connection.chains.includes("direct"))).toBe(true);
     await setMode("rule");
     await expect(tunnel().then(socket => echo(socket, "blocked"))).rejects.toThrow();
+    expect(peerFailures).toEqual([]);
   } finally {
+    closing = true;
     sockets.forEach(socket => socket.destroy());
+    peers.forEach(socket => socket.destroy());
     server.close();
     for (const child of children) {
       if (child.exitCode === null && child.signalCode === null) {

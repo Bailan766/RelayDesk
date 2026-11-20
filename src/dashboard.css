@@ -59,6 +59,9 @@ main { background: #f4f5f7; border: 0; border-radius: 0; margin: 0; padding: 24p
 .node-card .node-name > div { min-width: 0; }
 .node-card .node-name strong, .node-card .node-name small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-card .link { text-align: left; }
+.node-actions { display: flex; align-items: center; justify-content: space-between; }
+.node-favorite[aria-pressed="true"] { color: #9a580b; }
+.node-favorite[aria-pressed="true"] svg { fill: #ffe4ad; }
 .extension-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; margin-top: 16px; }
 .extension-grid p { color: #8b96a3; font-size: 12px; }
 .toolbar { flex-wrap: wrap; }

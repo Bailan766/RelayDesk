@@ -2,14 +2,15 @@
 use std::{
     fs,
     io::Write,
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     path::PathBuf,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio},
     sync::Mutex,
     time::Duration,
 };
 use tauri::Manager;
 mod network;
+mod probes;
 mod storage;
 mod system_proxy;
 mod telemetry;
@@ -28,20 +29,12 @@ fn core_command(path: &std::path::Path) -> Command {
 #[derive(Default)]
 struct ProxyState(Mutex<Option<network::Session>>);
 
-struct ProbeProcess(Child);
 struct TemporaryConfig(PathBuf);
 impl Drop for TemporaryConfig {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
 }
-impl Drop for ProbeProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[tauri::command]
 async fn local_tcp_google() -> Result<u64, String> {
     let started = std::time::Instant::now();
@@ -52,93 +45,6 @@ async fn local_tcp_google() -> Result<u64, String> {
     .await
     .map_err(|_| "本地 TCP 连接超时")?
     .map_err(|_| "本地 DNS 解析或 TCP 连接失败")?;
-    Ok(started.elapsed().as_millis() as u64)
-}
-
-#[tauri::command]
-async fn probe_node(config: serde_json::Value, port: u16) -> Result<u64, String> {
-    let inbound = config
-        .get("inbounds")
-        .and_then(|v| v.as_array())
-        .and_then(|v| v.first())
-        .ok_or("缺少本地入口")?;
-    if inbound.get("listen").and_then(|v| v.as_str()) != Some("127.0.0.1")
-        || inbound.get("type").and_then(|v| v.as_str()) != Some("mixed")
-        || inbound.get("listen_port").and_then(|v| v.as_u64()) != Some(port as u64)
-    {
-        return Err("测速入口配置无效".into());
-    }
-    let path = std::env::temp_dir().join(format!("relaydesk-probe-{}.json", uuid::Uuid::new_v4()));
-    fs::write(&path, serde_json::to_vec(&config).map_err(|_| "配置无效")?)
-        .map_err(|_| "无法创建测速配置")?;
-    let _temporary_config = TemporaryConfig(path.clone());
-    let result = (|| -> Result<ProbeProcess, String> {
-        let core = core_path()?;
-        if !core_command(&core)
-            .args(["check", "-c"])
-            .arg(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|_| "无法检查配置")?
-            .success()
-        {
-            return Err("节点配置未通过内核检查".into());
-        }
-        let child = core_command(&core)
-            .args(["run", "-c"])
-            .arg(&path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| "无法启动测速内核")?;
-        Ok(ProbeProcess(child))
-    })();
-    let mut process = result?;
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut ready = false;
-    for _ in 0..50 {
-        if process
-            .0
-            .try_wait()
-            .map_err(|_| "无法检查测速内核")?
-            .is_some()
-        {
-            return Err("测速内核启动失败".into());
-        }
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    if !ready {
-        return Err("测速内核启动超时".into());
-    }
-    let client = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|_| "代理地址无效")?)
-        .timeout(Duration::from_secs(12))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "无法初始化测速")?;
-    let started = std::time::Instant::now();
-    let response = client
-        .get("https://www.gstatic.com/generate_204")
-        .send()
-        .await
-        .map_err(|error| {
-            if error.is_timeout() {
-                "请求超时"
-            } else if error.is_connect() {
-                "建立代理连接或 TLS 握手失败"
-            } else {
-                "代理请求失败"
-            }
-        })?;
-    if response.status() != reqwest::StatusCode::NO_CONTENT {
-        return Err("测速服务返回异常".into());
-    }
     Ok(started.elapsed().as_millis() as u64)
 }
 
@@ -457,6 +363,7 @@ fn main() {
     let _ = network::recover();
     let app = tauri::Builder::default()
         .manage(ProxyState::default())
+        .manage(probes::ProbeBatch::default())
         .setup(|app| {
             use tauri::{
                 menu::{Menu, MenuItem},
@@ -512,7 +419,9 @@ fn main() {
             set_routing_mode,
             proxy_telemetry,
             check_connection,
-            probe_node,
+            probes::begin_probe_batch,
+            probes::cancel_probe_batch,
+            probes::probe_node,
             check_exit_ip,
             local_tcp_google,
             storage::save_subscription,

@@ -23,6 +23,7 @@ export type Workspace = {
   entryMode: EntryMode;
   routingMode: RoutingMode;
   refreshHours: number;
+  favorites: string[];
 };
 
 export const emptyWorkspace: Workspace = {
@@ -31,6 +32,7 @@ export const emptyWorkspace: Workspace = {
   entryMode: "system",
   routingMode: "rule",
   refreshHours: 0,
+  favorites: [],
 };
 
 export function subscriptionHost(source: string): string {
@@ -135,6 +137,9 @@ export function deserializeWorkspace(raw: string): Workspace {
     entryMode: saved.entryMode === "local" || saved.entryMode === "tun" ? saved.entryMode : "system",
     routingMode: saved.routingMode === "direct" || saved.routingMode === "global" ? saved.routingMode : "rule",
     refreshHours: [1, 6, 24].includes(saved.refreshHours) ? saved.refreshHours : 0,
+    favorites: Array.isArray(saved.favorites)
+      ? [...new Set<string>(saved.favorites.filter((id: unknown): id is string => typeof id === "string"))]
+      : [],
   };
 }
 
