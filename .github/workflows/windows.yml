@@ -36,6 +36,7 @@ jobs:
           Copy-Item (Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/sing-box.exe') release/
           Copy-Item (Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/LICENSE') release/THIRD-PARTY-SING-BOX-LICENSE.txt
           Copy-Item LICENSE release/RELAYDESK-LICENSE.txt
+          Copy-Item THIRD_PARTY_NOTICES.md release/
       - uses: actions/upload-artifact@v4
         with:
           name: relaydesk-windows-x64

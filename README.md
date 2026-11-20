@@ -1,6 +1,6 @@
 # RelayDesk
 
-Windows 代理客户端项目，当前处于开发早期。已实现本地订阅内容预览、节点列表和 Tauri 窗口骨架。GitHub Actions 在 Windows 上运行测试并构建可执行文件。
+Windows 代理客户端项目，当前处于开发早期。GitHub Actions 在 Windows 上运行测试并构建可执行文件。
 
 ## 开发
 
@@ -12,7 +12,7 @@ npm test
 npm run dev
 ```
 
-推送到 GitHub 后，Actions 的 Windows build 工作流生成可下载的 Windows x64 可执行文件。
+推送到 GitHub 后，Actions 的 Windows build 工作流生成 `relaydesk-windows-x64` 下载包。解压后保留 `relaydesk.exe` 和 `sing-box.exe` 在同一目录，运行 `relaydesk.exe`。导入订阅并选择受支持的节点后启动代理，再将需要使用代理的应用配置为界面显示的本地 HTTP 或 SOCKS5 地址和端口。连接检查通过表示测试请求已通过当前代理到达检查地址，不保证其他目标均可访问。
 
 ## 当前限制
 
@@ -20,4 +20,4 @@ npm run dev
 
 ## 许可
 
-项目代码使用 MIT 许可证。尚未包含或分发任何代理内核，后续分发时需随附各内核的许可证及相应源码获取信息。
+项目代码使用 MIT 许可证。构建产物单独包含 sing-box 可执行文件及其许可证；来源和版本见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
