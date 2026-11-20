@@ -84,6 +84,14 @@ pub struct Link {
 
 impl Supervisor {
     pub fn start(&self, plan: Plan) -> Result<(), String> {
+        self.start_using(plan, Plan::start)
+    }
+
+    fn start_using(
+        &self,
+        plan: Plan,
+        launch: impl FnOnce(&Plan) -> Result<network::Session, String>,
+    ) -> Result<(), String> {
         let mut slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
         if self.closing.load(Ordering::Acquire) {
             return Err("应用正在退出".into());
@@ -95,7 +103,7 @@ impl Supervisor {
         {
             return Err("代理已经运行".into());
         }
-        let session = plan.start()?;
+        let session = launch(&plan)?;
         slot.active = Some(Running {
             session,
             plan,
@@ -178,6 +186,10 @@ impl Supervisor {
     }
 
     fn tick(&self) {
+        self.tick_using(Plan::start);
+    }
+
+    fn tick_using(&self, launch: impl FnOnce(&Plan) -> Result<network::Session, String>) {
         let Ok(mut slot) = self.slot.try_lock() else {
             return;
         };
@@ -213,7 +225,7 @@ impl Supervisor {
         }
         active.failures += 1;
         active.retry_at = None;
-        if let Ok(session) = active.plan.start() {
+        if let Ok(session) = launch(&active.plan) {
             active.session = session;
             active.since = Instant::now();
             slot.message = Some("代理已自动恢复");
@@ -247,5 +259,98 @@ mod tests {
         assert!(recovery_delay(true, "system", 3).is_none());
         assert!(recovery_delay(false, "local", 0).is_none());
         assert!(recovery_delay(true, "tun", 0).is_none());
+    }
+
+    #[test]
+    fn installed_worker_recovers_and_explicit_stop_cancels_it() {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            path::PathBuf,
+        };
+        let Some(executable) = std::env::var_os("RELAYDESK_INSTALLED_SMOKE_APP").map(PathBuf::from)
+        else {
+            return;
+        };
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let supervisor = Supervisor::default();
+        let launch = |plan: &Plan| {
+            network::Session::start_using(
+                plan.config.clone(),
+                plan.port,
+                &plan.mode,
+                plan.routing_mode,
+                &executable,
+            )
+        };
+        let plan = Plan {
+            config: serde_json::json!({
+                "inbounds":[{"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port}],
+                "outbounds":[
+                    {"type":"vless","tag":"proxy","server":"127.0.0.1","server_port":9,"uuid":"00000000-0000-4000-8000-000000000000"},
+                    {"type":"direct","tag":"direct"}
+                ],
+                "route":{"rules":[],"final":"direct","auto_detect_interface":true}
+            }),
+            port,
+            mode: "local".into(),
+            routing_mode: network::RoutingMode::Rule,
+            recover: true,
+        };
+        let check_listener = || {
+            let endpoint = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            endpoint.set_nonblocking(true).unwrap();
+            let endpoint_port = endpoint.local_addr().unwrap().port();
+            let echo = thread::spawn(move || {
+                let until = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < until {
+                    if let Ok((mut client, _)) = endpoint.accept() {
+                        client
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let mut buffer = [0; 4096];
+                        let _ = client.read(&mut buffer);
+                        let _ = client.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\n\r\nokay");
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(30));
+                }
+            });
+            let mut proxy = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            proxy
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(proxy,"GET http://127.0.0.1:{endpoint_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{endpoint_port}\r\nConnection: close\r\n\r\n").unwrap();
+            let mut response = String::new();
+            proxy.read_to_string(&mut response).unwrap();
+            echo.join().unwrap();
+            assert!(response.ends_with("okay"), "{response}");
+        };
+        supervisor.start_using(plan, launch).unwrap();
+        check_listener();
+        let before = supervisor.live().unwrap().unwrap().id;
+        supervisor
+            .slot
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .unwrap()
+            .session
+            .kill_fixture_worker();
+        assert_eq!(supervisor.status().phase, "recovering");
+        supervisor.tick_using(launch);
+        thread::sleep(Duration::from_millis(1200));
+        supervisor.tick_using(launch);
+        assert_ne!(supervisor.live().unwrap().unwrap().id, before);
+        check_listener();
+        supervisor.stop().unwrap();
+        supervisor.tick_using(|_| panic!("an explicit stop started a new worker"));
+        assert_eq!(supervisor.status().phase, "stopped");
+        assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
     }
 }

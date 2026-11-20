@@ -7,7 +7,7 @@ export interface NodeProfile {
   definition?: { format: 'clash' | 'sing-box' | 'vmess-uri'; fields: Fields };
   revision?: string;
 }
-export interface ImportResult { nodes: NodeProfile[]; warnings: string[]; format: string }
+export interface ImportResult { nodes: NodeProfile[]; warnings: string[]; format: string; policySections?: string[] }
 const protocols = new Set(['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'hy2', 'tuic', 'shadowsocks']);
 export const decodeSubscriptionText = (value: string) => new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(value.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)));
 const clean = (value: unknown) => typeof value === 'string' ? value : '';
@@ -59,9 +59,25 @@ function serialized(value: unknown): string {
 export function nodeRevision(node: NodeProfile): string {
   return node.revision ?? node.uri ?? '';
 }
+
+function policySections(document: unknown): string[] | undefined {
+  if (!document || typeof document !== 'object' || Array.isArray(document)) return;
+  const value = document as Fields;
+  const known = [
+    ['策略组', ['proxy-groups']],
+    ['订阅提供者', ['proxy-providers']],
+    ['分流', ['rules', 'route', 'rule-providers', 'rule_set']],
+    ['DNS', ['dns']],
+    ['入站', ['inbounds', 'listeners']],
+    ['端点', ['endpoints']],
+  ] as const;
+  const selected = known.filter(([, keys]) => keys.some(key => Object.hasOwn(value, key))).map(([name]) => name);
+  return selected.length ? selected : undefined;
+}
 export function parseSubscription(input: string): ImportResult {
   let text = input.trim(); if (!text) throw new Error('订阅内容为空');
   let format = 'URI'; let entries: unknown[]; let schema: 'clash' | 'sing-box' = 'sing-box';
+  let sections: string[] | undefined;
   if (!text.includes('://') && !text.startsWith('{') && !text.startsWith('[') && !/^\s*(proxies|outbounds):/m.test(text)) {
     try { text = decodeSubscriptionText(text).trim(); format = 'Base64'; } catch { throw new Error('无法识别订阅格式'); }
   }
@@ -69,10 +85,12 @@ export function parseSubscription(input: string): ImportResult {
     const data = JSON.parse(text);
     schema = Array.isArray(data?.proxies) ? 'clash' : 'sing-box';
     entries = Array.isArray(data) ? data : schema === 'clash' ? data.proxies : data?.outbounds;
+    sections = policySections(data);
     format = schema === 'clash' ? 'Clash JSON' : 'sing-box JSON';
     if (!Array.isArray(entries)) throw new Error('JSON 中没有代理节点列表');
   } else if (/^\s*(proxies|outbounds):/m.test(text)) {
     const data = parseYaml(text, { maxAliasCount: 100 }); entries = data?.proxies ?? data?.outbounds;
+    sections = policySections(data);
     schema = data?.proxies ? 'clash' : 'sing-box'; format = schema === 'clash' ? 'Clash YAML' : 'sing-box YAML';
     if (!Array.isArray(entries)) throw new Error('YAML 中没有代理节点列表');
   } else entries = text.split(/\r?\n/).map(x => x.trim()).filter(x => x && !x.startsWith('#'));
@@ -85,5 +103,5 @@ export function parseSubscription(input: string): ImportResult {
     } catch { warnings.push(`第 ${index + 1} 项未导入：格式无效或协议不支持`); }
   });
   if (!nodes.length) throw new Error(`没有找到可识别的节点（${entries.length} 项）`);
-  return { nodes, warnings, format };
+  return { nodes, warnings, format, policySections: sections };
 }

@@ -458,6 +458,17 @@ impl Session {
         mode: &str,
         routing_mode: RoutingMode,
     ) -> Result<Self, String> {
+        let executable = env::current_exe().map_err(|_| "无法定位当前应用")?;
+        Self::start_using(config, port, mode, routing_mode, &executable)
+    }
+
+    pub(crate) fn start_using(
+        config: Value,
+        port: u16,
+        mode: &str,
+        routing_mode: RoutingMode,
+        executable: &std::path::Path,
+    ) -> Result<Self, String> {
         if !matches!(mode, "local" | "system" | "tun") {
             return Err("代理入口模式无效".into());
         }
@@ -492,11 +503,7 @@ impl Session {
             serde_json::to_vec(&input).map_err(|_| "代理配置无效")?,
         )
         .map_err(|_| "无法写入代理配置")?;
-        let executable = wide(
-            env::current_exe()
-                .map_err(|_| "无法定位当前应用")?
-                .as_os_str(),
-        );
+        let executable = wide(executable.as_os_str());
         let parameters = wide(format!(
             "--network-worker {} {token} {port} {mode}",
             std::process::id()
@@ -548,6 +555,13 @@ impl Session {
 
     pub fn running(&self) -> bool {
         !self.worker.signaled(0)
+    }
+
+    #[cfg(test)]
+    pub fn kill_fixture_worker(&self) {
+        use winapi::um::processthreadsapi::TerminateProcess;
+        assert_ne!(unsafe { TerminateProcess(self.worker.0, 1) }, 0);
+        assert!(self.worker.signaled(5000));
     }
 
     pub fn stop(self) -> Result<(), String> {

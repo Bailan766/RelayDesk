@@ -36,6 +36,7 @@ export function SubscriptionCard({ profile, pending, error, refreshable, onRefre
       <span>{profile.parsed.nodes.length} 个节点 · {supported} 个可连接{profile.parsed.warnings.length ? ` · ${profile.parsed.warnings.length} 项跳过` : ""}</span>
       {expiry && <span className={expired ? "error" : undefined}>{expired ? "已过期" : "到期"} {expiry}</span>}
     </div>
+    {!!profile.parsed.policySections?.length && <p className="rule-hint">原配置另含{profile.parsed.policySections.join("、")}。当前导入只提取独立节点。</p>}
     {quota !== undefined && <div className="subscription-quota">
       <progress max={100} value={quota} aria-label="已用流量比例" />
       <small>已用 {formatBytes(used)} / {formatBytes(usage?.total)}</small>

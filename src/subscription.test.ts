@@ -12,4 +12,13 @@ describe('subscription import', () => {
     expect(parseSubscription('{"outbounds":[{"tag":"Test","type":"hysteria2","server":"example.org","server_port":443}]}').nodes).toHaveLength(1);
   });
   it('rejects invalid inputs', () => expect(() => parseSubscription('')).toThrow());
+  it('reports source policy sections separately from malformed nodes', () => {
+    const result = parseSubscription(JSON.stringify({
+      outbounds: [{ type: 'trojan', server: 'example.org', server_port: 443, password: 'fixture' }],
+      route: { rules: [] }, dns: { servers: [] },
+    }));
+    expect(result.nodes).toHaveLength(1);
+    expect(result.warnings).toEqual([]);
+    expect(result.policySections).toEqual(['分流', 'DNS']);
+  });
 });
