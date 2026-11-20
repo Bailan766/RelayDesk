@@ -5,6 +5,55 @@ use tauri::Manager;
 #[derive(Default)]
 struct ProxyState(Mutex<Option<Child>>);
 
+struct ProbeProcess(Child);
+struct TemporaryConfig(PathBuf);
+impl Drop for TemporaryConfig {
+    fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+}
+impl Drop for ProbeProcess {
+    fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+}
+
+#[tauri::command]
+async fn probe_node(config: serde_json::Value, port: u16) -> Result<u64, String> {
+    let inbound = config.get("inbounds").and_then(|v| v.as_array()).and_then(|v| v.first()).ok_or("缺少本地入口")?;
+    if inbound.get("listen").and_then(|v| v.as_str()) != Some("127.0.0.1") || inbound.get("type").and_then(|v| v.as_str()) != Some("mixed") || inbound.get("listen_port").and_then(|v| v.as_u64()) != Some(port as u64) { return Err("测速入口配置无效".into()); }
+    let path = std::env::temp_dir().join(format!("relaydesk-probe-{}.json", uuid::Uuid::new_v4()));
+    fs::write(&path, serde_json::to_vec(&config).map_err(|_| "配置无效")?).map_err(|_| "无法创建测速配置")?;
+    let _temporary_config = TemporaryConfig(path.clone());
+    let result = (|| -> Result<ProbeProcess, String> {
+        let core = core_path()?;
+        if !Command::new(&core).args(["check", "-c"]).arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).status().map_err(|_| "无法检查配置")?.success() { return Err("节点配置未通过内核检查".into()); }
+        let child = Command::new(core).args(["run", "-c"]).arg(&path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|_| "无法启动测速内核")?;
+        Ok(ProbeProcess(child))
+    })();
+    let mut process = result?;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut ready = false;
+    for _ in 0..50 {
+        if process.0.try_wait().map_err(|_| "无法检查测速内核")?.is_some() { return Err("测速内核启动失败".into()); }
+        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() { ready = true; break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if !ready { return Err("测速内核启动超时".into()); }
+    let client = reqwest::Client::builder().proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|_| "代理地址无效")?).timeout(Duration::from_secs(12)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "无法初始化测速")?;
+    let started = std::time::Instant::now();
+    let response = client.get("https://www.gstatic.com/generate_204").send().await.map_err(|_| "连接失败或超时")?;
+    if response.status() != reqwest::StatusCode::NO_CONTENT { return Err("测速服务返回异常".into()); }
+    Ok(started.elapsed().as_millis() as u64)
+}
+
+#[tauri::command]
+async fn check_exit_ip(port: u16, state: tauri::State<'_, ProxyState>) -> Result<String, String> {
+    if !proxy_running(state) { return Err("代理内核未运行".into()); }
+    let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|_| "代理地址无效")?;
+    let client = reqwest::Client::builder().proxy(proxy).timeout(Duration::from_secs(12)).redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "无法初始化出口检查")?;
+    let response = client.get("https://api.ipify.org").send().await.map_err(|_| "出口地址检查失败")?.error_for_status().map_err(|_| "出口地址服务异常")?;
+    let text = response.text().await.map_err(|_| "读取出口地址失败")?;
+    let ip: std::net::IpAddr = text.trim().parse().map_err(|_| "出口地址服务返回无效数据")?;
+    Ok(ip.to_string())
+}
+
 fn core_path() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|_| "无法定位应用目录")?;
     let core = exe.parent().ok_or("无法定位应用目录")?.join("sing-box.exe");
@@ -100,7 +149,7 @@ async fn fetch_subscription(address: String) -> Result<String, String> {
 fn main() {
     let app = tauri::Builder::default()
         .manage(ProxyState::default())
-        .invoke_handler(tauri::generate_handler![fetch_subscription, allocate_port, start_proxy, stop_proxy, proxy_running, check_connection])
+        .invoke_handler(tauri::generate_handler![fetch_subscription, allocate_port, start_proxy, stop_proxy, proxy_running, check_connection, probe_node, check_exit_ip])
         .build(tauri::generate_context!()).expect("failed to build RelayDesk");
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
