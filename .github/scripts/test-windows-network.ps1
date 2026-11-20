@@ -24,6 +24,7 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
     $stop = [Threading.EventWaitHandle]::new($false, 'ManualReset', "Local\RelayDesk.$token.stop")
     $ready = [Threading.EventWaitHandle]::new($false, 'ManualReset', "Local\RelayDesk.$token.ready")
     $configPath = Join-Path $runtime "$token.json"
+    $errorLog = Join-Path $env:TEMP "relaydesk-network-$token.log"
     $worker = $null
     $parent = $null
     try {
@@ -40,9 +41,9 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
             $parent = Start-Process -FilePath ping.exe -ArgumentList '127.0.0.1', '-t' -PassThru -WindowStyle Hidden
             $parentId = $parent.Id
         }
-        $worker = Start-Process -FilePath $exePath -ArgumentList '--network-worker', $parentId, $token, $port, $Mode -PassThru -WindowStyle Hidden
+        $worker = Start-Process -FilePath $exePath -ArgumentList '--network-worker', $parentId, $token, $port, $Mode -PassThru -WindowStyle Hidden -RedirectStandardError $errorLog
         if (-not $ready.WaitOne(15000)) {
-            throw "$Mode worker did not report network readiness; exited=$($worker.HasExited)"
+            throw "$Mode worker did not report network readiness; exited=$($worker.HasExited); $(Get-Content -Raw -LiteralPath $errorLog)"
         }
         if ($Mode -eq 'system') {
             $active = Get-Proxy
@@ -50,7 +51,7 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
                 throw 'The system proxy was not set to the local listener'
             }
         }
-        if ($Mode -eq 'tun' -and -not (Get-NetIPAddress -InterfaceAlias 'RelayDesk' -IPAddress '172.28.254.1' -ErrorAction SilentlyContinue)) {
+        if ($Mode -eq 'tun' -and -not (Get-NetIPAddress -IPAddress '172.28.254.1' -ErrorAction SilentlyContinue)) {
             throw 'The TUN virtual interface was not configured'
         }
         if ($SimulateCrash) {
@@ -69,7 +70,7 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
         }
         if ($Mode -eq 'tun') {
             for ($attempt = 0; $attempt -lt 30; $attempt++) {
-                $interface = Get-NetIPAddress -InterfaceAlias 'RelayDesk' -IPAddress '172.28.254.1' -ErrorAction SilentlyContinue
+                $interface = Get-NetIPAddress -IPAddress '172.28.254.1' -ErrorAction SilentlyContinue
                 if (-not $interface) { break }
                 Start-Sleep -Milliseconds 100
             }
@@ -83,6 +84,7 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
         $stop.Dispose()
         $ready.Dispose()
         if (Test-Path -LiteralPath $configPath) { Remove-Item -LiteralPath $configPath }
+        if (Test-Path -LiteralPath $errorLog) { Remove-Item -LiteralPath $errorLog }
         $recovery = Start-Process -FilePath $exePath -ArgumentList '--recover-network' -Wait -PassThru -WindowStyle Hidden
         if ($recovery.ExitCode -ne 0) { throw 'Fallback network recovery failed' }
     }

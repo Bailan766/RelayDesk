@@ -11,7 +11,8 @@
     "resources": {
       "../build-resources/sing-box.exe": "sing-box.exe",
       "../build-resources/THIRD-PARTY-SING-BOX-LICENSE.txt": "THIRD-PARTY-SING-BOX-LICENSE.txt",
-      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "network-recovery-v1.txt": "network-recovery-v1.txt"
     },
     "windows": { "nsis": { "installMode": "currentUser", "installerHooks": "./network-hooks.nsh" } }
   }
