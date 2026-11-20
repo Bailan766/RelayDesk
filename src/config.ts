@@ -1,6 +1,8 @@
 import type { NodeProfile } from './subscription';
 
-export function buildConfig(node: NodeProfile, port: number): object {
+export type RouteRule = { type: 'domain' | 'domain_suffix'; value: string; action: 'direct' | 'proxy' | 'reject' };
+
+export function buildConfig(node: NodeProfile, port: number, rules: RouteRule[] = []): object {
   if (!node.uri || !['vless', 'hysteria2'].includes(node.protocol)) throw new Error('此节点类型尚不支持连接');
   const uri = new URL(node.uri);
   const query = uri.searchParams;
@@ -40,7 +42,12 @@ export function buildConfig(node: NodeProfile, port: number): object {
     }
   }
   if (tls.enabled) outbound.tls = tls;
-  return { log: { level: 'warn' }, inbounds: [{ type: 'mixed', tag: 'local', listen: '127.0.0.1', listen_port: port }], outbounds: [outbound, { type: 'direct', tag: 'direct' }], route: { final: 'proxy', auto_detect_interface: true } };
+  const compiledRules = rules.map(rule => {
+    const value = rule.value.trim();
+    if (!value || value.length > 253 || !/^(?!-)[a-z0-9-]+(?:\.[a-z0-9-]+)*$/i.test(value)) throw new Error('域名规则无效');
+    return rule.action === 'reject' ? { [rule.type]: [value], action: 'reject' } : { [rule.type]: [value], outbound: rule.action };
+  });
+  return { log: { level: 'warn' }, inbounds: [{ type: 'mixed', tag: 'local', listen: '127.0.0.1', listen_port: port }], outbounds: [outbound, { type: 'direct', tag: 'direct' }], route: { rules: compiledRules, final: 'proxy', auto_detect_interface: true } };
 }
 
 export function connectionSupport(node: NodeProfile): string | null {

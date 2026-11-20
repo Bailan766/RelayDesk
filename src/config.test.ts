@@ -3,6 +3,18 @@ import { buildConfig } from './config';
 import { parseSubscription } from './subscription';
 
 describe('sing-box configuration', () => {
+  it('compiles ordered domain routing rules and rejects invalid values', () => {
+    const node = parseSubscription('vless://id@host.test:443#Test').nodes[0];
+    const config = buildConfig(node, 12345, [
+      { type: 'domain', value: 'example.com', action: 'direct' },
+      { type: 'domain_suffix', value: 'blocked.test', action: 'reject' },
+    ]) as any;
+    expect(config.route.rules).toEqual([
+      { domain: ['example.com'], outbound: 'direct' },
+      { domain_suffix: ['blocked.test'], action: 'reject' },
+    ]);
+    expect(() => buildConfig(node, 12345, [{ type: 'domain', value: 'bad domain', action: 'proxy' }])).toThrow('域名规则无效');
+  });
   it('preserves VLESS Reality connection parameters', () => {
     const node = parseSubscription('vless://00000000-0000-4000-8000-000000000000@host.test:443?security=reality&pbk=public-key&sid=1234&sni=site.test&fp=chrome&flow=xtls-rprx-vision#Test').nodes[0];
     const result = buildConfig(node, 12345) as any;
