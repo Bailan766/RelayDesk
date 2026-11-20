@@ -19,6 +19,21 @@ async function availablePorts(count: number): Promise<number[]> {
   finally { listeners.forEach(listener => listener.close()); }
 }
 
+async function waitForListener(port: number) {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const socket = connect(port, "127.0.0.1");
+    try {
+      await once(socket, "connect");
+      return;
+    } catch {
+      await delay(75);
+    } finally {
+      socket.destroy();
+    }
+  }
+  throw new Error(`Fixture listener did not start on port ${port}`);
+}
+
 function read(socket: Socket, expected: (value: string) => boolean): Promise<string> {
   return new Promise((resolve, reject) => {
     let value = "";
@@ -73,6 +88,7 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
       })),
       outbounds: [{ type: "direct", tag: "direct" }],
     });
+    await Promise.all([waitForListener(firstNode), waitForListener(secondNode)]);
     const nodes = parseSubscription([firstNode, secondNode].map((port, index) =>
       `vless://${user}@127.0.0.1:${port}#node-${index}`).join("\n")).nodes;
     const { config } = buildSessionConfig(nodes[0], nodes, mixed, []);
@@ -96,6 +112,7 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
       await delay(75);
     }
     expect(ready).toBe(true);
+    await waitForListener(mixed);
 
     async function tunnel(): Promise<Socket> {
       const socket = connect(mixed, "127.0.0.1");
@@ -110,7 +127,10 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
     async function echo(socket: Socket, message: string) {
       const response = read(socket, value => value.length >= message.length);
       socket.write(message);
-      expect(await response).toBe(message);
+      const received = await response.catch(error => {
+        throw new Error(`TCP echo failed during ${message}`, { cause: error });
+      });
+      expect(received).toBe(message);
     }
     const first = await tunnel();
     await echo(first, "before");
@@ -147,4 +167,4 @@ it.skipIf(!core)("switches loaded nodes and routing modes on live traffic", asyn
       }
     }
   }
-}, 10_000);
+}, 15_000);
