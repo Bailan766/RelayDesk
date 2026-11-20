@@ -23,6 +23,7 @@ import type { NodeProfile } from "./subscription";
 import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleDomain, withSelectedOutbound, type RouteRule, type SessionPlan } from "./config";
 import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
 import { SubscriptionCard } from "./SubscriptionCard";
+import { WebsiteChecks } from "./WebsiteChecks";
 import { useWorkspace } from "./useWorkspace";
 import { preferredNode, type EntryMode, type RoutingMode, type Workspace } from "./workspace";
 import "./style.css";
@@ -163,7 +164,7 @@ function App() {
     setCheckResult("");
     try {
       const ms = await invoke<number>("check_connection", { port });
-      setCheckResult(`网络验证成功 · ${ms} ms`);
+      setCheckResult(`当前路由可达 · ${ms} ms`);
     } catch (e) {
       setCheckResult(typeof e === "string" ? e : "网络验证失败");
     } finally {
@@ -470,12 +471,9 @@ function App() {
                 </div>
               </div>
               <div className="columns">
+                <WebsiteChecks key={JSON.stringify([telemetry.snapshot?.sessionId, current?.id, routingMode])} port={running ? port : undefined} />
                 <section className="panel">
-                  <div className="panel-head"><h2>网站测试</h2></div>
-                  <div className="site-grid">{["Apple", "GitHub", "Google", "YouTube"].map(site => <div key={site}><strong>{site}</strong><span>测试未接入</span></div>)}</div>
-                </section>
-                <section className="panel">
-                  <div className="panel-head"><h2>IP 信息</h2><button className="link" disabled={!running || checking} onClick={showExitIp}>刷新</button></div>
+                  <div className="panel-head"><h2>当前路由出口 IP</h2><button className="link" disabled={!running || checking} onClick={showExitIp}>刷新</button></div>
                   <div className="empty">{exitIp || (running ? "尚未检查出口 IP" : "连接后可检查出口 IP")}</div>
                 </section>
                 <section className="panel">
@@ -584,7 +582,7 @@ function App() {
               )}
               {running && (
                 <div className="notice">
-                  当前出口 IP：{exitIp || "尚未检查"}{" "}
+                  当前路由出口 IP：{exitIp || "尚未检查"}{" "}
                   <button
                     className="link"
                     disabled={checking}

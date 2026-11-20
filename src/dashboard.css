@@ -50,6 +50,8 @@ main { background: #f4f5f7; border: 0; border-radius: 0; margin: 0; padding: 24p
 .site-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 8px; }
 .site-grid div { background: #f4f8fd; padding: 18px 6px; text-align: center; border-radius: 6px; overflow: hidden; }
 .site-grid span { display: block; color: #596675; font-size: 12px; margin-top: 12px; }
+.site-grid .link { display: block; margin: 8px auto 0; }
+.site-grid span:empty { display: none; }
 .group-heading { padding: 16px; margin: 12px 0; display: flex; justify-content: space-between; gap: 10px; }
 .group-heading span { color: #8793a1; font-size: 12px; }
 .node-grid, .unlock-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 10px; }

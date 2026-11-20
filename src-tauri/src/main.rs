@@ -261,6 +261,60 @@ async fn check_connection(port: u16, state: tauri::State<'_, ProxyState>) -> Res
     Ok(started.elapsed().as_millis())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Website {
+    Apple,
+    Github,
+    Google,
+    Youtube,
+}
+
+#[derive(serde::Serialize)]
+struct WebsiteResult {
+    status: u16,
+    milliseconds: u64,
+}
+
+#[tauri::command]
+async fn check_website(
+    site: Website,
+    port: u16,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<WebsiteResult, String> {
+    if running_port(&state) != Some(port) {
+        return Err("代理内核未运行".into());
+    }
+    let target = match site {
+        Website::Apple => "https://www.apple.com/",
+        Website::Github => "https://github.com/robots.txt",
+        Website::Google => "https://www.gstatic.com/generate_204",
+        Website::Youtube => "https://www.youtube.com/robots.txt",
+    };
+    let proxy =
+        reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|_| "代理地址无效")?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|_| "无法启动网站测试")?;
+    let start = std::time::Instant::now();
+    let response = client.get(target).send().await.map_err(|error| {
+        if error.is_timeout() {
+            "请求超时"
+        } else if error.is_connect() {
+            "连接或 TLS 握手失败"
+        } else {
+            "未收到 HTTP 响应"
+        }
+    })?;
+    Ok(WebsiteResult {
+        status: response.status().as_u16(),
+        milliseconds: start.elapsed().as_millis() as u64,
+    })
+}
+
 #[derive(Default, serde::Serialize)]
 struct SubscriptionUsage {
     upload: Option<u64>,
@@ -419,6 +473,7 @@ fn main() {
             set_routing_mode,
             proxy_telemetry,
             check_connection,
+            check_website,
             probes::begin_probe_batch,
             probes::cancel_probe_batch,
             probes::probe_node,
