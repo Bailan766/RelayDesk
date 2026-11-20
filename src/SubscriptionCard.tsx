@@ -27,16 +27,19 @@ export function SubscriptionRequestFields({ value, disabled, onChange }: {
   </div>;
 }
 
-export function SubscriptionCard({ profile, pending, error, refreshable, onRefresh, onRename, onConfigure, onRemove, onBrowse }: {
+export function SubscriptionCard({ profile, pending, error, refreshable, originalSelected, canSelectOriginal, onRefresh, onRename, onConfigure, onRemove, onBrowse, onSelectOriginal }: {
   profile: Subscription;
   pending: boolean;
   error?: string;
   refreshable: boolean;
+  originalSelected: boolean;
+  canSelectOriginal: boolean;
   onRefresh: () => void;
   onRename: (name: string) => void;
   onConfigure: (request: SubscriptionRequest) => Promise<void>;
   onRemove: () => void;
   onBrowse: () => void;
+  onSelectOriginal: () => void;
 }) {
   const [name, setName] = useState<string>();
   const [draft, setDraft] = useState<SubscriptionRequest>();
@@ -68,17 +71,22 @@ export function SubscriptionCard({ profile, pending, error, refreshable, onRefre
   return <article className="subscription-card">
     <div className="panel-head">
       <h3>{profile.name}</h3>
-      <button className="link" onClick={onBrowse}>查看节点</button>
+      {!!profile.parsed.nodes.length && <button className="link" onClick={onBrowse}>查看节点</button>}
     </div>
     <div className="subscription-meta">
       <span>{subscriptionHost(profile.source) || "本地导入"} · {profile.parsed.format}</span>
       <span>{profile.updatedAt ? new Date(profile.updatedAt).toLocaleString() : "原有订阅"}</span>
     </div>
     <div className="subscription-meta">
-      <span>{profile.parsed.nodes.length} 个节点 · {supported} 个可连接{profile.parsed.warnings.length ? ` · ${profile.parsed.warnings.length} 项跳过` : ""}</span>
+      {!!profile.parsed.nodes.length && <span>节点模式 · {supported} 个可连接 / {profile.parsed.nodes.length} 个识别</span>}
       {expiry && <span className={expired ? "error" : undefined}>{expired ? "已过期" : "到期"} {expiry}</span>}
     </div>
-    {!!profile.parsed.policySections?.length && <p className="rule-hint">原配置另含{profile.parsed.policySections.join("、")}。当前导入只提取独立节点。</p>}
+    {profile.parsed.mihomo && <p className="rule-hint">
+      {originalSelected ? "已选用 Mihomo 原配置" : "可使用 Mihomo 原配置"}
+      {!!profile.parsed.policySections?.length && ` · ${profile.parsed.policySections.join("、")}`}
+    </p>}
+    {!profile.parsed.mihomo && !!profile.parsed.policySections?.length &&
+      <p className="rule-hint">原配置另含{profile.parsed.policySections.join("、")}。节点模式提取独立节点。</p>}
     {quota !== undefined && <div className="subscription-quota">
       <progress max={100} value={quota} aria-label="已用流量比例" />
       <small>已用 {formatBytes(used)} / {formatBytes(usage?.total)}</small>
@@ -109,6 +117,9 @@ export function SubscriptionCard({ profile, pending, error, refreshable, onRefre
       </form>
     ) : (
       <div className="subscription-actions">
+        {profile.parsed.mihomo && <button className="link" disabled={!canSelectOriginal} onClick={onSelectOriginal}>
+          {originalSelected ? "打开连接" : "选用原配置"}
+        </button>}
         {profile.source && <button className="link" disabled={pending || !refreshable} onClick={onRefresh}>{pending ? "更新中…" : "更新"}</button>}
         {profile.source && <button className="link" disabled={!refreshable} onClick={() => {
           setRequestError("");

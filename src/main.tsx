@@ -25,6 +25,7 @@ import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } fro
 import { SubscriptionCard, SubscriptionRequestFields } from "./SubscriptionCard";
 import { WebsiteChecks } from "./WebsiteChecks";
 import { DownloadCheck } from "./DownloadCheck";
+import { MihomoGroups } from "./MihomoGroups";
 import { EventLog } from "./EventLog";
 import { useWorkspace } from "./useWorkspace";
 import { defaultSubscriptionRequest, preferredNode, type EntryMode, type RoutingMode, type SubscriptionRequest, type Workspace } from "./workspace";
@@ -104,6 +105,7 @@ function App() {
   const [recoveryMessage, setRecoveryMessage] = useState("");
   const [nodeHealth, setNodeHealth] = useState<ProxyStatus["node_health"]>(null);
   const [runningNode, setRunningNode] = useState<NodeProfile>();
+  const [runningOriginal, setRunningOriginal] = useState<string>();
   const [liveRouting, setLiveRouting] = useState<RoutingMode>();
   const routingMode = running ? liveRouting ?? work.workspace.routingMode : work.workspace.routingMode;
   const session = useRef<SessionPlan>();
@@ -145,6 +147,7 @@ function App() {
     setRecoveryMessage("");
     setNodeHealth(null);
     setRunningNode(undefined);
+    setRunningOriginal(undefined);
     setLiveRouting(undefined);
     setPort(undefined);
     resetDiagnostics();
@@ -196,10 +199,10 @@ function App() {
       setSettingsError("无法更新当前会话的自动恢复设置"));
   }, [autoReconnect, work.ready]);
   useEffect(() => {
-    if (!isTauri() || !running || !work.ready) return;
+    if (!isTauri() || !running || runningOriginal || !work.ready) return;
     void invoke("configure_failover", { enabled: autoFailover, fallbackGroups: fallbackGroups(session.current, subscriptions, starred) })
       .catch(() => setSettingsError("无法更新当前会话的自动换线设置"));
-  }, [autoFailover, running, starred, subscriptions, work.ready]);
+  }, [autoFailover, running, runningOriginal, starred, subscriptions, work.ready]);
   const activeFilter = subscriptions.find(profile => profile.id === subscriptionFilter);
   function probe(node: NodeProfile) {
     const value = latencies[node.id];
@@ -219,12 +222,12 @@ function App() {
     setError("");
     try {
       const request = importRequest && { ...importRequest, userAgent: importRequest.userAgent.trim() };
-      await work.add(text, request);
+      const original = await work.add(text, request);
       setSubscriptionFilter("");
       setText("");
       setImportRequest(undefined);
       setDialog(false);
-      setPage("节点");
+      setPage(original ? "订阅" : "节点");
     } catch (e) {
       setError(
         typeof e === "string" ? e : e instanceof Error ? e.message : "导入失败",
@@ -235,9 +238,11 @@ function App() {
   }
   const preferred = nodes.find(n => n.id === selected);
   const current = running ? runningNode ?? preferred : preferred;
-  const isSelected = (node: NodeProfile) => running
+  const originalProfile = subscriptions.find(profile => profile.id === work.workspace.mihomoProfile && profile.parsed.mihomo);
+  const originalName = running ? runningOriginal : originalProfile?.name;
+  const isSelected = (node: NodeProfile) => !originalName && (running
     ? runningNode?.id === node.id && nodeRevision(runningNode) === nodeRevision(node)
-    : node.id === selected;
+    : node.id === selected);
   async function checkProxy() {
     if (!port || busy || recovering) return;
     const epoch = diagnosticsEpoch.current;
@@ -277,7 +282,7 @@ function App() {
         setLiveRouting(value);
         resetDiagnostics();
       }
-      await saveSettings(state => ({ ...state, routingMode: value }));
+      if (!runningOriginal) await saveSettings(state => ({ ...state, routingMode: value }));
     } catch (error) {
       setConnectionError(typeof error === "string" ? error : "路由模式切换失败");
     } finally {
@@ -285,9 +290,10 @@ function App() {
     }
   }
   async function selectNode(node: NodeProfile) {
-    if (busy || recovering || testing || isSelected(node)) return;
+    if (busy || recovering || runningOriginal || testing || isSelected(node)) return;
     const remember = () => saveSettings(state => ({ ...state,
       selected: preferredNode(state.subscriptions, node.id),
+      mihomoProfile: undefined,
     }));
     const previous = session.current;
     if (!running || !port || !previous) {
@@ -416,13 +422,21 @@ function App() {
         await invoke("stop_proxy");
         clearSession();
       } else {
-        if (!preferred) throw new Error("请先导入并选择节点");
+        const original = originalProfile?.parsed.mihomo;
+        if (!original && !preferred) throw new Error("请先导入并选择节点或原配置");
         const localPort = proxyPort ?? await invoke<number>("allocate_port");
-        const next = await prepareSession(preferred, localPort);
-        await startProxy(next);
-        session.current = next;
-        setRunningNode(preferred);
-        setLiveRouting(routingMode);
+        if (original && originalProfile) {
+          const originalMode = original.mode === "global" || original.mode === "direct" ? original.mode : "rule";
+          await invoke("start_mihomo", { config: original, port: localPort, mode, routingMode: originalMode, autoReconnect });
+          setRunningOriginal(originalProfile.name);
+          setLiveRouting(originalMode);
+        } else if (preferred) {
+          const next = await prepareSession(preferred, localPort);
+          await startProxy(next);
+          session.current = next;
+          setRunningNode(preferred);
+          setLiveRouting(routingMode);
+        }
         setPort(localPort);
         setRunning(true);
       }
@@ -533,9 +547,10 @@ function App() {
                     </select>
                   </label>
                   {mode === "tun" && !running && <small>启动时需要管理员授权</small>}
+                  {originalName && mode === "tun" && !running && <small>原配置模式请选择系统代理或本地端口。</small>}
                   <button
                     className="connect"
-                    disabled={busy || (!running && (!current || testing)) || !isTauri()}
+                    disabled={busy || (!running && ((!current && !originalName) || testing || (!!originalName && mode === "tun"))) || !isTauri()}
                     onClick={toggleProxy}
                   >
                     {busy ? "处理中…" : running ? "停止" : "连接"}
@@ -545,13 +560,15 @@ function App() {
               <TrafficDashboard telemetry={telemetry} />
               <div className="stats">
                 <div>
-                  <span>当前节点</span>
-                  <strong>{current?.name || "尚未选择"}</strong>
+                  <span>{originalName ? "当前配置" : "当前节点"}</span>
+                  <strong>{originalName || current?.name || "尚未选择"}</strong>
                   <small>
-                    {current
+                    {originalName ? "Mihomo 原配置" : current
                       ? current.protocol.toUpperCase()
                       : "导入订阅后选择节点"}
                   </small>
+                  {originalName && !running && <button className="link" disabled={busy}
+                    onClick={() => void saveSettings(state => ({ ...state, mihomoProfile: undefined }))}>切回节点模式</button>}
                   {nodeHealth && <small role="status">{nodeHealthLabels[nodeHealth]}</small>}
                 </div>
                 <div>
@@ -560,6 +577,8 @@ function App() {
                   <small>{routingModes.find(entry => entry.value === routingMode)?.label}路由</small>
                 </div>
               </div>
+              {runningOriginal && <MihomoGroups mode={routingMode} disabled={busy || recovering}
+                onMode={value => void changeRouting(value)} onChange={resetDiagnostics} />}
               <div className="columns">
                 <WebsiteChecks key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
                 <section className="panel">
@@ -604,14 +623,10 @@ function App() {
                     <h2>运行环境</h2>
                   </div>
                   <div className="env-row">
-                    <span>sing-box</span>
+                    <span>代理内核</span>
                     <span className="muted">
-                      {running ? "运行中" : "未运行"}
+                      {running ? (runningOriginal ? "Mihomo" : "sing-box") : "未运行"}
                     </span>
-                  </div>
-                  <div className="env-row">
-                    <span>Mihomo</span>
-                    <span className="muted">未接入</span>
                   </div>
                   <div className="env-row">
                     <span>接管方式</span>
@@ -715,6 +730,7 @@ function App() {
                       disabled={
                         busy ||
                         recovering ||
+                        !!runningOriginal ||
                         testing ||
                         !!unavailableNodes.get(n.id) ||
                         isSelected(n)
@@ -773,6 +789,12 @@ function App() {
                   pending={work.refreshStatus[profile.id]?.pending ?? false}
                   error={work.refreshStatus[profile.id]?.error}
                   refreshable={isTauri()}
+                  originalSelected={originalProfile?.id === profile.id}
+                  canSelectOriginal={isTauri() && !running && !busy && !testing}
+                  onSelectOriginal={async () => {
+                    await saveSettings(state => ({ ...state, mihomoProfile: profile.id }));
+                    setPage("概览");
+                  }}
                   onRefresh={() => void work.refresh(profile.id).catch(() => {})}
                   onConfigure={request => work.configureRequest(profile.id, request)}
                   onBrowse={() => { setSubscriptionFilter(profile.id); setSearch(""); setOnlyFavorites(false); setPage("节点"); }}
@@ -782,6 +804,7 @@ function App() {
                     const remaining = state.subscriptions.filter(item => item.id !== profile.id);
                     const nodeIds = new Set(profile.parsed.nodes.map(node => node.id));
                     return { ...state, subscriptions: remaining, selected: preferredNode(remaining, state.selected),
+                      mihomoProfile: state.mihomoProfile === profile.id ? undefined : state.mihomoProfile,
                       favorites: state.favorites.filter(id => !nodeIds.has(id)) };
                   })}
                 />)}

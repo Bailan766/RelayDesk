@@ -22,6 +22,7 @@ export type Subscription = {
 export type Workspace = {
   subscriptions: Subscription[];
   selected?: string;
+  mihomoProfile?: string;
   rules: RouteRule[];
   entryMode: EntryMode;
   routingMode: RoutingMode;
@@ -112,7 +113,10 @@ export function preferredNode(subscriptions: Subscription[], selected?: string):
 
 export function replaceSubscription(state: Workspace, profile: Subscription): Workspace {
   const old = state.subscriptions.find(item => item.id === profile.id);
-  if (old?.parsed.nodes.some(node => !connectionSupport(node))
+  if (state.mihomoProfile === profile.id && old?.parsed.mihomo && !profile.parsed.mihomo) {
+    throw new Error("该更新缺少原配置的策略和节点，已保留原订阅");
+  }
+  if (state.mihomoProfile !== profile.id && old?.parsed.nodes.some(node => !connectionSupport(node))
       && !profile.parsed.nodes.some(node => !connectionSupport(node))) {
     throw new Error("更新后的订阅没有可连接的节点，已保留原订阅");
   }
@@ -194,6 +198,7 @@ export function deserializeWorkspace(raw: string): Workspace {
   return {
     subscriptions,
     selected: preferredNode(subscriptions, typeof saved.selected === "string" ? recoverId(saved.selected) : undefined),
+    mihomoProfile: subscriptions.find(profile => profile.id === saved.mihomoProfile && profile.parsed.mihomo)?.id,
     rules: (saved.rules as RouteRule[]).map(rule => rule.target ? { ...rule, target: recoverId(rule.target) } : rule),
     entryMode: saved.entryMode === "local" || saved.entryMode === "tun" ? saved.entryMode : "system",
     routingMode: saved.routingMode === "direct" || saved.routingMode === "global" ? saved.routingMode : "rule",

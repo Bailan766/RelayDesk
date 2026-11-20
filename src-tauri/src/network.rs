@@ -1,4 +1,4 @@
-use crate::{core_command, core_path, system_proxy};
+use crate::{core_command, core_path, mihomo, system_proxy};
 use serde_json::{json, Value};
 use std::{
     env, fs,
@@ -32,6 +32,15 @@ use winapi::{
 
 const APPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const TUN_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const MIHOMO_READY_TIMEOUT: Duration = Duration::from_secs(40);
+
+#[derive(Clone, Copy, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Core {
+    #[default]
+    Singbox,
+    Mihomo,
+}
 
 fn tun_interface(token: &str) -> String {
     format!("RelayDesk-{}", &token[..12])
@@ -120,7 +129,21 @@ impl Drop for NetworkLock {
 
 pub fn recover() -> Result<(), String> {
     let _lock = NetworkLock::acquire()?;
-    system_proxy::recover(&runtime_dir()?.join("proxy.json"))
+    let directory = runtime_dir()?;
+    for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+        let filename = entry.file_name();
+        if filename
+            .to_str()
+            .and_then(|name| name.strip_prefix("mihomo-"))
+            .is_some_and(|token| {
+                token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+    system_proxy::recover(&directory.join("proxy.json"))
         .map_err(|_| "恢复上次系统代理设置失败".into())
 }
 
@@ -609,6 +632,15 @@ struct WorkerInput {
     controller: crate::telemetry::Controller,
     #[serde(default)]
     routing_mode: RoutingMode,
+    #[serde(default)]
+    core: Core,
+}
+
+struct MihomoHome(PathBuf);
+impl Drop for MihomoHome {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 impl Session {
@@ -617,9 +649,10 @@ impl Session {
         port: u16,
         mode: &str,
         routing_mode: RoutingMode,
+        core: Core,
     ) -> Result<Self, String> {
         let executable = env::current_exe().map_err(|_| "无法定位当前应用")?;
-        Self::start_using(config, port, mode, routing_mode, &executable)
+        Self::start_using(config, port, mode, routing_mode, core, &executable)
     }
 
     pub(crate) fn start_using(
@@ -627,10 +660,17 @@ impl Session {
         port: u16,
         mode: &str,
         routing_mode: RoutingMode,
+        core: Core,
         executable: &std::path::Path,
     ) -> Result<Self, String> {
         if !matches!(mode, "local" | "system" | "tun") {
             return Err("代理入口模式无效".into());
+        }
+        if core == Core::Mihomo {
+            if mode == "tun" {
+                return Err("Mihomo 原配置模式目前使用系统代理或本地端口".into());
+            }
+            mihomo::prepare(&config, port, routing_mode)?;
         }
         ensure_port_available(port)?;
         let directory = runtime_dir()?;
@@ -658,6 +698,7 @@ impl Session {
             config,
             controller: controller.clone(),
             routing_mode,
+            core,
         };
         fs::write(
             &path,
@@ -693,7 +734,9 @@ impl Session {
             id: token,
         };
         let deadline = Instant::now()
-            + if mode == "tun" {
+            + if core == Core::Mihomo {
+                MIHOMO_READY_TIMEOUT + Duration::from_secs(5)
+            } else if mode == "tun" {
                 TUN_READY_TIMEOUT + Duration::from_secs(5)
             } else {
                 APPLY_TIMEOUT
@@ -706,7 +749,9 @@ impl Session {
                 break;
             }
         }
-        Err(if mode == "tun" {
+        Err(if core == Core::Mihomo {
+            "Mihomo 原配置检查或启动失败，请检查配置、提供者和本地端口"
+        } else if mode == "tun" {
             "TUN 启动失败，请检查管理员权限、虚拟网卡或 DNS 配置"
         } else {
             "代理启动失败，请检查内核、端口或 Windows 代理设置"
@@ -850,25 +895,61 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         mut config,
         controller,
         routing_mode,
+        core,
     } = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
-    if mode == "tun" {
-        config = tun_config(&config, port, &tun_interface(token)).ok_or("TUN 配置无效")?;
-    }
-    add_routing_modes(&mut config, mode == "tun").ok_or("无法配置路由模式")?;
-    controller.configure(&mut config, routing_mode.name());
-    let core = core_path()?;
+    let home = if core == Core::Mihomo {
+        if mode == "tun" {
+            return Err("Mihomo 原配置不能由 TUN 提权进程加载".into());
+        }
+        config = mihomo::prepare(&config, port, routing_mode)?;
+        controller.configure_mihomo(&mut config);
+        let path = directory.join(format!("mihomo-{token}"));
+        fs::create_dir(&path).map_err(|_| "无法创建 Mihomo 工作目录")?;
+        Some(MihomoHome(path))
+    } else {
+        if mode == "tun" {
+            config = tun_config(&config, port, &tun_interface(token)).ok_or("TUN 配置无效")?;
+        }
+        add_routing_modes(&mut config, mode == "tun").ok_or("无法配置路由模式")?;
+        controller.configure(&mut config, routing_mode.name());
+        None
+    };
+    let binary = match core {
+        Core::Singbox => core_path()?,
+        Core::Mihomo => crate::bundled_binary("mihomo.exe")?,
+    };
     let config = serde_json::to_vec(&config).map_err(|_| "内核配置无效")?;
     let job = job()?;
-    let config_command = |action| {
-        let mut command = core_command(&core);
+    let config_command = |check: bool| {
+        let mut command = core_command(&binary);
+        if let Some(home) = &home {
+            if check {
+                command.arg("-t");
+            }
+            command
+                .arg("-d")
+                .arg(&home.0)
+                .args(["-f", "-"])
+                .env_remove("SAFE_PATHS")
+                .env_remove("SKIP_SAFE_PATH_CHECK");
+        } else {
+            command.args([if check { "check" } else { "run" }, "-c", "stdin"]);
+        }
         command
-            .args([action, "-c", "stdin"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
     };
-    let mut check = config_command("check")
+    let deadline = Instant::now()
+        + if core == Core::Mihomo {
+            MIHOMO_READY_TIMEOUT
+        } else if mode == "tun" {
+            TUN_READY_TIMEOUT
+        } else {
+            Duration::from_secs(9)
+        };
+    let mut check = config_command(true)
         .spawn()
         .map_err(|_| "无法启动内核检查")?;
     assign(&mut check, &job)?;
@@ -879,11 +960,23 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         .ok_or("无法打开内核配置管道")?
         .write_all(&config)
         .is_err()
-        || !check.wait().map_err(|_| "无法完成内核检查")?.success()
     {
         return Err("内核配置检查失败".into());
     }
-    let mut child = config_command("run")
+    loop {
+        if let Some(status) = check.try_wait().map_err(|_| "无法完成内核检查")? {
+            if !status.success() {
+                return Err("内核配置检查失败".into());
+            }
+            break;
+        }
+        if stop.signaled(50) || parent.signaled(0) || Instant::now() >= deadline {
+            let _ = check.kill();
+            let _ = check.wait();
+            return Err("内核配置检查已停止或超时".into());
+        }
+    }
+    let mut child = config_command(false)
         .spawn()
         .map_err(|_| "无法启动代理内核")?;
     assign(&mut child, &job)?;
@@ -894,12 +987,6 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         .write_all(&config)
         .map_err(|_| "内核拒绝代理配置")?;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let deadline = Instant::now()
-        + if mode == "tun" {
-            TUN_READY_TIMEOUT
-        } else {
-            Duration::from_secs(9)
-        };
     loop {
         if stop.signaled(0)
             || parent.signaled(0)
@@ -909,6 +996,8 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                 .is_some()
             || Instant::now() >= deadline
         {
+            let _ = child.kill();
+            let _ = child.wait();
             return Err("本地代理入口未就绪".into());
         }
         let tun_ready =

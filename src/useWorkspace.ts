@@ -122,13 +122,15 @@ export function useWorkspace() {
         await configureRequest(previous.id, request);
         await refreshes.current.get(previous.id)?.catch(() => {});
       }
-      return refresh(previous.id);
+      await refresh(previous.id);
+      return !!current.current.subscriptions.find(item => item.id === previous.id)?.parsed.mihomo;
     }
     const downloaded = source ? await download(source, request) : { content: text, usage: null };
     const subscription = receiveSubscription(downloaded.content, source, downloaded.usage, undefined, source ? request : undefined);
     await commit(state => source && state.subscriptions.some(item => item.source === source)
       ? state
       : replaceSubscription(state, subscription));
+    return !!subscription.parsed.mihomo;
   }
 
   return { workspace, ready, storageError, commit, add, refresh, refreshStatus, configureRequest };

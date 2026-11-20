@@ -7,7 +7,7 @@ export interface NodeProfile {
   definition?: { format: 'clash' | 'sing-box' | 'vmess-uri'; fields: Fields };
   revision?: string;
 }
-export interface ImportResult { nodes: NodeProfile[]; warnings: string[]; format: string; policySections?: string[] }
+export interface ImportResult { nodes: NodeProfile[]; warnings: string[]; format: string; policySections?: string[]; mihomo?: Fields }
 const protocols = new Set(['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'hy2', 'tuic', 'shadowsocks', 'wireguard']);
 export const decodeSubscriptionText = (value: string) => new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(value.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)));
 const clean = (value: unknown) => typeof value === 'string' ? value : '';
@@ -76,26 +76,46 @@ function policySections(document: unknown): string[] | undefined {
   const selected = known.filter(([, keys]) => keys.some(key => Object.hasOwn(value, key))).map(([name]) => name);
   return selected.length ? selected : undefined;
 }
+
+const structuredKeys = /^[ \t]*["']?(?:proxies|proxy-groups|proxy-providers|rules|rule-providers|outbounds|endpoints)["']?[ \t]*:/m;
+
+function mihomoDocument(document: unknown): Fields | undefined {
+  if (!document || typeof document !== 'object' || Array.isArray(document)) return;
+  const fields = document as Fields;
+  const hasTraffic = ['proxies', 'proxy-groups', 'rules'].some(key =>
+    Array.isArray(fields[key]) && fields[key].length > 0);
+  const hasProviders = ['proxy-providers', 'rule-providers'].some(key => {
+    const providers = fields[key];
+    return providers && typeof providers === 'object' && !Array.isArray(providers) && Object.keys(providers).length > 0;
+  });
+  return hasTraffic || hasProviders ? fields : undefined;
+}
+
 export function parseSubscription(input: string): ImportResult {
   let text = input.trim(); if (!text) throw new Error('订阅内容为空');
-  let format = 'URI'; let entries: unknown[]; let schema: 'clash' | 'sing-box' = 'sing-box';
+  let format = 'URI'; let entries: unknown; let schema: 'clash' | 'sing-box' = 'sing-box';
   let sections: string[] | undefined;
-  if (!text.includes('://') && !text.startsWith('{') && !text.startsWith('[') && !/^\s*(proxies|outbounds|endpoints):/m.test(text)) {
+  let mihomo: Fields | undefined;
+  if (!text.includes('://') && !text.startsWith('{') && !text.startsWith('[') && !structuredKeys.test(text)) {
     try { text = decodeSubscriptionText(text).trim(); format = 'Base64'; } catch { throw new Error('无法识别订阅格式'); }
   }
   if (text.startsWith('{') || text.startsWith('[')) {
     const data = JSON.parse(text);
-    schema = Array.isArray(data?.proxies) ? 'clash' : 'sing-box';
-    entries = Array.isArray(data) ? data : schema === 'clash' ? data.proxies : singBoxEntries(data);
+    mihomo = mihomoDocument(data);
+    schema = mihomo ? 'clash' : 'sing-box';
+    entries = Array.isArray(data) ? data : mihomo ? mihomo.proxies ?? [] : singBoxEntries(data);
     sections = policySections(data);
     format = schema === 'clash' ? 'Clash JSON' : 'sing-box JSON';
     if (!Array.isArray(entries)) throw new Error('JSON 中没有代理节点列表');
-  } else if (/^\s*(proxies|outbounds|endpoints):/m.test(text)) {
-    const data = parseYaml(text, { maxAliasCount: 100 }); entries = data?.proxies ?? singBoxEntries(data);
+  } else if (structuredKeys.test(text)) {
+    const data = parseYaml(text, { maxAliasCount: 100 });
+    mihomo = mihomoDocument(data);
+    entries = mihomo ? mihomo.proxies ?? [] : singBoxEntries(data);
     sections = policySections(data);
-    schema = data?.proxies ? 'clash' : 'sing-box'; format = schema === 'clash' ? 'Clash YAML' : 'sing-box YAML';
+    schema = mihomo ? 'clash' : 'sing-box'; format = schema === 'clash' ? 'Clash YAML' : 'sing-box YAML';
     if (!Array.isArray(entries)) throw new Error('YAML 中没有代理节点列表');
   } else entries = text.split(/\r?\n/).map(x => x.trim()).filter(x => x && !x.startsWith('#'));
+  if (!Array.isArray(entries)) throw new Error('配置中没有代理节点列表');
   const nodes: NodeProfile[] = [], warnings: string[] = [], seen = new Set<string>();
   entries.forEach((entry, index) => {
     try {
@@ -104,8 +124,8 @@ export function parseSubscription(input: string): ImportResult {
       if (!seen.has(revision)) { nodes.push({ ...n, revision, sourceIndex: index + 1 }); seen.add(revision); }
     } catch { warnings.push(`第 ${index + 1} 项未导入：格式无效或协议不支持`); }
   });
-  if (!nodes.length) throw new Error(`没有找到可识别的节点（${entries.length} 项）`);
-  return { nodes, warnings, format, policySections: sections };
+  if (!nodes.length && !mihomo) throw new Error(`没有找到可识别的节点（${entries.length} 项）`);
+  return { nodes, warnings, format, policySections: sections, mihomo };
 }
 
 function singBoxEntries(document: unknown): unknown[] {

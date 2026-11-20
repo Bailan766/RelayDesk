@@ -23,6 +23,7 @@ const HEALTHY_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Plan {
+    pub core: network::Core,
     pub config: Value,
     pub port: u16,
     pub mode: String,
@@ -39,6 +40,7 @@ impl Plan {
             self.port,
             &self.mode,
             self.routing_mode,
+            self.core,
         )
     }
 
@@ -73,7 +75,9 @@ impl Plan {
     }
 
     fn monitors_node(&self) -> bool {
-        self.failover && !matches!(self.routing_mode, network::RoutingMode::Direct)
+        self.core == network::Core::Singbox
+            && self.failover
+            && !matches!(self.routing_mode, network::RoutingMode::Direct)
     }
 }
 
@@ -180,6 +184,7 @@ pub struct Link {
     pub port: u16,
     pub controller: Controller,
     pub route_revision: u64,
+    pub core: network::Core,
 }
 
 impl Supervisor {
@@ -289,6 +294,7 @@ impl Supervisor {
                 port: active.session.port,
                 controller: active.session.controller.clone(),
                 route_revision: active.health.revision,
+                core: active.plan.core,
             }))
     }
 
@@ -320,12 +326,40 @@ impl Supervisor {
             return Err("节点标识无效".into());
         }
         let _guard = self.control.lock().await;
-        let active = self.live()?.ok_or("代理内核未运行")?;
+        let active = self
+            .live()?
+            .filter(|active| active.core == network::Core::Singbox)
+            .ok_or("节点模式未运行")?;
         active.controller.switch(&tag).await?;
         if !self.update_plan(&active.id, "已切换代理节点", None, |plan| {
             plan.config["outbounds"][0]["default"] = tag.into();
         }) {
             return Err("代理会话已变化，请重新切换节点".into());
+        }
+        Ok(())
+    }
+
+    pub async fn mihomo_groups(&self) -> Result<Vec<crate::telemetry::ProxyGroup>, String> {
+        let active = self
+            .live()?
+            .filter(|active| active.core == network::Core::Mihomo)
+            .ok_or("Mihomo 原配置模式未运行")?;
+        let groups = active.controller.groups().await?;
+        if !self.live()?.is_some_and(|current| current.id == active.id) {
+            return Err("Mihomo 会话已变化，请刷新策略组".into());
+        }
+        Ok(groups)
+    }
+
+    pub async fn switch_mihomo_group(&self, group: &str, choice: &str) -> Result<(), String> {
+        let _guard = self.control.lock().await;
+        let active = self
+            .live()?
+            .filter(|active| active.core == network::Core::Mihomo)
+            .ok_or("Mihomo 原配置模式未运行")?;
+        active.controller.switch_group(group, choice).await?;
+        if !self.update_plan(&active.id, "已切换 Mihomo 策略组", None, |_| {}) {
+            return Err("Mihomo 会话已变化，请重新选择".into());
         }
         Ok(())
     }
@@ -644,6 +678,7 @@ mod tests {
         let port = loopback().local_addr().unwrap().port();
         let supervisor = Supervisor::default();
         let plan = Plan {
+            core: network::Core::Singbox,
             config: serde_json::json!({
                 "inbounds":[{"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port}],
                 "outbounds":[
@@ -668,6 +703,7 @@ mod tests {
                     plan.port,
                     &plan.mode,
                     plan.routing_mode,
+                    plan.core,
                     &executable,
                 )
             })
@@ -789,10 +825,12 @@ mod tests {
                 plan.port,
                 &plan.mode,
                 plan.routing_mode,
+                plan.core,
                 &executable,
             )
         };
         let plan = Plan {
+            core: network::Core::Singbox,
             config: serde_json::json!({
                 "inbounds":[{"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port}],
                 "outbounds":[

@@ -31,6 +31,18 @@ jobs:
           if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df') { throw 'sing-box checksum mismatch' }
           Expand-Archive $archive -DestinationPath (Join-Path $env:RUNNER_TEMP 'sing-box')
           "SING_BOX=$(Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/sing-box.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Download and verify Mihomo
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'mihomo.zip'
+          $directory = Join-Path $env:RUNNER_TEMP 'mihomo'
+          Invoke-WebRequest 'https://github.com/MetaCubeX/mihomo/releases/download/v1.19.34/mihomo-windows-amd64-v1-v1.19.34.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '703e325bfeee582f874b06d054eaae55ab7c194645d1835411685aafa85da5ea') { throw 'Mihomo checksum mismatch' }
+          Expand-Archive $archive -DestinationPath $directory
+          "MIHOMO=$(Join-Path $directory 'mihomo-windows-amd64-v1.exe')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $license = Join-Path $directory 'LICENSE'
+          Invoke-WebRequest 'https://raw.githubusercontent.com/MetaCubeX/mihomo/v1.19.34/LICENSE' -OutFile $license
+          if ((Get-FileHash $license -Algorithm SHA256).Hash -ne '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986') { throw 'Mihomo license checksum mismatch' }
       - run: npm test
       - run: npm run build
       - name: Prepare installer resources
@@ -39,16 +51,17 @@ jobs:
           New-Item -ItemType Directory -Path build-resources | Out-Null
           Copy-Item $env:SING_BOX build-resources/sing-box.exe
           Copy-Item (Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/LICENSE') build-resources/THIRD-PARTY-SING-BOX-LICENSE.txt
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'mihomo/mihomo-windows-amd64-v1.exe') build-resources/mihomo.exe
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'mihomo/LICENSE') build-resources/THIRD-PARTY-MIHOMO-LICENSE.txt
       - name: Test Windows data protection
         run: cargo test --manifest-path src-tauri/Cargo.toml
       - run: npm run tauri -- build --bundles nsis
-      - name: Package pinned sing-box
+      - name: Package proxy cores
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release | Out-Null
           Copy-Item src-tauri/target/release/relaydesk.exe release/
-          Copy-Item (Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/sing-box.exe') release/
-          Copy-Item (Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/LICENSE') release/THIRD-PARTY-SING-BOX-LICENSE.txt
+          Copy-Item build-resources/sing-box.exe, build-resources/mihomo.exe, build-resources/THIRD-PARTY-SING-BOX-LICENSE.txt, build-resources/THIRD-PARTY-MIHOMO-LICENSE.txt -Destination release/
           Copy-Item LICENSE release/RELAYDESK-LICENSE.txt
           Copy-Item THIRD_PARTY_NOTICES.md release/
           Compress-Archive -Path release/* -DestinationPath relaydesk-windows-x64-portable.zip
@@ -59,11 +72,13 @@ jobs:
           $install = Join-Path $env:RUNNER_TEMP 'RelayDeskSmoke'
           $setup = Start-Process -FilePath (Resolve-Path relaydesk-windows-x64-setup.exe) -ArgumentList '/S', "/D=$install" -Wait -PassThru
           if ($setup.ExitCode -ne 0) { throw "Installer failed: $($setup.ExitCode)" }
-          foreach ($name in @('relaydesk.exe', 'sing-box.exe', 'THIRD-PARTY-SING-BOX-LICENSE.txt')) {
+          foreach ($name in @('relaydesk.exe', 'sing-box.exe', 'mihomo.exe', 'THIRD-PARTY-SING-BOX-LICENSE.txt', 'THIRD-PARTY-MIHOMO-LICENSE.txt')) {
             if (-not (Test-Path (Join-Path $install $name))) { throw "Missing installed file: $name" }
           }
           & .github/scripts/test-windows-network.ps1 -App (Join-Path $install 'relaydesk.exe')
           $env:RELAYDESK_INSTALLED_SMOKE_APP = Join-Path $install 'relaydesk.exe'
+          npm test -- src/mihomo-integration.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Installed Mihomo profile test failed' }
           npm test -- src/wireguard-integration.test.ts
           if ($LASTEXITCODE -ne 0) { throw 'Installed WireGuard TUN test failed' }
           cargo test --manifest-path src-tauri/Cargo.toml supervisor::tests::installed_worker_recovers_and_explicit_stop_cancels_it -- --exact --nocapture

@@ -47,6 +47,11 @@ impl Controller {
         });
     }
 
+    pub fn configure_mihomo(&self, config: &mut Value) {
+        config["external-controller"] = json!(format!("127.0.0.1:{}", self.port));
+        config["secret"] = json!(self.secret.to_string());
+    }
+
     pub fn ready(&self) -> bool {
         let address = SocketAddr::from(([127, 0, 0, 1], self.port));
         let timeout = Duration::from_millis(150);
@@ -92,8 +97,29 @@ impl Controller {
     }
 
     pub async fn switch(&self, tag: &str) -> Result<(), String> {
+        self.choose("/proxies/proxy", tag).await
+    }
+
+    pub async fn switch_group(&self, group: &str, choice: &str) -> Result<(), String> {
+        if group.is_empty()
+            || group.len() > 512
+            || matches!(group, "." | "..")
+            || choice.is_empty()
+            || choice.len() > 512
+        {
+            return Err("策略组或节点名称无效".into());
+        }
+        let mut url = url::Url::parse("http://127.0.0.1/proxies/").map_err(|_| "策略组地址无效")?;
+        url.path_segments_mut()
+            .map_err(|_| "策略组地址无效")?
+            .pop_if_empty()
+            .push(group);
+        self.choose(url.path(), choice).await
+    }
+
+    async fn choose(&self, path: &str, tag: &str) -> Result<(), String> {
         let response = self
-            .request(reqwest::Method::PUT, "/proxies/proxy")?
+            .request(reqwest::Method::PUT, path)?
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(json!({ "name": tag }).to_string())
             .send()
@@ -103,6 +129,35 @@ impl Controller {
             return Ok(());
         }
         Err("内核未接受节点切换".into())
+    }
+
+    pub async fn groups(&self) -> Result<Vec<ProxyGroup>, String> {
+        #[derive(Deserialize)]
+        struct List {
+            proxies: std::collections::BTreeMap<String, GroupStatus>,
+        }
+        #[derive(Deserialize)]
+        struct GroupStatus {
+            #[serde(rename = "type")]
+            kind: String,
+            now: Option<String>,
+            all: Option<Vec<String>>,
+        }
+        let list: List = self.read_json("/proxies").await?;
+        Ok(list
+            .proxies
+            .into_iter()
+            .filter_map(|(name, group)| {
+                let choices = group.all.filter(|choices| !choices.is_empty())?;
+                Some(ProxyGroup {
+                    manual: group.kind.eq_ignore_ascii_case("selector"),
+                    name,
+                    kind: group.kind,
+                    selected: group.now.unwrap_or_default(),
+                    choices,
+                })
+            })
+            .collect())
     }
 
     pub async fn probe_outbound(&self, tag: &str, url: &str) -> Option<bool> {
@@ -153,8 +208,12 @@ impl Controller {
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot, String> {
+        self.read_json("/connections").await
+    }
+
+    async fn read_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, String> {
         let mut response = self
-            .request(reqwest::Method::GET, "/connections")?
+            .request(reqwest::Method::GET, path)?
             .send()
             .await
             .map_err(|_| "内核监控暂时不可用")?
@@ -211,6 +270,15 @@ impl Controller {
             }
         }
     }
+}
+
+#[derive(Serialize)]
+pub struct ProxyGroup {
+    name: String,
+    kind: String,
+    selected: String,
+    choices: Vec<String>,
+    manual: bool,
 }
 
 #[derive(Deserialize)]

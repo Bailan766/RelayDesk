@@ -9,6 +9,7 @@ use std::{
 };
 use tauri::Manager;
 mod failover;
+mod mihomo;
 mod network;
 mod probes;
 mod storage;
@@ -77,10 +78,14 @@ async fn check_exit_ip(port: u16, state: tauri::State<'_, ProxyState>) -> Result
 }
 
 fn core_path() -> Result<PathBuf, String> {
+    bundled_binary("sing-box.exe")
+}
+
+fn bundled_binary(name: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|_| "无法定位应用目录")?;
-    let core = exe.parent().ok_or("无法定位应用目录")?.join("sing-box.exe");
+    let core = exe.parent().ok_or("无法定位应用目录")?.join(name);
     if !core.is_file() {
-        return Err("应用目录缺少 sing-box.exe".into());
+        return Err(format!("应用目录缺少 {name}"));
     }
     Ok(core)
 }
@@ -142,6 +147,7 @@ async fn start_proxy(
             return Err("本地入口配置无效".into());
         }
         app.state::<ProxyState>().start(supervisor::Plan {
+            core: network::Core::Singbox,
             config,
             port,
             mode: mode.unwrap_or_else(|| "local".into()),
@@ -153,6 +159,51 @@ async fn start_proxy(
     })
     .await
     .map_err(|_| "启动代理任务异常".to_string())?
+}
+
+#[tauri::command]
+async fn start_mihomo(
+    config: serde_json::Value,
+    port: u16,
+    mode: String,
+    routing_mode: network::RoutingMode,
+    auto_reconnect: bool,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    if port < 1024 {
+        return Err("本地端口无效".into());
+    }
+    bundled_binary("mihomo.exe")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ProxyState>().start(supervisor::Plan {
+            core: network::Core::Mihomo,
+            config,
+            port,
+            mode,
+            routing_mode,
+            recover: auto_reconnect,
+            failover: false,
+            fallback_groups: Vec::new(),
+        })
+    })
+    .await
+    .map_err(|_| "启动 Mihomo 任务异常".to_string())?
+}
+
+#[tauri::command]
+async fn mihomo_groups(
+    state: tauri::State<'_, ProxyState>,
+) -> Result<Vec<telemetry::ProxyGroup>, String> {
+    state.mihomo_groups().await
+}
+
+#[tauri::command]
+async fn switch_mihomo_group(
+    group: String,
+    choice: String,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<(), String> {
+    state.switch_mihomo_group(&group, &choice).await
 }
 
 #[tauri::command]
@@ -593,6 +644,9 @@ fn main() {
             allocate_port,
             validate_proxy_config,
             start_proxy,
+            start_mihomo,
+            mihomo_groups,
+            switch_mihomo_group,
             stop_proxy,
             proxy_status,
             proxy_events,
