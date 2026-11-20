@@ -1,0 +1,56 @@
+body { background: #f1f2f4; color: #171b22; }
+aside { width: 220px; background: #fff; border-right: 1px solid #e8ebef; padding: 24px 14px; }
+.brand { padding-bottom: 30px; color: #15191e; }
+.brand strong { letter-spacing: 0; font-size: 18px; }
+.side-label { display: none; }
+nav { gap: 6px; }
+nav button { height: 43px; color: #4b5563; }
+nav button.active { background: #e7f1ff; color: #0876ed; }
+.side-bottom { border-top: 1px solid #e9edf1; }
+.workspace header { background: #fff; border-bottom: 1px solid #edf0f3; height: 54px; }
+main { background: #f4f5f7; border: 0; border-radius: 0; margin: 0; padding: 24px 28px 40px; }
+.title { margin-bottom: 20px; align-items: center; }
+.title h1 { font-size: 21px; }
+.primary, .connect { background: #0878ed !important; border-color: #0878ed !important; }
+.connect:disabled { background: #b7c4d4 !important; }
+.link { color: #0878ed; }
+.connection, .panel, .group-heading, .node-card, .test-card { background: white; border: 1px solid #e9edf2; border-radius: 8px; }
+.connection { padding: 18px 22px; margin-bottom: 16px; }
+.status { font-size: 18px; }
+.section-label { margin-bottom: 8px; }
+.panel { padding: 18px; }
+.traffic-panel { margin-top: 16px; }
+.traffic-empty { height: 132px; background: #f7f9fb; border: 1px solid #edf0f3; display: grid; place-items: center; color: #596675; border-radius: 6px; }
+.metric-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+.metric { border: 1px solid #edf0f3; border-radius: 6px; padding: 12px; display: flex; flex-direction: column; gap: 6px; color: #6b7685; }
+.metric strong { color: #202c38; font-size: 18px; }
+.stats { padding: 20px 0; }
+.columns { grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; margin-top: 16px; }
+.site-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 8px; }
+.site-grid div { background: #f4f8fd; padding: 18px 6px; text-align: center; border-radius: 6px; overflow: hidden; }
+.site-grid span { display: block; color: #596675; font-size: 12px; margin-top: 12px; }
+.group-heading { padding: 16px; margin: 12px 0; display: flex; justify-content: space-between; gap: 10px; }
+.group-heading span { color: #8793a1; font-size: 12px; }
+.node-grid, .unlock-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 10px; }
+.node-card { min-width: 0; padding: 14px; display: grid; gap: 9px; font-size: 12px; }
+.node-card.selected { border-color: #0878ed; background: #ecf5ff; }
+.node-card .node-name { min-width: 0; }
+.node-card .node-name > div { min-width: 0; }
+.node-card .node-name strong, .node-card .node-name small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.node-card .link { text-align: left; }
+.extension-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; margin-top: 16px; }
+.extension-grid p { color: #8b96a3; font-size: 12px; }
+.unlock-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; color: #6b7685; }
+.unlock-heading button, .test-card button { border: 1px solid #dae3ed; border-radius: 6px; background: #fff; padding: 6px 10px; color: #9ba8b5; }
+.test-card { padding: 16px; min-height: 112px; }
+.test-card > div { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.test-card span { display: inline-block; margin-top: 10px; color: #7d8793; background: #f1f3f5; padding: 4px 8px; border-radius: 12px; font-size: 12px; }
+.test-card footer { border-top: 1px dashed #e2e6eb; color: #a1aab5; text-align: right; margin-top: 12px; padding-top: 6px; }
+.connection-actions { display: grid; justify-items: end; gap: 6px; }
+.connection-actions label { display: flex; align-items: center; gap: 8px; }
+.connection-actions select { font: inherit; padding: 6px 8px; border-radius: 5px; border: 1px solid #dbe2ec; background: white; }
+.connection-actions small { color: #576677; }
+.source-index { font-variant-numeric: tabular-nums; color: #096acb; }
+.probe-result { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media(max-width:800px) { aside { width: 64px; } main { padding: 20px 16px; } .columns { grid-template-columns: 1fr; } .metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media(max-width:480px) { .site-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } .extension-grid { grid-template-columns: 1fr; } .toolbar { flex-wrap: wrap; gap: 10px; } }
