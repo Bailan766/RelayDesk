@@ -62,6 +62,13 @@ jobs:
           foreach ($name in @('relaydesk.exe', 'sing-box.exe', 'THIRD-PARTY-SING-BOX-LICENSE.txt')) {
             if (-not (Test-Path (Join-Path $install $name))) { throw "Missing installed file: $name" }
           }
+          & .github/scripts/test-windows-network.ps1 -App (Join-Path $install 'relaydesk.exe')
+          $upgrade = Start-Process -FilePath (Resolve-Path relaydesk-windows-x64-setup.exe) -ArgumentList '/S', "/D=$install" -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) { throw "In-place reinstall failed: $($upgrade.ExitCode)" }
+          $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'uninstall*.exe' | Select-Object -First 1
+          if (-not $uninstaller) { throw "Missing uninstaller" }
+          $remove = Start-Process -FilePath $uninstaller.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($remove.ExitCode -ne 0) { throw "Uninstall failed: $($remove.ExitCode)" }
       - uses: actions/upload-artifact@v4
         with:
           name: relaydesk-windows-x64
