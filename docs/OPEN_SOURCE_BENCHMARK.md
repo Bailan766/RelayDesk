@@ -22,7 +22,7 @@
 | A04 TUN 默认路由丢失 | Windows 实机移除测试网卡的默认路由后，原实现的内核仍在运行，路由没有自行回来。使用 Windows 网络接口重建该网卡的 IPv4、IPv6 默认路由后，TCP 请求恢复。`v0.1.17-preview.1` 验证安装后的应用会自动补回丢失的测试路由，保持同一会话，且可再次转发 TCP。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44846758386) | 恢复失败后的完整状态提示、真正的切网和休眠唤醒。 |
 | A04/A09 TUN 接管内核退出 | `v0.1.18-preview.2` 强制结束已安装应用的接管内核，验证同一授权进程恢复 Mihomo TUN 的实际 TCP 流量。节点模式恢复上次所选节点和路由模式，重试期间关闭自动恢复会停止接管。模拟界面验证恢复中仍可点击停止。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44849122906) | 授权进程自身退出、Mihomo 策略进程退出后重连、恢复期间阻断直连、Windows 服务及真实休眠唤醒。 |
 | A04/A09 Mihomo 策略内核退出 | `v0.1.19-preview.1` 强制结束 Mihomo 策略内核。接管网卡持续存在，恢复后原策略组选择生效，更新后的规则转发了到新目标的 TCP 请求。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44851096170) | 策略守护进程退出、应用自身保留 Fake-IP 地址时的恢复。 |
-| A05 双栈和 Fake-IP | Windows 实机夹具通过 IPv6 HTTP、Shadowsocks UDP 回显和 AAAA 查询。另复现了 Mihomo 重启后转发层仍缓存旧 Fake-IP。关闭该层缓存后，新查询得到替换内核提供的有效地址，HTTP 恢复。 | 安装包验证、应用和 Windows 自身仍缓存的 Fake-IP、IPv6 真实上游和切网。 |
+| A05 双栈和 Fake-IP | Windows 实机及 `v0.1.19-preview.2` 安装验收均通过 IPv6 HTTP、Shadowsocks UDP 回显和 AAAA 查询。关闭 TUN 转发层的 DNS 缓存后，重启 Mihomo 后的查询会返回替换内核提供的 Fake-IP，同一域名的新 HTTP 请求恢复。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44852078767) | 应用和 Windows 自身仍缓存的 Fake-IP、IPv6 真实上游和切网。 |
 
 ## 优先解决的用户风险
 
