@@ -138,6 +138,22 @@ impl Drop for FixtureCore {
     }
 }
 
+fn read_installed_log_tail(max_lines: usize) -> String {
+    let Some(local) = env::var_os("LOCALAPPDATA") else {
+        return "(no LOCALAPPDATA)".into();
+    };
+    let path = PathBuf::from(local)
+        .join("RelayDesk")
+        .join("logs")
+        .join("relaydesk.log");
+    let Ok(text) = fs::read_to_string(path) else {
+        return "(no log file)".into();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
+}
+
 #[test]
 fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let Some(app) = env::var_os("RELAYDESK_INSTALLED_SMOKE_APP").map(PathBuf::from) else {
@@ -285,6 +301,7 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         }),
         selections: BTreeMap::new(),
     };
+    let initial_tun_ip = mihomo::tun_ipv4_address(&settings.config);
     let mut session = Session::start_using(
         settings.clone(),
         mixed,
@@ -294,14 +311,10 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         true,
     )
     .unwrap_or_else(|e| {
-        let tail: Vec<String> = crate::logs::read_tail(20)
-            .into_iter()
-            .map(|(_, lvl, msg)| format!("[{lvl}] {msg}"))
-            .collect();
-        panic!("{e}\nlogs:\n{}", tail.join("\n"));
+        panic!("{e}\nlogs:\n{}", read_installed_log_tail(30));
     });
     assert!(session.running() && session.controller.ready());
-    assert!(UdpSocket::bind((TUN_ADDRESS, 0)).is_ok());
+    assert!(UdpSocket::bind((initial_tun_ip, 0)).is_ok());
     let target_address: std::net::Ipv4Addr = TARGET.parse().unwrap();
     let address = SocketAddr::from((target_address, 8089));
     let adapter = session.active_tun_interface().unwrap();
@@ -389,6 +402,7 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         false,
     )
     .unwrap();
+    let updated_tun_ip = mihomo::tun_ipv4_address(&updated);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -401,6 +415,10 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
             .await
             .unwrap();
     });
+    wait_until(
+        || UdpSocket::bind((updated_tun_ip, 0)).is_ok(),
+        Duration::from_secs(5),
+    );
     let previous_fake_ip = resolve_fixture_ipv4(POLICY_DNS_NAME, 0x1930);
     assert_eq!(&previous_fake_ip.octets()[..3], &[198, 19, 55]);
 
@@ -440,7 +458,10 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
 
     session.stop().or_else(|_| recover()).unwrap();
     wait_until(
-        || UdpSocket::bind((TUN_ADDRESS, 0)).is_err(),
+        || {
+            UdpSocket::bind((updated_tun_ip, 0)).is_err()
+                && UdpSocket::bind((initial_tun_ip, 0)).is_err()
+        },
         Duration::from_secs(4),
     );
     assert!(tun_default_route(&adapter, AF_INET as u16).is_none());

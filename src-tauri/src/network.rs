@@ -192,6 +192,10 @@ fn tun_default_route(alias: &str, family: u16) -> Option<MIB_IPFORWARD_ROW2> {
 }
 
 fn restore_tun_default_route(alias: &str, family: u16, saved: &MIB_IPFORWARD_ROW2) -> bool {
+    // Wait/check alias default route first: Mihomo ReCreateTun during hot reload may assign a new InterfaceIndex.
+    if tun_default_route(alias, family).is_some() {
+        return true;
+    }
     let mut current = *saved;
     match unsafe { GetIpForwardEntry2(&mut current) } {
         0 => true,
@@ -1783,6 +1787,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                 command.arg("-t");
             }
             command
+                .current_dir(&home.0)
                 .arg("-d")
                 .arg(&home.0)
                 .args(["-f", "-"])
@@ -1834,31 +1839,55 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         }
     }
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let launch = |config: &[u8], deadline, interface: &str, recovery: Option<&TunControl>| {
+    let launch = |config: &[u8],
+                  deadline,
+                  interface: &str,
+                  tun_ipv4: std::net::Ipv4Addr,
+                  recovery: Option<&TunControl>| {
         let mut child = start_core(&mut config_command(false), &job, config)?;
         let core_logs = attach_core_logger(&mut child, "core");
         let mut route = None;
         let mut ipv4_ready_at: Option<Instant> = None;
+        let (mut ip_ok, mut v4_ok, mut v6_ok, mut tcp_ok, mut ctrl_ok) =
+            (false, false, false, false, false);
         if let Err(err) = await_core(&mut child, &lifetime, deadline, recovery, || {
+            ip_ok = mode != "tun";
+            v4_ok = mode != "tun";
+            v6_ok = mode != "tun" || !tun_ipv6;
+            tcp_ok = false;
+            ctrl_ok = false;
             if mode == "tun" {
-                if UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_err() {
+                ip_ok = UdpSocket::bind((tun_ipv4, 0)).is_ok();
+                if !ip_ok {
                     return false;
                 }
                 route = tun_default_route(interface, AF_INET as u16);
-                if route.is_none() {
+                v4_ok = route.is_some();
+                if !v4_ok {
                     ipv4_ready_at = None;
                     return false;
                 }
-                if tun_ipv6 && tun_default_route(interface, AF_INET6 as u16).is_none() {
-                    let since = *ipv4_ready_at.get_or_insert_with(Instant::now);
-                    if since.elapsed() < Duration::from_millis(800) {
-                        return false;
+                if tun_ipv6 {
+                    v6_ok = tun_default_route(interface, AF_INET6 as u16).is_some();
+                    if !v6_ok {
+                        let since = *ipv4_ready_at.get_or_insert_with(Instant::now);
+                        if since.elapsed() < Duration::from_millis(800) {
+                            return false;
+                        }
                     }
                 }
             }
-            TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
-                && controller.ready()
+            tcp_ok = TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok();
+            ctrl_ok = tcp_ok && controller.ready();
+            ctrl_ok
         }) {
+            crate::logs::append(
+                "worker",
+                "error",
+                &format!(
+                    "内核就绪超时/失败：{err} (mode={mode} iface={interface} tun_ip={tun_ipv4} ip={ip_ok} v4={v4_ok} v6={v6_ok} tcp={tcp_ok} ctrl={ctrl_ok})"
+                ),
+            );
             let detail = core_logs
                 .lock()
                 .ok()
@@ -1870,7 +1899,18 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         }
         Ok::<_, String>((child, route))
     };
-    let (mut child, mut route) = launch(&initial, initial_deadline, &interface, None)?;
+    let initial_tun_ipv4 = if core == Core::Mihomo {
+        mihomo::tun_ipv4_address(&config)
+    } else {
+        std::net::Ipv4Addr::new(172, 28, 254, 1)
+    };
+    let (mut child, mut route) = launch(
+        &initial,
+        initial_deadline,
+        &interface,
+        initial_tun_ipv4,
+        None,
+    )?;
     if core == Core::Mihomo {
         restore_policy_choices(&controller, &mihomo_selections, initial_deadline);
         if lifetime.ended(0) || !matches!(child.try_wait(), Ok(None)) {
@@ -1948,9 +1988,14 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                 control.restore_routing(&mut config);
             }
             let replacement = serde_json::to_vec(&config).map_err(|_| "恢复 TUN 配置失败")?;
+            let next_tun_ipv4 = if core == Core::Mihomo {
+                mihomo::tun_ipv4_address(&config)
+            } else {
+                std::net::Ipv4Addr::new(172, 28, 254, 1)
+            };
             let deadline = Instant::now() + timeout;
             if let Ok((mut next, replacement_route)) =
-                launch(&replacement, deadline, &interface, Some(control))
+                launch(&replacement, deadline, &interface, next_tun_ipv4, Some(control))
             {
                 if core == Core::Mihomo {
                     restore_policy_choices(&controller, &mihomo_selections, deadline);

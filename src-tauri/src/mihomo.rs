@@ -135,6 +135,42 @@ pub fn prepare_with_lan(
     Ok(Value::Object(config))
 }
 
+fn normalize_fake_ip_range(value: &str) -> Option<String> {
+    let (ip_str, prefix_str) = value.trim().split_once('/')?;
+    let ip: std::net::Ipv4Addr = ip_str.trim().parse().ok()?;
+    let prefix: u8 = prefix_str.trim().parse().ok()?;
+    if prefix > 30 {
+        return None;
+    }
+    let mut octets = ip.octets();
+    match octets[3] % 4 {
+        0 => octets[3] += 1,
+        3 => octets[3] -= 2,
+        _ => {}
+    }
+    let normalized = std::net::Ipv4Addr::from(octets);
+    Some(format!("{normalized}/{prefix}"))
+}
+
+pub fn tun_ipv4_address(config: &Value) -> std::net::Ipv4Addr {
+    if let Some(raw) = config
+        .get("dns")
+        .and_then(|d| d.get("fake-ip-range"))
+        .and_then(Value::as_str)
+    {
+        let normalized = normalize_fake_ip_range(raw);
+        let candidate = normalized.as_deref().unwrap_or(raw);
+        if let Some(ip) = candidate
+            .split('/')
+            .next()
+            .and_then(|host| host.trim().parse::<std::net::Ipv4Addr>().ok())
+        {
+            return ip;
+        }
+    }
+    std::net::Ipv4Addr::new(198, 18, 0, 1)
+}
+
 pub fn prepare_native_tun_with_lan(
     config: &Value,
     port: u16,
@@ -158,6 +194,13 @@ pub fn prepare_native_tun_with_lan(
             ("use-hosts".into(), json!(true)),
         ]);
     }
+    if let Some(fixed) = dns
+        .get("fake-ip-range")
+        .and_then(Value::as_str)
+        .and_then(normalize_fake_ip_range)
+    {
+        dns.insert("fake-ip-range".into(), json!(fixed));
+    }
     dns.insert("enable".into(), json!(true));
     dns.remove("listen");
     if tun_ipv6 {
@@ -176,7 +219,6 @@ pub fn prepare_native_tun_with_lan(
         ("strict-route".into(), json!(true)),
         ("auto-detect-interface".into(), json!(true)),
         ("dns-hijack".into(), json!(["any:53", "tcp://any:53"])),
-        ("inet4-address".into(), json!(["172.28.254.1/30"])),
     ]);
     if tun_ipv6 {
         tun.insert("inet6-address".into(), json!(["fdfe:dcba:9876::1/126"]));
@@ -223,7 +265,7 @@ mod tests {
         let configured = json!({
             "rules":["MATCH,DIRECT"],
             "dns":{"enable":true,"listen":"0.0.0.0:53","nameserver":["https://dns.example/query"],
-                   "enhanced-mode":"fake-ip"}
+                   "enhanced-mode":"fake-ip","fake-ip-range":"198.19.55.0/24"}
         });
         let prepared = prepare_native_tun_with_lan(
             &configured,
@@ -238,10 +280,15 @@ mod tests {
         assert!(prepared["dns"].get("listen").is_none());
         assert_eq!(prepared["dns"]["nameserver"], configured["dns"]["nameserver"]);
         assert_eq!(prepared["dns"]["enhanced-mode"], "fake-ip");
+        assert_eq!(prepared["dns"]["fake-ip-range"], "198.19.55.1/24");
+        assert_eq!(
+            tun_ipv4_address(&prepared),
+            std::net::Ipv4Addr::new(198, 19, 55, 1)
+        );
         assert_eq!(prepared["tun"]["enable"], true);
         assert_eq!(prepared["tun"]["device"], "RelayDesk-test1234");
         assert_eq!(prepared["tun"]["stack"], "mixed");
-        assert_eq!(prepared["tun"]["inet4-address"], json!(["172.28.254.1/30"]));
+        assert!(prepared["tun"].get("inet4-address").is_none());
         assert_eq!(prepared["tun"]["inet6-address"], json!(["fdfe:dcba:9876::1/126"]));
 
         for config in [
@@ -258,9 +305,15 @@ mod tests {
             )
             .unwrap();
             assert_eq!(prepared["allow-lan"], true);
+            assert!(prepared["tun"].get("inet4-address").is_none());
             assert!(prepared["tun"].get("inet6-address").is_none());
             assert_eq!(prepared["dns"]["enable"], true);
             assert_eq!(prepared["dns"]["enhanced-mode"], "fake-ip");
+            assert_eq!(prepared["dns"]["fake-ip-range"], "198.18.0.1/16");
+            assert_eq!(
+                tun_ipv4_address(&prepared),
+                std::net::Ipv4Addr::new(198, 18, 0, 1)
+            );
             assert_eq!(prepared["dns"]["nameserver"], json!(["system"]));
         }
     }
