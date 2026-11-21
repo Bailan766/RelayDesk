@@ -1651,7 +1651,7 @@ struct SystemProxyGuardEvent {
 
 #[cfg(windows)]
 mod single_instance {
-    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr, sync::Mutex};
+    use std::{os::windows::ffi::OsStrExt, ptr, sync::Mutex};
     use winapi::{
         shared::winerror::ERROR_ALREADY_EXISTS,
         um::{
@@ -1659,6 +1659,7 @@ mod single_instance {
             handleapi::CloseHandle,
             synchapi::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
             winbase::{WAIT_ABANDONED, WAIT_OBJECT_0},
+            winnt::HANDLE,
             winuser::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE},
         },
     };
@@ -1702,7 +1703,7 @@ mod single_instance {
         if let Ok(mut guard) = HOLDER.lock() {
             let raw = std::mem::take(&mut *guard);
             if raw != 0 {
-                let handle = raw as *mut c_void;
+                let handle = raw as HANDLE;
                 unsafe {
                     ReleaseMutex(handle);
                     CloseHandle(handle);

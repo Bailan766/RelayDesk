@@ -62,7 +62,7 @@ fn store(conn: &Connection, data: &str) -> Result<(), String> {
         return Err(err);
     }
     conn.execute_batch("COMMIT;")
-        .map_err(|_| "无法提交订阅保存事务")
+        .map_err(|_| "无法提交订阅保存事务".into())
 }
 
 fn read_encrypted_row(conn: &Connection, table: &str) -> Result<Option<Vec<u8>>, String> {
