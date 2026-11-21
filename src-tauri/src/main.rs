@@ -5,9 +5,10 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 mod failover;
 mod mihomo;
 mod network;
@@ -51,30 +52,30 @@ async fn local_tcp_google() -> Result<u64, String> {
 
 #[tauri::command]
 async fn check_exit_ip(port: u16, state: tauri::State<'_, ProxyState>) -> Result<String, String> {
+    Ok(check_exit_ip_detail(port, state).await?.ip)
+}
+
+#[tauri::command]
+async fn check_exit_ip_detail(
+    port: u16,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<probes::ExitIpDetail, String> {
     if running_port(&state) != Some(port) {
         return Err("代理内核未运行".into());
     }
-    let proxy =
-        reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|_| "代理地址无效")?;
-    let client = reqwest::Client::builder()
-        .proxy(proxy)
-        .timeout(Duration::from_secs(12))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "无法初始化出口检查")?;
-    let response = client
-        .get("https://api.ipify.org")
-        .send()
-        .await
-        .map_err(|_| "出口地址检查失败")?
-        .error_for_status()
-        .map_err(|_| "出口地址服务异常")?;
-    let text = response.text().await.map_err(|_| "读取出口地址失败")?;
-    let ip: std::net::IpAddr = text
-        .trim()
-        .parse()
-        .map_err(|_| "出口地址服务返回无效数据")?;
-    Ok(ip.to_string())
+    probes::check_exit_ip_detail(port).await
+}
+
+#[tauri::command]
+async fn check_unlock_service(
+    service: String,
+    port: u16,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<probes::UnlockResult, String> {
+    if running_port(&state) != Some(port) {
+        return Err("代理内核未运行".into());
+    }
+    probes::check_unlock_service(&service, port).await
 }
 
 fn core_path() -> Result<PathBuf, String> {
@@ -128,6 +129,9 @@ async fn start_proxy(
     auto_reconnect: Option<bool>,
     auto_failover: Option<bool>,
     fallback_groups: Option<Vec<Vec<String>>>,
+    allow_lan: Option<bool>,
+    bypass: Option<String>,
+    tun_ipv6: Option<bool>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -154,6 +158,11 @@ async fn start_proxy(
             recover: auto_reconnect.unwrap_or(true),
             failover: auto_failover.unwrap_or(false),
             fallback_groups: fallback_groups.unwrap_or_default(),
+            options: network::SessionOptions {
+                allow_lan: allow_lan.unwrap_or(false),
+                bypass,
+                tun_ipv6: tun_ipv6.unwrap_or(true),
+            },
         })
     })
     .await
@@ -168,6 +177,9 @@ async fn start_mihomo(
     routing_mode: network::RoutingMode,
     auto_reconnect: bool,
     selections: Option<std::collections::BTreeMap<String, String>>,
+    allow_lan: Option<bool>,
+    bypass: Option<String>,
+    tun_ipv6: Option<bool>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     if port < 1024 {
@@ -197,6 +209,11 @@ async fn start_mihomo(
             recover: auto_reconnect,
             failover: false,
             fallback_groups: Vec::new(),
+            options: network::SessionOptions {
+                allow_lan: allow_lan.unwrap_or(false),
+                bypass,
+                tun_ipv6: tun_ipv6.unwrap_or(true),
+            },
         })
     })
     .await
@@ -246,6 +263,144 @@ fn proxy_status(state: tauri::State<'_, ProxyState>) -> supervisor::Status {
 #[tauri::command]
 fn proxy_events(state: tauri::State<'_, ProxyState>) -> Result<Vec<supervisor::Event>, String> {
     state.events()
+}
+
+#[tauri::command]
+fn clear_proxy_events(state: tauri::State<'_, ProxyState>) -> Result<(), String> {
+    state.clear_events()
+}
+
+#[tauri::command]
+async fn probe_loaded_node(
+    tag: String,
+    probe_url: Option<String>,
+    timeout_ms: Option<u64>,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<u64, String> {
+    let url = probe_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+        .unwrap_or("https://www.gstatic.com/generate_204");
+    state
+        .probe_delay(&tag, url, timeout_ms.unwrap_or(5000))
+        .await
+}
+
+#[tauri::command]
+async fn probe_mihomo_group(
+    group: String,
+    probe_url: Option<String>,
+    timeout_ms: Option<u64>,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<std::collections::BTreeMap<String, u64>, String> {
+    let url = probe_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+        .unwrap_or("https://www.gstatic.com/generate_204");
+    state
+        .probe_group_delays(&group, url, timeout_ms.unwrap_or(5000))
+        .await
+}
+
+#[tauri::command]
+async fn close_proxy_connection(
+    id: String,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<(), String> {
+    state.close_connection(&id).await
+}
+
+#[tauri::command]
+async fn close_all_connections(state: tauri::State<'_, ProxyState>) -> Result<(), String> {
+    state.close_all_connections().await
+}
+
+#[tauri::command]
+fn is_elevated() -> bool {
+    network::is_elevated()
+}
+
+#[tauri::command]
+fn relaunch_elevated(app: tauri::AppHandle) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::shellapi::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
+    let _ = app.state::<ProxyState>().shutdown();
+    let exe = std::env::current_exe().map_err(|_| "无法定位当前程序")?;
+    let wide = |s: &std::ffi::OsStr| s.encode_wide().chain([0]).collect::<Vec<u16>>();
+    let file = wide(exe.as_os_str());
+    let verb = wide(std::ffi::OsStr::new("runas"));
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.nShow = 1;
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        return Err("未获得管理员权限授权".into());
+    }
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_autostart() -> bool {
+    #[cfg(windows)]
+    {
+        win_reg::is_enabled()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        win_reg::set_enabled(enabled)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("仅支持 Windows 开机自启".into())
+    }
+}
+
+#[tauri::command]
+fn set_close_action(exit_on_close: bool, prefs: tauri::State<'_, AppPreferences>) {
+    prefs.exit_on_close.store(exit_on_close, Ordering::Release);
+}
+
+#[tauri::command]
+fn update_tray_state(
+    running: bool,
+    summary: String,
+    routing_mode: String,
+    app: tauri::AppHandle,
+) {
+    if let Some(ui) = app.try_state::<TrayUi>() {
+        let status_text = if running {
+            format!("状态：运行中 · {summary}")
+        } else {
+            "状态：未连接".to_owned()
+        };
+        let _ = ui.status.set_text(&status_text);
+        let _ = ui.toggle.set_text(if running { "断开代理" } else { "连接代理" });
+        let _ = ui.rule.set_checked(routing_mode == "rule");
+        let _ = ui.global.set_checked(routing_mode == "global");
+        let _ = ui.direct.set_checked(routing_mode == "direct");
+    }
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let tip = if running {
+            format!("RelayDesk · {summary}")
+        } else {
+            "RelayDesk · 未连接".to_owned()
+        };
+        let _ = tray.set_tooltip(Some(&tip));
+    }
 }
 
 #[tauri::command]
@@ -304,10 +459,19 @@ async fn proxy_telemetry(
     })
 }
 #[tauri::command]
-async fn check_connection(port: u16, state: tauri::State<'_, ProxyState>) -> Result<u128, String> {
+async fn check_connection(
+    port: u16,
+    probe_url: Option<String>,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<u128, String> {
     if running_port(&state) != Some(port) {
         return Err("代理内核未运行".into());
     }
+    let url = probe_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+        .unwrap_or("https://www.gstatic.com/generate_204");
     let proxy =
         reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|_| "本地代理地址无效")?;
     let client = reqwest::Client::builder()
@@ -318,11 +482,11 @@ async fn check_connection(port: u16, state: tauri::State<'_, ProxyState>) -> Res
         .map_err(|_| "无法启动连接检查")?;
     let started = std::time::Instant::now();
     let response = client
-        .get("https://www.gstatic.com/generate_204")
+        .get(url)
         .send()
         .await
         .map_err(|_| "代理请求失败或超时，请检查节点和网络")?;
-    if response.status() != reqwest::StatusCode::NO_CONTENT {
+    if !response.status().is_success() && response.status() != reqwest::StatusCode::NO_CONTENT {
         return Err("检查地址返回异常状态，连接未确认".into());
     }
     Ok(started.elapsed().as_millis())
@@ -455,21 +619,47 @@ enum SubscriptionRoute {
 struct SubscriptionRequest {
     route: SubscriptionRoute,
     user_agent: String,
+    allow_http: bool,
+}
+
+fn is_local_or_private_http(target: &url::Url) -> bool {
+    if target.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = target.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.trim_matches(|c| c == '[' || c == ']').parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local()
+        }
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+fn subscription_url_allowed(target: &url::Url, allow_http: bool) -> bool {
+    if target.host_str().is_none() || !target.username().is_empty() || target.password().is_some() {
+        return false;
+    }
+    target.scheme() == "https"
+        || is_local_or_private_http(target)
+        || (allow_http && target.scheme() == "http")
 }
 
 fn subscription_http_client(
     request: SubscriptionRequest,
     port: Option<u16>,
 ) -> Result<reqwest::Client, String> {
+    let allow_http = request.allow_http;
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             let target = attempt.url();
-            if attempt.previous().len() > 3
-                || target.scheme() != "https"
-                || !target.username().is_empty()
-                || target.password().is_some()
-            {
+            if attempt.previous().len() > 3 || !subscription_url_allowed(target, allow_http) {
                 attempt.error("invalid subscription redirect")
             } else {
                 attempt.follow()
@@ -502,14 +692,10 @@ async fn fetch_subscription(
     state: tauri::State<'_, ProxyState>,
 ) -> Result<SubscriptionDownload, String> {
     let parsed = url::Url::parse(&address).map_err(|_| "订阅地址无效")?;
-    if parsed.scheme() != "https"
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return Err("请输入不含账号密码的 HTTPS 订阅地址".into());
-    }
     let request = request.unwrap_or_default();
+    if !subscription_url_allowed(&parsed, request.allow_http) {
+        return Err("请输入不含账号密码的 HTTPS 订阅地址（或内网 HTTP / 在请求设置中允许 HTTP）".into());
+    }
     let port = if matches!(&request.route, SubscriptionRoute::Relaydesk) {
         running_port(&state)
     } else {
@@ -578,6 +764,7 @@ mod subscription_tests {
         let request = |route| SubscriptionRequest {
             route,
             user_agent: " RelayDesk-Fixture/1.0 ".into(),
+            allow_http: false,
         };
         assert!(subscription_http_client(request(SubscriptionRoute::Relaydesk), None).is_err());
 
@@ -611,6 +798,132 @@ mod subscription_tests {
     }
 }
 
+#[derive(Default)]
+struct AppPreferences {
+    exit_on_close: AtomicBool,
+}
+
+struct TrayUi {
+    status: tauri::menu::MenuItem<tauri::Wry>,
+    toggle: tauri::menu::MenuItem<tauri::Wry>,
+    rule: tauri::menu::CheckMenuItem<tauri::Wry>,
+    global: tauri::menu::CheckMenuItem<tauri::Wry>,
+    direct: tauri::menu::CheckMenuItem<tauri::Wry>,
+}
+
+#[cfg(windows)]
+mod win_reg {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    type Hkey = *mut c_void;
+    const HKEY_CURRENT_USER: Hkey = 0x8000_0001usize as Hkey;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const KEY_SET_VALUE: u32 = 0x0002;
+    const REG_SZ: u32 = 1;
+    const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const VALUE_NAME: &str = "RelayDesk";
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hkey: Hkey,
+            sub_key: *const u16,
+            options: u32,
+            sam: u32,
+            result: *mut Hkey,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: Hkey,
+            value_name: *const u16,
+            reserved: *mut u32,
+            kind: *mut u32,
+            data: *mut u8,
+            size: *mut u32,
+        ) -> i32;
+        fn RegSetValueExW(
+            hkey: Hkey,
+            value_name: *const u16,
+            reserved: u32,
+            kind: u32,
+            data: *const u8,
+            size: u32,
+        ) -> i32;
+        fn RegDeleteValueW(hkey: Hkey, value_name: *const u16) -> i32;
+        fn RegCloseKey(hkey: Hkey) -> i32;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text).encode_wide().chain([0]).collect()
+    }
+
+    pub fn is_enabled() -> bool {
+        let subkey = wide(RUN_KEY);
+        let name = wide(VALUE_NAME);
+        let mut key: Hkey = std::ptr::null_mut();
+        if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) }
+            != 0
+        {
+            return false;
+        }
+        let mut kind = 0u32;
+        let mut size = 0u32;
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        unsafe { RegCloseKey(key) };
+        status == 0 && kind == REG_SZ && size > 2
+    }
+
+    pub fn set_enabled(enabled: bool) -> Result<(), String> {
+        let subkey = wide(RUN_KEY);
+        let name = wide(VALUE_NAME);
+        let mut key: Hkey = std::ptr::null_mut();
+        if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_SET_VALUE, &mut key) }
+            != 0
+        {
+            return Err("无法打开 Windows 启动项注册表".into());
+        }
+        let status = if enabled {
+            let Ok(exe) = std::env::current_exe() else {
+                unsafe { RegCloseKey(key) };
+                return Err("无法定位程序路径".into());
+            };
+            let command = wide(&format!("\"{}\"", exe.to_string_lossy()));
+            let bytes = (command.len() * std::mem::size_of::<u16>()) as u32;
+            unsafe {
+                RegSetValueExW(
+                    key,
+                    name.as_ptr(),
+                    0,
+                    REG_SZ,
+                    command.as_ptr().cast(),
+                    bytes,
+                )
+            }
+        } else {
+            let code = unsafe { RegDeleteValueW(key, name.as_ptr()) };
+            if code == 2 {
+                0
+            } else {
+                code
+            }
+        };
+        unsafe { RegCloseKey(key) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err("无法更新 Windows 开机自启设置".into())
+        }
+    }
+}
+
 fn main() {
     if let Some(code) = network::cli() {
         std::process::exit(code);
@@ -619,21 +932,52 @@ fn main() {
     let app = tauri::Builder::default()
         .manage(ProxyState::default())
         .manage(probes::ProbeBatch::default())
+        .manage(AppPreferences::default())
         .setup(|app| {
             use tauri::{
-                menu::{Menu, MenuItem},
+                menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
                 tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
             };
+            let status = MenuItem::with_id(app, "status", "状态：未连接", false, None::<&str>)?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
             let show = MenuItem::with_id(app, "show", "打开 RelayDesk", true, None::<&str>)?;
+            let toggle = MenuItem::with_id(app, "toggle", "连接代理", true, None::<&str>)?;
+            let rule = CheckMenuItem::with_id(app, "mode_rule", "规则模式", true, true, None::<&str>)?;
+            let global = CheckMenuItem::with_id(app, "mode_global", "全局模式", true, false, None::<&str>)?;
+            let direct = CheckMenuItem::with_id(app, "mode_direct", "直连模式", true, false, None::<&str>)?;
+            let mode_menu = Submenu::with_items(app, "路由模式", true, &[&rule, &global, &direct])?;
             let stop = MenuItem::with_id(app, "stop", "停止代理", true, None::<&str>)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "彻底退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &stop, &quit])?;
-            let mut tray = TrayIconBuilder::new()
-                .tooltip("RelayDesk")
+            let menu = Menu::with_items(
+                app,
+                &[&status, &sep1, &show, &toggle, &mode_menu, &stop, &sep2, &quit],
+            )?;
+            app.manage(TrayUi {
+                status,
+                toggle,
+                rule,
+                global,
+                direct,
+            });
+            let mut tray = TrayIconBuilder::with_id("main-tray")
+                .tooltip("RelayDesk · 未连接")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" => show_main(app),
+                    "toggle" => {
+                        let _ = app.emit("tray-action", "toggle");
+                    }
+                    "mode_rule" => {
+                        let _ = app.emit("tray-action", "mode:rule");
+                    }
+                    "mode_global" => {
+                        let _ = app.emit("tray-action", "mode:global");
+                    }
+                    "mode_direct" => {
+                        let _ = app.emit("tray-action", "mode:direct");
+                    }
                     "stop" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn_blocking(move || {
@@ -665,8 +1009,15 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let _ = window.hide();
+                let exit = window
+                    .app_handle()
+                    .state::<AppPreferences>()
+                    .exit_on_close
+                    .load(Ordering::Acquire);
+                if !exit {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -681,6 +1032,11 @@ fn main() {
             stop_proxy,
             proxy_status,
             proxy_events,
+            clear_proxy_events,
+            probe_loaded_node,
+            probe_mihomo_group,
+            close_proxy_connection,
+            close_all_connections,
             configure_recovery,
             configure_failover,
             switch_proxy_node,
@@ -693,7 +1049,15 @@ fn main() {
             probes::cancel_probe_batch,
             probes::probe_node,
             check_exit_ip,
+            check_exit_ip_detail,
+            check_unlock_service,
             local_tcp_google,
+            is_elevated,
+            relaunch_elevated,
+            get_autostart,
+            set_autostart,
+            set_close_action,
+            update_tray_state,
             storage::save_subscription,
             storage::load_subscription
         ])

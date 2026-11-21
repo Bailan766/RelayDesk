@@ -81,6 +81,15 @@ fn prepare_providers(config: &mut Map<String, Value>, field: &str) -> Result<(),
 }
 
 pub fn prepare(config: &Value, port: u16, mode: RoutingMode) -> Result<Value, String> {
+    prepare_with_lan(config, port, mode, false)
+}
+
+pub fn prepare_with_lan(
+    config: &Value,
+    port: u16,
+    mode: RoutingMode,
+    allow_lan: bool,
+) -> Result<Value, String> {
     let source = config.as_object().ok_or("Mihomo 原配置必须为对象")?;
     if ![
         "proxies",
@@ -105,8 +114,11 @@ pub fn prepare(config: &Value, port: u16, mode: RoutingMode) -> Result<Value, St
         dns.remove("listen");
     }
     config.insert("mixed-port".into(), json!(port));
-    config.insert("bind-address".into(), json!("127.0.0.1"));
-    config.insert("allow-lan".into(), json!(false));
+    config.insert(
+        "bind-address".into(),
+        json!(if allow_lan { "0.0.0.0" } else { "127.0.0.1" }),
+    );
+    config.insert("allow-lan".into(), json!(allow_lan));
     config.insert("mode".into(), json!(mode.name()));
     config.insert("log-level".into(), json!("warning"));
     Ok(Value::Object(config))
@@ -119,7 +131,18 @@ pub fn prepare_tun_policy(
     dns_port: u16,
     system_dns: Option<u16>,
 ) -> Result<Value, String> {
-    let mut prepared = prepare(config, port, mode)?;
+    prepare_tun_policy_with_lan(config, port, mode, dns_port, system_dns, false)
+}
+
+pub fn prepare_tun_policy_with_lan(
+    config: &Value,
+    port: u16,
+    mode: RoutingMode,
+    dns_port: u16,
+    system_dns: Option<u16>,
+    allow_lan: bool,
+) -> Result<Value, String> {
+    let mut prepared = prepare_with_lan(config, port, mode, allow_lan)?;
     let dns = prepared["dns"].take();
     let mut dns = match dns {
         Value::Object(dns) => dns,

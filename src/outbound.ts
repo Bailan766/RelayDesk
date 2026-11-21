@@ -74,9 +74,9 @@ function truthy(value: string | null) {
   return value === '1' || value?.toLowerCase() === 'true';
 }
 
-function tlsFields(enabled: boolean, sni: unknown, insecure?: boolean, alpn?: unknown, fingerprint?: unknown) {
+function tlsFields(enabled: boolean, sni: unknown, insecure?: boolean, alpn?: unknown, fingerprint?: unknown, disableSni?: boolean) {
   const fp = optionalString(fingerprint);
-  return { enabled, server_name: optionalString(sni, 'SNI'), insecure,
+  return { enabled, server_name: optionalString(sni, 'SNI'), insecure, disable_sni: disableSni,
     alpn: strings(alpn, 'ALPN'), utls: fp ? { enabled: true, fingerprint: fp } : undefined };
 }
 
@@ -140,7 +140,8 @@ function uriFields(node: NodeProfile): Fields {
     throw new Error('此节点的 gRPC 工作模式暂不支持');
   }
   const tls: Fields = tlsFields(security !== 'none', q.get('sni') || q.get('servername') || q.get('peer'),
-    truthy(q.get('insecure')) || truthy(q.get('allowInsecure')), q.get('alpn'), q.get('fp'));
+    truthy(q.get('insecure')) || truthy(q.get('allowInsecure')), q.get('alpn'), q.get('fp'),
+    q.has('disableSni') || q.has('disable-sni') ? truthy(q.get('disableSni') ?? q.get('disable-sni')) : undefined);
   if (security === 'reality') tls.reality = { enabled: true, public_key: requiredString(q.get('pbk'), 'Reality 公钥'), short_id: q.get('sid') || '' };
   const auth = secret ? `${user}:${secret}` : user;
   switch (node.protocol) {
@@ -179,7 +180,7 @@ function clashFields(node: NodeProfile, value: Fields): Fields {
     hysteria2: 'password ports hop-interval up down obfs obfs-password',
     tuic: 'uuid password congestion-controller udp-relay-mode reduce-rtt heartbeat-interval udp-over-stream',
   };
-  fieldsOnly(value, `name type server port udp tls servername sni skip-cert-verify client-fingerprint alpn reality-opts ${connectionKeys[protocol]}`, 'Clash 节点');
+  fieldsOnly(value, `name type server port udp tls servername server-name sni skip-cert-verify disable-sni client-fingerprint alpn reality-opts tfo fast-open mptcp ip-version xudp ${connectionKeys[protocol]}`, 'Clash 节点');
   if (protocol === 'shadowsocks') {
     const options = value['plugin-opts'] == null ? {} : object(value['plugin-opts'], '插件选项');
     fieldsOnly(options, 'mode host path tls', '插件选项');
@@ -192,8 +193,8 @@ function clashFields(node: NodeProfile, value: Fields): Fields {
   }
   const network = optionalBool(value.udp) === false ? 'tcp' : undefined;
   const tls: Fields = tlsFields(protocol === 'trojan' || protocol === 'tuic' || protocol === 'hysteria2'
-    || optionalBool(value.tls) === true || !!value['reality-opts'], value.servername ?? value.sni,
-    optionalBool(value['skip-cert-verify']), value.alpn, value['client-fingerprint']);
+    || optionalBool(value.tls) === true || !!value['reality-opts'], value.servername ?? value['server-name'] ?? value.sni,
+    optionalBool(value['skip-cert-verify']), value.alpn, value['client-fingerprint'], optionalBool(value['disable-sni']));
   if (value['reality-opts'] !== undefined) {
     const reality = object(value['reality-opts'], 'Reality 配置');
     fieldsOnly(reality, 'public-key short-id', 'Reality');
@@ -226,12 +227,14 @@ function clashFields(node: NodeProfile, value: Fields): Fields {
 }
 
 function vmessUri(value: Fields): Fields {
-  fieldsOnly(value, 'v ps add port id aid scy net type host path tls sni alpn fp', 'VMess');
+  fieldsOnly(value, 'v ps add port id aid scy net type host path tls sni alpn fp allowInsecure skip-cert-verify', 'VMess');
   if (value.type && value.type !== 'none') throw new Error('此 VMess 传输头暂不支持');
   if (value.tls && value.tls !== 'tls' && value.tls !== 'none') throw new Error('此 VMess TLS 模式暂不支持');
   const kind = optionalString(value.net) ?? 'tcp';
+  const insecure = value.allowInsecure != null ? truthy(String(value.allowInsecure))
+    : value['skip-cert-verify'] != null ? truthy(String(value['skip-cert-verify'])) : undefined;
   return { uuid: value.id, security: value.scy ?? 'auto', alter_id: integer(value.aid, 'Alter ID') ?? 0,
-    tls: value.tls === 'tls' ? tlsFields(true, value.sni, undefined, value.alpn, value.fp) : undefined,
+    tls: value.tls === 'tls' ? tlsFields(true, value.sni, insecure, value.alpn, value.fp) : undefined,
     transport: transport(kind, { host: value.host, path: value.path, service_name: value.path }) };
 }
 

@@ -1,12 +1,17 @@
-import { connectionSupport, ruleTypes, type RouteRule } from "./config";
+import { connectionSupport, ruleTypes, type RouteRule, type RuleDefaultAction } from "./config";
 import { nodeRevision, parseSubscription, type ImportResult, type NodeProfile } from "./subscription";
 
 export type EntryMode = "system" | "tun" | "local";
 export type RoutingMode = "rule" | "global" | "direct";
+export type ThemeMode = "system" | "light" | "dark";
+export type CloseAction = "tray" | "exit";
+export type LatencyRecord = { revision: string; label: string; milliseconds?: number; testedAt?: number };
 export type Usage = { upload?: number; download?: number; total?: number; expire?: number };
 export type SubscriptionDownload = { content: string; usage: Usage | null };
-export type SubscriptionRequest = { route: "automatic" | "direct" | "relaydesk"; userAgent: string };
+export type SubscriptionRequest = { route: "automatic" | "direct" | "relaydesk"; userAgent: string; allowHttp?: boolean };
 export const defaultSubscriptionRequest: SubscriptionRequest = { route: "automatic", userAgent: "" };
+export const defaultSystemProxyBypass = "localhost;127.0.0.1;[::1];<local>";
+export const defaultProbeUrl = "https://www.gstatic.com/generate_204";
 
 export const refreshOptions = [[0, "关闭"], [1, "每小时"], [6, "每 6 小时"], [24, "每天"]] as const;
 export type RefreshHours = (typeof refreshOptions)[number][0];
@@ -37,6 +42,15 @@ export type Workspace = {
   autoReconnect: boolean;
   autoFailover: boolean;
   proxyPort: number | null;
+  theme: ThemeMode;
+  autoConnect: boolean;
+  closeAction: CloseAction;
+  allowLan: boolean;
+  systemProxyBypass: string;
+  probeUrl: string;
+  tunIpv6: boolean;
+  ruleDefaultAction: RuleDefaultAction;
+  nodeLatencies: Record<string, LatencyRecord>;
 };
 
 export const emptyWorkspace: Workspace = {
@@ -49,6 +63,15 @@ export const emptyWorkspace: Workspace = {
   autoReconnect: true,
   autoFailover: false,
   proxyPort: null,
+  theme: "system",
+  autoConnect: false,
+  closeAction: "tray",
+  allowLan: false,
+  systemProxyBypass: defaultSystemProxyBypass,
+  probeUrl: defaultProbeUrl,
+  tunIpv6: true,
+  ruleDefaultAction: "proxy",
+  nodeLatencies: {},
 };
 
 export function subscriptionHost(source: string): string {
@@ -78,7 +101,39 @@ function subscriptionRequest(value: unknown): SubscriptionRequest {
     route: settings?.route === "direct" || settings?.route === "relaydesk" ? settings.route : "automatic",
     userAgent: typeof settings?.userAgent === "string" && /^[\x20-\x7e]{0,256}$/.test(settings.userAgent)
       ? settings.userAgent.trim() : "",
+    ...(settings?.allowHttp === true ? { allowHttp: true } : {}),
   };
+}
+
+function validLatencies(value: unknown, known: Set<string>, recoverId: (id: string) => string): Record<string, LatencyRecord> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result: Record<string, LatencyRecord> = {};
+  for (const [rawId, entry] of Object.entries(value)) {
+    const id = recoverId(rawId);
+    if (!known.has(id) || !entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const item = entry as Partial<LatencyRecord>;
+    if (typeof item.revision !== "string" || typeof item.label !== "string") continue;
+    result[id] = {
+      revision: item.revision,
+      label: item.label.slice(0, 120),
+      ...(typeof item.milliseconds === "number" && Number.isFinite(item.milliseconds) && item.milliseconds >= 0
+        ? { milliseconds: Math.round(item.milliseconds) } : {}),
+      ...(typeof item.testedAt === "number" && Number.isSafeInteger(item.testedAt) ? { testedAt: item.testedAt } : {}),
+    };
+  }
+  return result;
+}
+
+function validProbeUrl(value: unknown): string {
+  if (typeof value !== "string") return defaultProbeUrl;
+  const trimmed = value.trim();
+  if (!trimmed) return defaultProbeUrl;
+  try {
+    const url = new URL(trimmed);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : defaultProbeUrl;
+  } catch {
+    return defaultProbeUrl;
+  }
 }
 
 function mihomoSelections(value: unknown): Record<string, string> {
@@ -164,7 +219,13 @@ export function replaceSubscription(state: Workspace, profile: Subscription): Wo
   const favorites = Array.from(new Set(state.favorites.map(id => remapped.get(id) ?? id)));
   const rules = state.rules.map(rule => rule.target && remapped.has(rule.target)
     ? { ...rule, target: remapped.get(rule.target)! } : rule);
-  return { ...state, subscriptions, selected: preferredNode(subscriptions, selection), favorites, rules };
+  const validIds = new Set(subscriptions.flatMap(item => item.parsed.nodes.map(node => node.id)));
+  const nodeLatencies: Record<string, LatencyRecord> = {};
+  for (const [id, record] of Object.entries(state.nodeLatencies)) {
+    const nextId = remapped.get(id) ?? id;
+    if (validIds.has(nextId)) nodeLatencies[nextId] = record;
+  }
+  return { ...state, subscriptions, selected: preferredNode(subscriptions, selection), favorites, rules, nodeLatencies };
 }
 
 function isRule(value: unknown): value is RouteRule {
@@ -246,6 +307,16 @@ export function deserializeWorkspace(raw: string): Workspace {
     autoFailover: saved.autoFailover === true,
     proxyPort: Number.isInteger(saved.proxyPort) && saved.proxyPort >= 1024 && saved.proxyPort <= 65535
       ? saved.proxyPort : null,
+    theme: saved.theme === "light" || saved.theme === "dark" ? saved.theme : "system",
+    autoConnect: saved.autoConnect === true,
+    closeAction: saved.closeAction === "exit" ? "exit" : "tray",
+    allowLan: saved.allowLan === true,
+    systemProxyBypass: typeof saved.systemProxyBypass === "string" && saved.systemProxyBypass.length <= 2048
+      ? saved.systemProxyBypass : defaultSystemProxyBypass,
+    probeUrl: validProbeUrl(saved.probeUrl),
+    tunIpv6: saved.tunIpv6 !== false,
+    ruleDefaultAction: saved.ruleDefaultAction === "direct" ? "direct" : "proxy",
+    nodeLatencies: validLatencies(saved.nodeLatencies, known, recoverId),
   };
 }
 

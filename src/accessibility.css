@@ -1,4 +1,11 @@
-.title p, .connection p, .modal p, .stats span, .stats small, .empty, .node-name small, .muted, .toolbar, .table-head { color: #586768; }
-.empty, .connection p, .stats span, .stats small { font-size: 13px; }
-.brand small, .side-bottom small, .notice { color: #536365; }
-.connect:not(:disabled) { background: #1c2b2d; color: #fff; cursor: pointer; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

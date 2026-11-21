@@ -25,6 +25,11 @@ export function SubscriptionRequestFields({ value, disabled, onChange }: {
         placeholder="留空使用默认值" maxLength={256} pattern="[ -~]{0,256}"
         onChange={event => onChange({ ...value, userAgent: event.target.value })} />
     </label>
+    <label className="checkbox-inline" style={{ display: "inline-flex", flexDirection: "row", alignItems: "center", gap: 8 }}>
+      <input type="checkbox" checked={!!value.allowHttp} disabled={disabled}
+        onChange={event => onChange({ ...value, allowHttp: event.target.checked })} />
+      <span>允许非本地的明文 HTTP 订阅地址</span>
+    </label>
     {value.route === "relaydesk" && <small>需要先连接 RelayDesk，请求会应用当前分流规则。</small>}
     {value.route === "direct" && <small>TUN 开启时，系统仍会按 TUN 路由发送请求。</small>}
   </div>;
@@ -71,30 +76,32 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
     }
   }
 
-  return <article className="subscription-card">
+  return <article className={`subscription-card ${originalSelected ? "is-original" : ""}`}>
     <div className="panel-head">
       <h3>{profile.name}</h3>
-      {!!profile.parsed.nodes.length && <button className="link" onClick={onBrowse}>查看节点</button>}
+      {!!profile.parsed.nodes.length && <button className="link" onClick={onBrowse}>查看节点 ({profile.parsed.nodes.length})</button>}
     </div>
     <div className="subscription-meta">
       <span>{subscriptionHost(profile.source) || "本地导入"} · {profile.parsed.format}</span>
       <span>{profile.updatedAt ? new Date(profile.updatedAt).toLocaleString() : "原有订阅"}</span>
     </div>
     <div className="subscription-meta">
-      {!!profile.parsed.nodes.length && <span>节点模式 · {supported} 个可连接 / {profile.parsed.nodes.length} 个识别</span>}
+      {!!profile.parsed.nodes.length && <span>可连接 {supported} / {profile.parsed.nodes.length}</span>}
       {expiry && <span className={expired ? "error" : undefined}>{expired ? "已过期" : "到期"} {expiry}</span>}
       {profile.source && profile.refreshHours !== undefined &&
         <span>自动更新 · {refreshOptions.find(([hours]) => hours === profile.refreshHours)?.[1]}</span>}
     </div>
     {profile.parsed.mihomo && <p className="rule-hint">
-      {originalSelected ? "已选用 Mihomo 原配置" : "可使用 Mihomo 原配置"}
+      <span className={`badge ${originalSelected ? "is-accent" : ""}`}>
+        {originalSelected ? "当前选用 Mihomo 原配置" : "支持 Mihomo 原配置"}
+      </span>
       {!!profile.parsed.policySections?.length && ` · ${profile.parsed.policySections.join("、")}`}
     </p>}
     {!profile.parsed.mihomo && !!profile.parsed.policySections?.length &&
       <p className="rule-hint">原配置另含{profile.parsed.policySections.join("、")}。节点模式提取独立节点。</p>}
     {quota !== undefined && <div className="subscription-quota">
       <progress max={100} value={quota} aria-label="已用流量比例" />
-      <small>已用 {formatBytes(used)} / {formatBytes(usage?.total)}</small>
+      <small>已用 {formatBytes(used)} / {formatBytes(usage?.total)} ({quota.toFixed(1)}%)</small>
     </div>}
     {error && <p className="error" role="status">更新失败，已保留原订阅。{error}</p>}
     {draft ? (
@@ -115,8 +122,8 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
         </label>
         {requestError && <p className="error" role="status">{requestError}</p>}
         <div className="subscription-actions">
-          <button className="link" type="submit" disabled={saving}>保存订阅设置</button>
-          <button className="link" type="button" disabled={saving} onClick={() => setDraft(undefined)}>取消</button>
+          <button className="mini-btn is-primary" type="submit" disabled={saving}>保存设置</button>
+          <button className="mini-btn" type="button" disabled={saving} onClick={() => setDraft(undefined)}>取消</button>
         </div>
       </form>
     ) : name !== undefined ? (
@@ -127,19 +134,19 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
         setName(undefined);
       }}>
         <input aria-label="订阅名称" value={name} onChange={event => setName(event.target.value)} autoFocus maxLength={80} required />
-        <button className="link" type="submit">保存名称</button>
-        <button className="link" type="button" onClick={() => setName(undefined)}>取消</button>
+        <button className="mini-btn is-primary" type="submit">保存</button>
+        <button className="mini-btn" type="button" onClick={() => setName(undefined)}>取消</button>
       </form>
     ) : (
       <div className="subscription-actions">
-        {profile.parsed.mihomo && <button className="link" disabled={!canSelectOriginal} onClick={onSelectOriginal}>
-          {originalSelected ? "打开连接" : "选用原配置"}
+        {profile.parsed.mihomo && <button className="mini-btn" disabled={!canSelectOriginal} onClick={onSelectOriginal}>
+          {originalSelected ? "前往概览" : "选用原配置"}
         </button>}
-        {profile.source && <button className="link" disabled={pending || !refreshable} onClick={onRefresh}>{pending ? "更新中…" : "更新"}</button>}
+        {profile.source && <button className="mini-btn" disabled={pending || !refreshable} onClick={onRefresh}>{pending ? "更新中…" : "更新"}</button>}
         {profile.source && <button className="link" disabled={!refreshable} onClick={() => {
           setRequestError("");
           setDraft({ request: profile.request, refreshHours: profile.refreshHours });
-        }}>订阅设置</button>}
+        }}>设置</button>}
         <button className="link" onClick={() => setName(profile.name)}>重命名</button>
         {confirmRemove ? <>
           <button className="link error" onClick={onRemove}>确认移除</button>

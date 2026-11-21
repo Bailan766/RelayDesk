@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildConfig, buildSessionConfig, normalizeRuleValue } from './config';
+import { buildConfig, buildSessionConfig, normalizeRuleValue, rulePresets } from './config';
 import { parseSubscription } from './subscription';
 
 describe('sing-box configuration', () => {
@@ -68,5 +68,14 @@ describe('sing-box configuration', () => {
     expect(normalizeRuleValue('ip_cidr', '2001:db8:0::/48')).toBe('2001:db8::/48');
     expect(() => normalizeRuleValue('ip_cidr', '255.1.1.256/24')).toThrow('IP');
     expect(() => normalizeRuleValue('ip_cidr', '2001:db8::/129')).toThrow('IP');
+  });
+
+  it('ignores harmless Clash node metadata while keeping security checks and supports default direct final', () => {
+    const source = 'proxies:\n- {name: tuned, type: vless, server: example.org, port: 443, uuid: id, tls: true, servername: tls.test, tfo: true, mptcp: true, ip-version: dual, disable-sni: true}';
+    const node = parseSubscription(source).nodes[0];
+    const built = buildConfig(node, 12345, rulePresets[0].rules, 'direct') as any;
+    expect(built.outbounds[0].tls).toMatchObject({ enabled: true, server_name: 'tls.test', disable_sni: true });
+    expect(built.route.final).toBe('direct');
+    expect(built.route.rules.length).toBe(rulePresets[0].rules.length);
   });
 });

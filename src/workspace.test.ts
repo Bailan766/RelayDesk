@@ -112,6 +112,37 @@ describe("encrypted workspace data", () => {
     expect(result.favorites).toEqual([updated.parsed.nodes[1].id]);
   });
 
+  it("persists extended desktop settings, allowHttp request option, and remaps nodeLatencies", () => {
+    const profile = receiveSubscription([primary, backup].join("\n"), source, null, undefined, {
+      route: "automatic",
+      userAgent: "RelayDesk/1.0",
+      allowHttp: true,
+    });
+    const base = replaceSubscription(emptyWorkspace, profile);
+    const firstId = base.subscriptions[0].parsed.nodes[0].id;
+    const configured = {
+      ...base,
+      theme: "dark" as const,
+      autoConnect: true,
+      closeAction: "exit" as const,
+      allowLan: true,
+      systemProxyBypass: "localhost;<local>",
+      probeUrl: "https://cp.cloudflare.com/generate_204",
+      tunIpv6: false,
+      ruleDefaultAction: "direct" as const,
+      nodeLatencies: {
+        [firstId]: { revision: primary, label: "42 ms", milliseconds: 42, testedAt: 1700000000000 },
+      },
+    };
+    const restored = deserializeWorkspace(serializeWorkspace(configured));
+    expect(restored).toEqual(configured);
+    expect(restored.subscriptions[0].request.allowHttp).toBe(true);
+
+    const reordered = receiveSubscription([backup, primary].join("\n"), source, null, profile);
+    const updated = replaceSubscription(restored, reordered);
+    expect(updated.nodeLatencies[reordered.parsed.nodes[1].id]).toEqual(configured.nodeLatencies[firstId]);
+  });
+
   it("preserves the legacy selected index when an earlier subscription line is a transport variant", () => {
     const legacy = deserializeWorkspace(JSON.stringify({ source, selected: 1,
       content: [primary, primary.replace("security=tls", "security=tls&type=ws"), backup].join("\n") }));

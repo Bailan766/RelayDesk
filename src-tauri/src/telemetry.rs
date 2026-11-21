@@ -197,6 +197,101 @@ impl Controller {
         }
     }
 
+    pub async fn probe_delay(&self, name: &str, url: &str, timeout_ms: u64) -> Result<u64, String> {
+        #[derive(Deserialize)]
+        struct Delay {
+            delay: u64,
+        }
+        let mut target =
+            url::Url::parse("http://127.0.0.1/proxies/").map_err(|_| "节点地址无效")?;
+        target
+            .path_segments_mut()
+            .map_err(|_| "节点地址无效")?
+            .pop_if_empty()
+            .push(name)
+            .push("delay");
+        let timeout_str = timeout_ms.clamp(1000, 15000).to_string();
+        let response = self
+            .request(reqwest::Method::GET, target.path())?
+            .query(&[("timeout", timeout_str.as_str()), ("url", url)])
+            .timeout(Duration::from_millis(timeout_ms.clamp(1000, 15000) + 1500))
+            .send()
+            .await
+            .map_err(|_| "测速请求超时")?;
+        if !response.status().is_success() {
+            return Err("节点连接失败或超时".into());
+        }
+        let parsed: Delay = response.json().await.map_err(|_| "测速响应无效")?;
+        Ok(parsed.delay)
+    }
+
+    pub async fn probe_group_delays(
+        &self,
+        group: &str,
+        url: &str,
+        timeout_ms: u64,
+    ) -> Result<std::collections::BTreeMap<String, u64>, String> {
+        let mut target =
+            url::Url::parse("http://127.0.0.1/group/").map_err(|_| "策略组地址无效")?;
+        target
+            .path_segments_mut()
+            .map_err(|_| "策略组地址无效")?
+            .pop_if_empty()
+            .push(group)
+            .push("delay");
+        let timeout_str = timeout_ms.clamp(1000, 15000).to_string();
+        let response = self
+            .request(reqwest::Method::GET, target.path())?
+            .query(&[("timeout", timeout_str.as_str()), ("url", url)])
+            .timeout(Duration::from_millis(timeout_ms.clamp(1000, 15000) + 2000))
+            .send()
+            .await
+            .map_err(|_| "策略组测速超时")?;
+        if !response.status().is_success() {
+            return Err("策略组测速失败".into());
+        }
+        response
+            .json::<std::collections::BTreeMap<String, u64>>()
+            .await
+            .map_err(|_| "策略组测速响应无效".into())
+    }
+
+    pub async fn close_connection(&self, id: &str) -> Result<(), String> {
+        if id.is_empty() || id.len() > 128 {
+            return Err("连接标识无效".into());
+        }
+        let mut target =
+            url::Url::parse("http://127.0.0.1/connections/").map_err(|_| "连接地址无效")?;
+        target
+            .path_segments_mut()
+            .map_err(|_| "连接地址无效")?
+            .pop_if_empty()
+            .push(id);
+        let response = self
+            .request(reqwest::Method::DELETE, target.path())?
+            .send()
+            .await
+            .map_err(|_| "关闭连接请求失败")?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err("内核未能关闭该连接".into())
+        }
+    }
+
+    pub async fn close_all_connections(&self) -> Result<(), String> {
+        let response = self
+            .request(reqwest::Method::DELETE, "/connections")?
+            .send()
+            .await
+            .map_err(|_| "断开全部连接失败")?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err("内核未能断开全部连接".into())
+        }
+    }
+
     pub async fn routing_mode(&self, mode: &str) -> Result<(), String> {
         let response = self
             .request(reqwest::Method::PATCH, "/configs")?
@@ -253,7 +348,7 @@ impl Controller {
     pub async fn stream_logs(
         &self,
         still_current: impl Fn() -> bool,
-        mut receive: impl FnMut(&'static str, &'static str),
+        mut receive: impl FnMut(&'static str, String),
     ) {
         let Ok(client) = LOG_CLIENT.get_or_init(|| {
             reqwest::Client::builder()
@@ -265,7 +360,7 @@ impl Controller {
             return;
         };
         let request = client
-            .get(format!("http://127.0.0.1:{}/logs?level=warn", self.port))
+            .get(format!("http://127.0.0.1:{}/logs?level=info", self.port))
             .bearer_auth(self.secret.to_string());
         let Ok(Ok(mut response)) =
             tokio::time::timeout(Duration::from_secs(45), request.send()).await
@@ -308,7 +403,52 @@ struct CoreLog {
     payload: String,
 }
 
-fn log_lines(buffer: &mut Vec<u8>, receive: &mut impl FnMut(&'static str, &'static str)) {
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub(crate) fn redact_log_payload(raw: &str) -> String {
+    let clean = strip_ansi(raw);
+    let mut tokens = Vec::new();
+    for part in clean.split_whitespace() {
+        if (part.starts_with("http://") || part.starts_with("https://"))
+            && url::Url::parse(part).is_ok()
+        {
+            if let Ok(mut parsed) = url::Url::parse(part) {
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+                if parsed.query().is_some() {
+                    parsed.set_query(Some("redacted"));
+                }
+                tokens.push(parsed.to_string());
+                continue;
+            }
+        }
+        tokens.push(part.to_owned());
+    }
+    let joined = tokens.join(" ");
+    let mut truncated = joined.chars().take(240).collect::<String>();
+    if joined.chars().count() > 240 {
+        truncated.push('…');
+    }
+    truncated
+}
+
+fn log_lines(buffer: &mut Vec<u8>, receive: &mut impl FnMut(&'static str, String)) {
     let Some(end) = buffer.iter().rposition(|byte| *byte == b'\n') else {
         return;
     };
@@ -323,43 +463,22 @@ fn log_lines(buffer: &mut Vec<u8>, receive: &mut impl FnMut(&'static str, &'stat
         let level = match entry.level.as_str() {
             "error" | "fatal" | "panic" => "error",
             "warning" | "warn" => "warn",
+            "info" => "info",
             _ => continue,
         };
-        let payload = entry.payload.to_ascii_lowercase();
-        let message = if payload.contains("certificate")
-            || payload.contains("tls handshake")
-            || payload.contains("x509")
-        {
-            "内核报告 TLS 握手或证书校验异常"
-        } else if payload.contains("authentication") || payload.contains("invalid password") {
-            "内核报告代理认证异常"
-        } else if payload.contains("dns:")
-            || payload.contains("lookup ")
-            || payload.contains("resolve domain")
-        {
-            "内核报告 DNS 请求异常"
-        } else if payload.contains("wintun") || payload.contains("inbound/tun") {
-            "内核报告 TUN 网卡或路由异常"
-        } else if payload.contains("timeout")
-            || payload.contains("deadline exceeded")
-            || payload.contains("context deadline")
-        {
-            "内核报告请求超时"
-        } else if payload.contains("connect") || payload.contains("dial ") {
-            "内核报告连接异常"
-        } else {
-            "内核报告网络处理异常"
-        };
-        receive(level, message);
+        let message = redact_log_payload(&entry.payload);
+        if !message.is_empty() {
+            receive(level, message);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn parses_split_records_and_discards_all_remote_text() {
+    fn parses_split_records_and_redacts_sensitive_urls() {
         let mut buffer =
-            b"{\"type\":\"error\",\"payload\":\"TLS handshake for secret.example".to_vec();
+            b"{\"type\":\"error\",\"payload\":\"TLS handshake for https://user:secret@sub.example/path?token=abc".to_vec();
         let mut events = Vec::new();
         super::log_lines(&mut buffer, &mut |level, message| {
             events.push((level, message))
@@ -371,13 +490,12 @@ mod tests {
         super::log_lines(&mut buffer, &mut |level, message| {
             events.push((level, message))
         });
-        assert_eq!(
-            events,
-            [
-                ("error", "内核报告 TLS 握手或证书校验异常"),
-                ("warn", "内核报告 DNS 请求异常")
-            ]
-        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "error");
+        assert!(events[0].1.contains("sub.example"));
+        assert!(!events[0].1.contains("secret"));
+        assert!(!events[0].1.contains("token=abc"));
+        assert_eq!(events[1], ("warn", "lookup private.example".to_owned()));
         assert!(buffer.is_empty());
     }
 }

@@ -62,6 +62,77 @@ pub enum Core {
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct SessionOptions {
+    #[serde(default)]
+    pub allow_lan: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass: Option<String>,
+    #[serde(default = "default_true")]
+    pub tun_ipv6: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            allow_lan: false,
+            bypass: None,
+            tun_ipv6: true,
+        }
+    }
+}
+
+#[repr(C)]
+struct TokenElevation {
+    token_is_elevated: u32,
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(
+        process_handle: HANDLE,
+        desired_access: u32,
+        token_handle: *mut HANDLE,
+    ) -> i32;
+    fn GetTokenInformation(
+        token_handle: HANDLE,
+        token_information_class: u32,
+        token_information: *mut std::ffi::c_void,
+        token_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
+pub fn is_elevated() -> bool {
+    use winapi::um::{processthreadsapi::GetCurrentProcess, winnt::TOKEN_QUERY};
+    const TOKEN_ELEVATION_CLASS: u32 = 20;
+    let mut token: HANDLE = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return false;
+    }
+    let Ok(token) = Handle::new(token) else {
+        return false;
+    };
+    let mut elevation = TokenElevation {
+        token_is_elevated: 0,
+    };
+    let mut size = 0u32;
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TOKEN_ELEVATION_CLASS,
+            (&mut elevation as *mut TokenElevation).cast(),
+            std::mem::size_of::<TokenElevation>() as u32,
+            &mut size,
+        ) != 0
+            && elevation.token_is_elevated != 0
+    }
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct CoreSettings {
     pub config: Value,
     #[serde(default)]
@@ -728,6 +799,7 @@ pub struct Session {
     pub controller: crate::telemetry::Controller,
     pub id: String,
     pub tun_dns: Option<(u16, u16)>,
+    pub allow_lan: bool,
     policy: Option<Box<Session>>,
     tun_control: Option<TunControl>,
     staged_policy_recovery: Option<u32>,
@@ -742,6 +814,8 @@ struct WorkerInput {
     routing_mode: RoutingMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy_dns: Option<u16>,
+    #[serde(default)]
+    options: SessionOptions,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -850,8 +924,34 @@ impl Session {
         routing_mode: RoutingMode,
         recover: bool,
     ) -> Result<Self, String> {
+        Self::start_with_options(
+            settings,
+            port,
+            mode,
+            routing_mode,
+            recover,
+            SessionOptions::default(),
+        )
+    }
+
+    pub fn start_with_options(
+        settings: CoreSettings,
+        port: u16,
+        mode: &str,
+        routing_mode: RoutingMode,
+        recover: bool,
+        options: SessionOptions,
+    ) -> Result<Self, String> {
         let executable = env::current_exe().map_err(|_| "无法定位当前应用")?;
-        Self::start_using(settings, port, mode, routing_mode, &executable, recover)
+        Self::start_using_with_options(
+            settings,
+            port,
+            mode,
+            routing_mode,
+            &executable,
+            recover,
+            options,
+        )
     }
 
     pub(crate) fn start_using(
@@ -862,6 +962,26 @@ impl Session {
         executable: &std::path::Path,
         recover: bool,
     ) -> Result<Self, String> {
+        Self::start_using_with_options(
+            settings,
+            port,
+            mode,
+            routing_mode,
+            executable,
+            recover,
+            SessionOptions::default(),
+        )
+    }
+
+    pub(crate) fn start_using_with_options(
+        settings: CoreSettings,
+        port: u16,
+        mode: &str,
+        routing_mode: RoutingMode,
+        executable: &std::path::Path,
+        recover: bool,
+        options: SessionOptions,
+    ) -> Result<Self, String> {
         if !matches!(mode, "local" | "system" | "tun") {
             return Err("代理入口模式无效".into());
         }
@@ -869,14 +989,21 @@ impl Session {
             let dns_port = auxiliary_port(&[port])?;
             let system_dns = auxiliary_port(&[port, dns_port])?;
             let local_port = auxiliary_port(&[port, dns_port, system_dns])?;
-            let initial =
-                mihomo::prepare_tun_policy(&settings.config, port, routing_mode, dns_port, None)?;
-            let attached = mihomo::prepare_tun_policy(
+            let initial = mihomo::prepare_tun_policy_with_lan(
+                &settings.config,
+                port,
+                routing_mode,
+                dns_port,
+                None,
+                options.allow_lan,
+            )?;
+            let attached = mihomo::prepare_tun_policy_with_lan(
                 &settings.config,
                 port,
                 routing_mode,
                 dns_port,
                 Some(system_dns),
+                options.allow_lan,
             )?;
             let selections = settings.selections.clone();
             let policy = Self::start_worker(
@@ -887,6 +1014,7 @@ impl Session {
                 executable,
                 Some(dns_port),
                 recover,
+                options.clone(),
             )?;
             let policy_pid = unsafe { GetProcessId(policy.worker.0) };
             if policy_pid == 0 {
@@ -911,10 +1039,12 @@ impl Session {
                 executable,
                 None,
                 recover,
+                options.clone(),
             )?;
             capture.port = port;
             capture.controller = policy.controller.clone();
             capture.tun_dns = Some((dns_port, system_dns));
+            capture.allow_lan = options.allow_lan;
             capture.policy = Some(Box::new(policy));
             // Provider startup uses the ordinary system resolver until the TUN is attached.
             if initial != attached {
@@ -938,7 +1068,7 @@ impl Session {
             return Ok(capture);
         }
         if settings.core == Core::Mihomo {
-            mihomo::prepare(&settings.config, port, routing_mode)?;
+            mihomo::prepare_with_lan(&settings.config, port, routing_mode, options.allow_lan)?;
         }
         Self::start_worker(
             settings,
@@ -948,6 +1078,7 @@ impl Session {
             executable,
             None,
             recover,
+            options,
         )
     }
 
@@ -959,6 +1090,7 @@ impl Session {
         executable: &std::path::Path,
         policy_dns: Option<u16>,
         recover: bool,
+        options: SessionOptions,
     ) -> Result<Self, String> {
         let core = settings.core;
         ensure_port_available(port)?;
@@ -993,11 +1125,13 @@ impl Session {
         let path = directory.join(format!("{token}.json"));
         let _cleanup = crate::TemporaryConfig(path.clone());
         let controller = crate::telemetry::Controller::new(port)?;
+        let allow_lan = options.allow_lan;
         let input = WorkerInput {
             settings,
             controller: controller.clone(),
             routing_mode,
             policy_dns,
+            options,
         };
         fs::write(
             &path,
@@ -1009,7 +1143,11 @@ impl Session {
             "--network-worker {} {token} {port} {mode}",
             std::process::id()
         ));
-        let verb = wide(if mode == "tun" { "runas" } else { "open" });
+        let verb = wide(if mode == "tun" && !is_elevated() {
+            "runas"
+        } else {
+            "open"
+        });
         let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
         info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
         info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
@@ -1032,6 +1170,7 @@ impl Session {
             controller,
             id: token,
             tun_dns: None,
+            allow_lan,
             policy: None,
             tun_control,
             staged_policy_recovery: None,
@@ -1120,12 +1259,13 @@ impl Session {
         }
         let generation = policy.generation();
         let request = PolicyRestart {
-            config: mihomo::prepare_tun_policy(
+            config: mihomo::prepare_tun_policy_with_lan(
                 &settings.config,
                 self.port,
                 mode,
                 dns,
                 Some(system_dns),
+                self.allow_lan,
             )?,
             selections: settings.selections.clone(),
         };
@@ -1443,7 +1583,11 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         controller,
         routing_mode,
         policy_dns,
+        options,
     } = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
+    let allow_lan = options.allow_lan;
+    let tun_ipv6 = options.tun_ipv6;
+    let bypass = options.bypass;
     if (mode == "policy" && (core != Core::Mihomo || policy_dns.is_none()))
         || (mode != "policy" && policy_dns.is_some())
         || (core == Core::Bridge && mode != "tun")
@@ -1466,9 +1610,9 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                 return Err("Mihomo DNS 端口无效".into());
             }
             ensure_port_available(dns)?;
-            mihomo::prepare_tun_policy(&config, port, routing_mode, dns, None)?
+            mihomo::prepare_tun_policy_with_lan(&config, port, routing_mode, dns, None, allow_lan)?
         } else {
-            mihomo::prepare(&config, port, routing_mode)?
+            mihomo::prepare_with_lan(&config, port, routing_mode, allow_lan)?
         };
         controller.configure_mihomo(&mut config);
         let path = directory.join(format!("mihomo-{token}"));
@@ -1493,10 +1637,22 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         ensure_port_available(target.system_dns)?;
         let program = crate::bundled_binary("mihomo.exe")?;
         config = capture_config(&target, port, &interface, &program);
+        if !tun_ipv6 {
+            config["inbounds"][1]["address"] = json!(["172.28.254.1/30"]);
+        }
+        if allow_lan {
+            config["inbounds"][0]["listen"] = json!("0.0.0.0");
+        }
         None
     } else {
         if mode == "tun" {
             config = tun_config(&config, port, &interface).ok_or("TUN 配置无效")?;
+            if !tun_ipv6 {
+                config["inbounds"][1]["address"] = json!(["172.28.254.1/30"]);
+            }
+        }
+        if allow_lan {
+            config["inbounds"][0]["listen"] = json!("0.0.0.0");
         }
         add_routing_modes(&mut config, mode == "tun").ok_or("无法配置路由模式")?;
         controller.configure(&mut config, routing_mode.name());
@@ -1559,14 +1715,22 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let launch = |config: &[u8], deadline, interface: &str, recovery: Option<&TunControl>| {
         let mut child = start_core(&mut config_command(false), &job, config)?;
         let mut route = None;
+        let mut ipv4_ready_at: Option<Instant> = None;
         await_core(&mut child, &lifetime, deadline, recovery, || {
             if mode == "tun" {
                 if UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_err() {
                     return false;
                 }
                 route = tun_default_route(interface, AF_INET as u16);
-                if route.is_none() || tun_default_route(interface, AF_INET6 as u16).is_none() {
+                if route.is_none() {
+                    ipv4_ready_at = None;
                     return false;
+                }
+                if tun_ipv6 && tun_default_route(interface, AF_INET6 as u16).is_none() {
+                    let since = *ipv4_ready_at.get_or_insert_with(Instant::now);
+                    if since.elapsed() < Duration::from_millis(800) {
+                        return false;
+                    }
                 }
             }
             policy_dns.is_none_or(|dns| UdpSocket::bind(("127.0.0.1", dns)).is_err())
@@ -1584,7 +1748,11 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         }
     }
     if mode == "system" {
-        system_proxy::enable(&journal, port).map_err(|_| "无法设置系统代理")?;
+        let bypass_text = bypass
+            .as_deref()
+            .unwrap_or("localhost;127.0.0.1;[::1];<local>");
+        system_proxy::enable_with_bypass(&journal, port, bypass_text)
+            .map_err(|_| "无法设置系统代理")?;
     }
     unsafe {
         SetEvent(ready.0);

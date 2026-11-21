@@ -4,11 +4,40 @@ import { normalizeIpCidr } from './ip';
 
 export type RuleType = 'domain' | 'domain_suffix' | 'ip_cidr' | 'process_name';
 export type RouteRule = { type: RuleType; value: string; action: 'direct' | 'proxy' | 'reject'; target?: string };
+export type RuleDefaultAction = 'proxy' | 'direct';
 export const ruleTypes: { value: RuleType; label: string; example: string }[] = [
   { value: 'domain', label: '域名', example: 'example.com' },
   { value: 'domain_suffix', label: '域名后缀', example: 'example.com' },
   { value: 'ip_cidr', label: 'IP 地址或网段', example: '192.0.2.0/24' },
   { value: 'process_name', label: 'Windows 进程', example: 'chrome.exe' },
+];
+
+export const rulePresets: { id: string; label: string; description: string; rules: RouteRule[] }[] = [
+  {
+    id: 'lan-direct',
+    label: '绕过局域网与保留地址',
+    description: '将内网 IPv4/IPv6 与 CGNAT 地址设为直连，避免局域网访问走代理',
+    rules: [
+      { type: 'ip_cidr', value: '10.0.0.0/8', action: 'direct' },
+      { type: 'ip_cidr', value: '172.16.0.0/12', action: 'direct' },
+      { type: 'ip_cidr', value: '192.168.0.0/16', action: 'direct' },
+      { type: 'ip_cidr', value: '127.0.0.0/8', action: 'direct' },
+      { type: 'ip_cidr', value: '169.254.0.0/16', action: 'direct' },
+      { type: 'ip_cidr', value: '100.64.0.0/10', action: 'direct' },
+      { type: 'ip_cidr', value: 'fc00::/7', action: 'direct' },
+      { type: 'ip_cidr', value: 'fe80::/10', action: 'direct' },
+    ],
+  },
+  {
+    id: 'cn-common-direct',
+    label: '常见国内站点直连',
+    description: '将 .cn 及常用国内服务域名后缀设为直连',
+    rules: [
+      'cn', 'qq.com', 'wechat.com', 'taobao.com', 'tmall.com', 'jd.com',
+      'alipay.com', 'baidu.com', 'bilibili.com', 'zhihu.com', 'douyin.com',
+      '163.com', '126.com', 'xiaomi.com', 'mi.com', 'huawei.com', 'apple.com', 'icloud.com',
+    ].map(value => ({ type: 'domain_suffix', value, action: 'direct' })),
+  },
 ];
 
 export function normalizeRuleDomain(input: string): string {
@@ -30,7 +59,13 @@ export function normalizeRuleValue(type: RuleType, input: string): string {
 
 type LoadedOutbounds = ReadonlyMap<string, { tag: string }>;
 
-function compileConfig(outbounds: Fields[], port: number, rules: RouteRule[], loaded: LoadedOutbounds) {
+function compileConfig(
+  outbounds: Fields[],
+  port: number,
+  rules: RouteRule[],
+  loaded: LoadedOutbounds,
+  ruleDefaultAction: RuleDefaultAction = 'proxy',
+) {
   const compiledRules = rules.map(rule => {
     const value = normalizeRuleValue(rule.type, rule.value);
     const match = rule.type === 'process_name'
@@ -54,15 +89,20 @@ function compileConfig(outbounds: Fields[], port: number, rules: RouteRule[], lo
       rules: wireguard
         ? [{ inbound: endpoints.map(endpoint => endpoint.tag), action: 'reject' }, ...compiledRules]
         : compiledRules,
-      final: 'proxy', auto_detect_interface: true,
+      final: ruleDefaultAction, auto_detect_interface: true,
       ...(wireguard ? { default_domain_resolver: 'bootstrap' } : {}),
     },
   };
 }
 
-export function buildConfig(node: NodeProfile, port: number, rules: RouteRule[] = []) {
-  if (node.protocol === 'wireguard') return buildSessionConfig(node, [], port, rules).config;
-  return compileConfig([compileOutbound(node, 'proxy')], port, rules, new Map([[node.id, { tag: 'proxy' }]]));
+export function buildConfig(
+  node: NodeProfile,
+  port: number,
+  rules: RouteRule[] = [],
+  ruleDefaultAction: RuleDefaultAction = 'proxy',
+) {
+  if (node.protocol === 'wireguard') return buildSessionConfig(node, [], port, rules, ruleDefaultAction).config;
+  return compileConfig([compileOutbound(node, 'proxy')], port, rules, new Map([[node.id, { tag: 'proxy' }]]), ruleDefaultAction);
 }
 
 export type SessionPlan = {
@@ -70,7 +110,13 @@ export type SessionPlan = {
   loaded: Map<string, { tag: string; revision: string; node: NodeProfile }>;
 };
 
-export function buildSessionConfig(selected: NodeProfile, candidates: NodeProfile[], port: number, rules: RouteRule[]): SessionPlan {
+export function buildSessionConfig(
+  selected: NodeProfile,
+  candidates: NodeProfile[],
+  port: number,
+  rules: RouteRule[],
+  ruleDefaultAction: RuleDefaultAction = 'proxy',
+): SessionPlan {
   const outbounds = [compileOutbound(selected, 'node-0')];
   const loaded = new Map([[selected.id, { tag: 'node-0', revision: nodeRevision(selected), node: selected }]]);
   let wireguardCount = selected.protocol === 'wireguard' ? 1 : 0;
@@ -88,7 +134,7 @@ export function buildSessionConfig(selected: NodeProfile, candidates: NodeProfil
     config: compileConfig([{
       type: 'selector', tag: 'proxy', outbounds: outbounds.map(outbound => outbound.tag),
       default: 'node-0', interrupt_exist_connections: false,
-    }, ...outbounds], port, rules, loaded),
+    }, ...outbounds], port, rules, loaded, ruleDefaultAction),
     loaded,
   };
 }

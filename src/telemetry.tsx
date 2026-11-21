@@ -1,5 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Search, Trash2, X } from "lucide-react";
+import type { RouteRule } from "./config";
 
 type Connection = {
   id: string;
@@ -114,7 +116,7 @@ export function formatBytes(bytes?: number | null, rate = false): string {
 
 function TrafficChart({ history, mini = false }: { history: Sample[]; mini?: boolean }) {
   const width = mini ? 176 : 800;
-  const height = mini ? 24 : 132;
+  const height = mini ? 24 : 120;
   const last = history.at(-1)?.time ?? 0;
   const duration = mini ? 60_000 : historyDuration;
   const points = history.filter(sample => sample.time >= last - duration);
@@ -140,7 +142,7 @@ function TrafficChart({ history, mini = false }: { history: Sample[]; mini?: boo
 
 export function TrafficSidebar({ telemetry }: { telemetry: Telemetry }) {
   const { rate, snapshot, history } = telemetry;
-  return <div className="side-bottom traffic-sidebar">
+  return <div className="traffic-sidebar">
     <span className="traffic-up">↑ {formatBytes(rate?.upload, true)}</span>
     <span className="traffic-down">↓ {formatBytes(rate?.download, true)}</span>
     <TrafficChart history={history} mini />
@@ -162,7 +164,7 @@ export function TrafficDashboard({ telemetry }: { telemetry: Telemetry }) {
 
   return <section className="panel traffic-panel">
     <div className="panel-head">
-      <h2>流量统计</h2>
+      <h2>实时流量</h2>
       <span className="traffic-legend"><span className="traffic-up">↑ 上传</span><span className="traffic-down">↓ 下载</span></span>
     </div>
     {rate ? (
@@ -183,32 +185,146 @@ function endpoint(host: string | null, port: string | null): string {
   return port ? `${host.includes(":") ? `[${host}]` : host}:${port}` : host;
 }
 
-export function ConnectionMonitor({ telemetry, running }: { telemetry: Telemetry; running: boolean }) {
+export function ConnectionMonitor({
+  telemetry,
+  running,
+  onQuickRule,
+}: {
+  telemetry: Telemetry;
+  running: boolean;
+  onQuickRule?: (rule: RouteRule) => void;
+}) {
   const { snapshot, message } = telemetry;
+  const [query, setQuery] = useState("");
+  const [sortBy, setSortBy] = useState<"default" | "download" | "upload">("download");
+  const [busyId, setBusyId] = useState<string>();
+  const [actionMsg, setActionMsg] = useState("");
+
+  const filtered = useMemo(() => {
+    const items = snapshot?.connections ?? [];
+    const q = query.trim().toLowerCase();
+    const matched = q
+      ? items.filter(({ metadata, chains, rule }) =>
+          [metadata.host, metadata.destinationIP, metadata.sourceIP, rule, ...(chains ?? [])]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase()
+            .includes(q))
+      : [...items];
+    if (sortBy === "download") matched.sort((a, b) => b.download - a.download);
+    else if (sortBy === "upload") matched.sort((a, b) => b.upload - a.upload);
+    return matched;
+  }, [snapshot?.connections, query, sortBy]);
+
+  async function closeOne(id: string) {
+    if (!isTauri()) return;
+    setBusyId(id);
+    setActionMsg("");
+    try {
+      await invoke("close_proxy_connection", { id });
+    } catch (e) {
+      setActionMsg(typeof e === "string" ? e : "关闭连接失败");
+    } finally {
+      setBusyId(undefined);
+    }
+  }
+
+  async function closeAll() {
+    if (!isTauri()) return;
+    setBusyId("*");
+    setActionMsg("");
+    try {
+      await invoke("close_all_connections");
+      setActionMsg("已请求断开全部活跃连接");
+    } catch (e) {
+      setActionMsg(typeof e === "string" ? e : "断开全部连接失败");
+    } finally {
+      setBusyId(undefined);
+    }
+  }
+
   return <section className="panel connection-monitor">
     <div className="panel-head">
-      <h2>活跃连接</h2>
-      {snapshot && <span className="muted">{snapshot.connections.length} 条</span>}
+      <h2>活跃连接 {snapshot ? `(${filtered.length}/${snapshot.connections.length})` : ""}</h2>
+      <div className="event-controls">
+        <label className="search" style={{ maxWidth: 220 }}>
+          <Search size={14} />
+          <input
+            placeholder="搜索域名、IP、规则或出站"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+          />
+        </label>
+        <select aria-label="连接排序" value={sortBy} onChange={e => setSortBy(e.target.value as typeof sortBy)}>
+          <option value="download">按下载量</option>
+          <option value="upload">按上传量</option>
+          <option value="default">按内核顺序</option>
+        </select>
+        <button
+          className="mini-btn"
+          disabled={!running || !snapshot?.connections.length || busyId === "*"}
+          onClick={() => void closeAll()}
+        >
+          <Trash2 size={13} /> 断开全部
+        </button>
+      </div>
     </div>
-    {snapshot?.connections.length ? (
+    {actionMsg && <p className="rule-hint" role="status" style={{ marginBottom: 10 }}>{actionMsg}</p>}
+    {filtered.length ? (
       <div className="connection-table">
         <table>
-          <thead><tr><th scope="col">目标</th><th scope="col">来源</th><th scope="col">规则 / 出站</th><th scope="col">上传</th><th scope="col">下载</th></tr></thead>
+          <thead>
+            <tr>
+              <th scope="col">目标</th>
+              <th scope="col">来源</th>
+              <th scope="col">规则 / 出站</th>
+              <th scope="col" style={{ width: "6.5em", textAlign: "right" }}>上传</th>
+              <th scope="col" style={{ width: "6.5em", textAlign: "right" }}>下载</th>
+              <th scope="col" style={{ width: "8.5em", textAlign: "right" }}>操作</th>
+            </tr>
+          </thead>
           <tbody>
-            {snapshot.connections.map(({ id, metadata, chains, rule, upload, download }) => {
+            {filtered.map(({ id, metadata, chains, rule, upload, download }) => {
               const destination = endpoint(metadata.host || metadata.destinationIP, metadata.destinationPort);
               const source = endpoint(metadata.sourceIP, metadata.sourcePort);
+              const host = metadata.host?.trim();
               return <tr key={id}>
                 <td><strong title={destination}>{destination}</strong><small>{metadata.network.toUpperCase()} · {metadata.type}</small></td>
                 <td title={source}>{source}</td>
                 <td><strong title={rule}>{rule === "final" ? "默认路由" : rule}</strong><small>{chains?.slice().reverse().join(" → ") || "—"}</small></td>
-                <td>{formatBytes(upload)}</td>
-                <td>{formatBytes(download)}</td>
+                <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatBytes(upload)}</td>
+                <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatBytes(download)}</td>
+                <td style={{ textAlign: "right" }}>
+                  <div style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+                    {onQuickRule && host && (
+                      <button
+                        type="button"
+                        className="link"
+                        title={`将 ${host} 设为直连规则`}
+                        onClick={() => {
+                          onQuickRule({ type: "domain", value: host, action: "direct" });
+                          setActionMsg(`已添加直连规则：${host}（重连节点模式后生效）`);
+                        }}
+                      >
+                        直连
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="icon-button"
+                      aria-label={`断开连接 ${destination}`}
+                      disabled={busyId === id}
+                      onClick={() => void closeOne(id)}
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                </td>
               </tr>;
             })}
           </tbody>
         </table>
       </div>
-    ) : <p className="empty">{snapshot ? "当前没有活跃连接" : running ? message : "启动代理后显示活跃连接"}</p>}
+    ) : <p className="empty">{snapshot ? (query ? "没有匹配的连接" : "当前没有活跃连接") : running ? message : "启动代理后显示活跃连接"}</p>}
   </section>;
 }

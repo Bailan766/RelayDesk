@@ -94,7 +94,9 @@ export function useWorkspace() {
       const existing = state.subscriptions.find(profile => profile.id === id);
       if (!existing?.source) return state;
       const next = { ...existing, ...patch };
-      const requestChanged = existing.request.route !== next.request.route || existing.request.userAgent !== next.request.userAgent;
+      const requestChanged = existing.request.route !== next.request.route
+        || existing.request.userAgent !== next.request.userAgent
+        || !!existing.request.allowHttp !== !!next.request.allowHttp;
       if (!requestChanged && existing.refreshHours === next.refreshHours) return state;
       if (!requestChanged) next.request = existing.request;
       return {
@@ -130,7 +132,7 @@ export function useWorkspace() {
     };
   }, [ready, refresh, refreshEnabled, workspace.refreshHours, refreshSchedule]);
 
-  async function add(raw: string, request?: SubscriptionRequest) {
+  async function add(raw: string, request?: SubscriptionRequest, customName?: string) {
     const text = raw.trim();
     if (!canWrite.current) throw new Error("本地工作区尚未加载");
     const source = /^https?:\/\//i.test(text) ? new URL(text).href : "";
@@ -141,10 +143,20 @@ export function useWorkspace() {
         await refreshes.current.get(previous.id)?.catch(() => {});
       }
       await refresh(previous.id);
+      if (customName?.trim()) {
+        const renamed = customName.trim();
+        await commit(state => ({
+          ...state,
+          subscriptions: state.subscriptions.map(item => item.id === previous.id ? { ...item, name: renamed } : item),
+        }));
+      }
       return !!current.current.subscriptions.find(item => item.id === previous.id)?.parsed.mihomo;
     }
     const downloaded = source ? await download(source, request) : { content: text, usage: null };
     const subscription = receiveSubscription(downloaded.content, source, downloaded.usage, undefined, source ? request : undefined);
+    if (customName?.trim()) {
+      subscription.name = customName.trim();
+    }
     await commit(state => source && state.subscriptions.some(item => item.source === source)
       ? state
       : replaceSubscription(state, subscription));

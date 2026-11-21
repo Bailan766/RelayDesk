@@ -30,16 +30,18 @@ pub struct Plan {
     pub recover: bool,
     pub failover: bool,
     pub fallback_groups: Vec<Vec<String>>,
+    pub options: network::SessionOptions,
 }
 
 impl Plan {
     fn start(&self) -> Result<network::Session, String> {
-        network::Session::start(
+        network::Session::start_with_options(
             self.settings.clone(),
             self.port,
             &self.mode,
             self.routing_mode,
             self.recover,
+            self.options.clone(),
         )
     }
 
@@ -99,12 +101,26 @@ struct Running {
 
 impl Running {
     fn retry_delay(&self) -> Option<Duration> {
-        recovery_delay(self.plan.recover, &self.plan.mode, self.failures)
+        recovery_delay_for(
+            self.plan.recover,
+            &self.plan.mode,
+            self.failures,
+            network::is_elevated(),
+        )
     }
 }
 
 fn recovery_delay(enabled: bool, mode: &str, failures: usize) -> Option<Duration> {
-    if enabled && matches!(mode, "local" | "system") {
+    recovery_delay_for(enabled, mode, failures, false)
+}
+
+fn recovery_delay_for(
+    enabled: bool,
+    mode: &str,
+    failures: usize,
+    elevated: bool,
+) -> Option<Duration> {
+    if enabled && (matches!(mode, "local" | "system") || (mode == "tun" && elevated)) {
         RETRY_DELAYS.get(failures).copied()
     } else {
         None
@@ -124,11 +140,11 @@ pub struct Event {
     sequence: u64,
     timestamp: u64,
     level: &'static str,
-    message: &'static str,
+    message: String,
 }
 
 impl Slot {
-    fn record(&mut self, level: &'static str, message: &'static str) {
+    fn record(&mut self, level: &'static str, message: impl Into<String>) {
         const LIMIT: usize = 160;
         if self.events.len() == LIMIT {
             self.events.pop_front();
@@ -142,7 +158,7 @@ impl Slot {
             sequence: self.next_event,
             timestamp,
             level,
-            message,
+            message: message.into(),
         });
     }
 }
@@ -391,7 +407,7 @@ impl Supervisor {
 
     pub async fn reload_mihomo(&self, config: Value) -> Result<(), String> {
         let _guard = self.control.lock().await;
-        let (id, controller, old, port, dns, mode, selections) = {
+        let (id, controller, old, port, dns, allow_lan, mode, selections) = {
             let slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
             let active = slot
                 .active
@@ -406,15 +422,21 @@ impl Supervisor {
                 active.plan.settings.config.clone(),
                 active.plan.port,
                 active.session.tun_dns,
+                active.session.allow_lan,
                 active.plan.routing_mode,
                 active.plan.settings.selections.clone(),
             )
         };
         let prepare = |profile: &Value| match dns {
-            Some((dns, system_dns)) => {
-                crate::mihomo::prepare_tun_policy(profile, port, mode, dns, Some(system_dns))
-            }
-            None => crate::mihomo::prepare(profile, port, mode),
+            Some((dns, system_dns)) => crate::mihomo::prepare_tun_policy_with_lan(
+                profile,
+                port,
+                mode,
+                dns,
+                Some(system_dns),
+                allow_lan,
+            ),
+            None => crate::mihomo::prepare_with_lan(profile, port, mode, allow_lan),
         };
         let next = prepare(&config)?;
         match controller.reload_mihomo(next).await {
@@ -586,6 +608,40 @@ impl Supervisor {
             .try_lock()
             .map_err(|_| "代理正在处理网络状态，请稍后刷新")?;
         Ok(slot.events.iter().cloned().collect())
+    }
+
+    pub fn clear_events(&self) -> Result<(), String> {
+        let mut slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
+        slot.events.clear();
+        Ok(())
+    }
+
+    pub async fn probe_delay(&self, name: &str, url: &str, timeout_ms: u64) -> Result<u64, String> {
+        let active = self.live()?.ok_or("代理内核未运行")?;
+        active.controller.probe_delay(name, url, timeout_ms).await
+    }
+
+    pub async fn probe_group_delays(
+        &self,
+        group: &str,
+        url: &str,
+        timeout_ms: u64,
+    ) -> Result<std::collections::BTreeMap<String, u64>, String> {
+        let active = self.live()?.ok_or("代理内核未运行")?;
+        active
+            .controller
+            .probe_group_delays(group, url, timeout_ms)
+            .await
+    }
+
+    pub async fn close_connection(&self, id: &str) -> Result<(), String> {
+        let active = self.live()?.ok_or("代理内核未运行")?;
+        active.controller.close_connection(id).await
+    }
+
+    pub async fn close_all_connections(&self) -> Result<(), String> {
+        let active = self.live()?.ok_or("代理内核未运行")?;
+        active.controller.close_all_connections().await
     }
 
     pub async fn watch_core_logs(app: tauri::AppHandle) {
@@ -809,6 +865,7 @@ mod tests {
             recover: true,
             failover: true,
             fallback_groups: vec![vec!["node-0".into(), "node-1".into()]],
+            options: Default::default(),
         };
         supervisor
             .start_using(plan, |plan| {
@@ -958,6 +1015,7 @@ mod tests {
             recover: true,
             failover: false,
             fallback_groups: Vec::new(),
+            options: Default::default(),
         };
         let check_listener = || {
             let endpoint = TcpListener::bind(("127.0.0.1", 0)).unwrap();

@@ -1,50 +1,76 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Activity,
   Boxes,
   Cat,
-  Link2,
-  List,
+  Check,
+  Copy,
   FlaskConical,
-  FileText,
   Globe2,
   LayoutDashboard,
+  Link2,
+  List,
+  Moon,
   Plus,
   Search,
   Settings2,
   Shield,
+  ShieldAlert,
+  ShieldCheck,
   Star,
-  Upload,
+  Sun,
+  SunMoon,
   X,
 } from "lucide-react";
 import { nodeRevision, type NodeProfile } from "./subscription";
-import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleValue, ruleTypes, withSelectedOutbound, type RouteRule, type SessionPlan } from "./config";
+import {
+  buildConfig,
+  buildSessionConfig,
+  connectionSupport,
+  withSelectedOutbound,
+  type RouteRule,
+  type SessionPlan,
+} from "./config";
 import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
-import { SubscriptionCard, SubscriptionRequestFields } from "./SubscriptionCard";
+import { SubscriptionCard } from "./SubscriptionCard";
 import { WebsiteChecks } from "./WebsiteChecks";
 import { DownloadCheck } from "./DownloadCheck";
 import { MihomoGroups } from "./MihomoGroups";
 import { EventLog } from "./EventLog";
+import { RulesEditor } from "./components/RulesEditor";
+import { UnlockTests } from "./components/UnlockTests";
+import { SettingsPage } from "./components/SettingsPage";
+import { ImportModal } from "./components/ImportModal";
 import { useWorkspace } from "./useWorkspace";
 import {
-  defaultSubscriptionRequest, parseRefreshHours, preferredNode, refreshOptions,
-  type EntryMode, type RoutingMode, type SubscriptionRequest, type Workspace,
+  parseRefreshHours,
+  preferredNode,
+  refreshOptions,
+  type EntryMode,
+  type LatencyRecord,
+  type RoutingMode,
+  type SubscriptionRequest,
+  type ThemeMode,
+  type Workspace,
 } from "./workspace";
 import "./style.css";
 import "./accessibility.css";
 import "./rules.css";
 import "./dashboard.css";
 
-type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "诊断" | "设置";
-type Probe = { revision: string; label: string; milliseconds?: number };
+type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "设置";
+type ExitIpDetail = { ip: string; country?: string | null; region?: string | null; city?: string | null; isp?: string | null };
+
 const nodeHealthLabels = {
   checking: "正在确认节点连通性",
   healthy: "节点探测成功",
   unreachable: "节点连续两次探测失败",
   unavailable: "暂时无法检测节点",
 };
+
 type ProxyStatus = {
   phase: "running" | "recovering" | "stopped" | "busy";
   message: string | null;
@@ -55,54 +81,97 @@ type ProxyStatus = {
 
 function fallbackGroups(plan: SessionPlan | undefined, subscriptions: Workspace["subscriptions"], favorites: Set<string>) {
   if (!plan) return [];
-  return subscriptions.map(profile => [...profile.parsed.nodes]
-    .sort((first, second) => Number(favorites.has(second.id)) - Number(favorites.has(first.id)))
-    .flatMap(node => plan.loaded.get(node.id)?.tag ?? []))
+  return subscriptions
+    .map(profile =>
+      [...profile.parsed.nodes]
+        .sort((first, second) => Number(favorites.has(second.id)) - Number(favorites.has(first.id)))
+        .flatMap(node => plan.loaded.get(node.id)?.tag ?? []),
+    )
     .filter(group => group.length > 1);
 }
+
 const entryModes: { value: EntryMode; label: string }[] = [
   { value: "system", label: "系统代理" },
   { value: "tun", label: "TUN" },
   { value: "local", label: "本地端口" },
 ];
+
 const routingModes: { value: RoutingMode; label: string }[] = [
   { value: "rule", label: "规则" },
   { value: "global", label: "全局" },
   { value: "direct", label: "直连" },
 ];
-const nav: { name: Page; icon: typeof Activity }[] = [
-  { name: "概览", icon: LayoutDashboard },
-  { name: "节点", icon: Globe2 },
-  { name: "订阅", icon: Boxes },
-  { name: "连接", icon: Link2 },
-  { name: "规则", icon: Shield },
-  { name: "日志", icon: List },
-  { name: "测试", icon: FlaskConical },
-  { name: "诊断", icon: Activity },
-  { name: "设置", icon: Settings2 },
-];
+
+const pageMeta: Record<Page, { subtitle: string; icon: typeof Activity }> = {
+  概览: { subtitle: "连接控制、核心状态与快捷节点切换", icon: LayoutDashboard },
+  节点: { subtitle: "浏览、筛选、测速并选择代理节点", icon: Globe2 },
+  订阅: { subtitle: "导入与管理多订阅来源及 Mihomo 原配置", icon: Boxes },
+  连接: { subtitle: "查看、搜索、管理活跃连接及快速分流", icon: Link2 },
+  规则: { subtitle: "管理节点模式的分流规则与默认动作", icon: Shield },
+  日志: { subtitle: "实时查看脱敏后的内核运行日志与网络事件", icon: List },
+  测试: { subtitle: "下载测速、网站连通性、服务解锁与本地诊断", icon: FlaskConical },
+  设置: { subtitle: "外观主题、Windows 权限、入口与恢复选项", icon: Settings2 },
+};
+
+const navOrder: Page[] = ["概览", "节点", "订阅", "连接", "规则", "日志", "测试", "设置"];
+
+function latencyClass(ms?: number) {
+  if (ms == null) return "";
+  if (ms < 180) return "is-good";
+  if (ms < 400) return "is-warn";
+  return "is-bad";
+}
+
 function App() {
   const [page, setPage] = useState<Page>("概览");
   const work = useWorkspace();
-  const { subscriptions, rules, selected, favorites, autoReconnect, autoFailover, proxyPort, entryMode: mode } = work.workspace;
+  const {
+    subscriptions,
+    rules,
+    selected,
+    favorites,
+    autoReconnect,
+    autoFailover,
+    proxyPort,
+    entryMode: mode,
+    theme,
+    autoConnect,
+    closeAction,
+    allowLan,
+    systemProxyBypass,
+    probeUrl,
+    tunIpv6,
+    ruleDefaultAction,
+    nodeLatencies,
+  } = work.workspace;
+
   const starred = useMemo(() => new Set(favorites), [favorites]);
   const nodes = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes), [subscriptions]);
   const unavailableNodes = useMemo(() => new Map(nodes.map(node => [node.id, connectionSupport(node)])), [nodes]);
-  const ruleTargets = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes
-    .filter(node => !unavailableNodes.get(node.id))
-    .map(node => ({ id: node.id, label: `${profile.name} · #${node.sourceIndex} ${node.name}` }))), [subscriptions, unavailableNodes]);
+  const protocols = useMemo(() => Array.from(new Set(nodes.map(n => n.protocol))).sort(), [nodes]);
+  const ruleTargets = useMemo(
+    () =>
+      subscriptions.flatMap(profile =>
+        profile.parsed.nodes
+          .filter(node => !unavailableNodes.get(node.id))
+          .map(node => ({ id: node.id, label: `${profile.name} · #${node.sourceIndex} ${node.name}` })),
+      ),
+    [subscriptions, unavailableNodes],
+  );
+
   const [subscriptionFilter, setSubscriptionFilter] = useState("");
+  const [protocolFilter, setProtocolFilter] = useState("");
   const [nodeSort, setNodeSort] = useState("source");
   const [onlyFavorites, setOnlyFavorites] = useState(false);
+  const [onlySupported, setOnlySupported] = useState(false);
   const [dialog, setDialog] = useState(false);
-  const [text, setText] = useState("");
-  const [importRequest, setImportRequest] = useState<SubscriptionRequest>();
+  const [detailNode, setDetailNode] = useState<NodeProfile>();
   const [error, setError] = useState("");
   const [importing, setImporting] = useState(false);
   const [busy, setBusy] = useState(false);
   const [settingsError, setSettingsError] = useState("");
   const [search, setSearch] = useState("");
-  const file = useRef<HTMLInputElement>(null);
+
   const [running, setRunning] = useState(false);
   const [recovering, setRecovering] = useState(false);
   const [recoveryMessage, setRecoveryMessage] = useState("");
@@ -110,38 +179,81 @@ function App() {
   const [runningNode, setRunningNode] = useState<NodeProfile>();
   const [runningOriginal, setRunningOriginal] = useState<{ id: string; name: string; content: string }>();
   const [liveRouting, setLiveRouting] = useState<RoutingMode>();
-  const routingMode = running ? liveRouting ?? work.workspace.routingMode : work.workspace.routingMode;
+  const [appliedRulesKey, setAppliedRulesKey] = useState("");
+
+  const originalProfile = subscriptions.find(profile => profile.id === work.workspace.mihomoProfile && profile.parsed.mihomo);
+  const liveOriginalProfile = runningOriginal && subscriptions.find(profile => profile.id === runningOriginal.id);
+  const originalName = running ? (liveOriginalProfile?.name ?? runningOriginal?.name) : originalProfile?.name;
+  const originalUpdated = runningOriginal && liveOriginalProfile && runningOriginal.content !== liveOriginalProfile.content;
+
+  const preferredOriginalMode: RoutingMode | undefined = originalProfile?.parsed.mihomo
+    ? (originalProfile.mihomoMode ??
+      (originalProfile.parsed.mihomo.mode === "global" || originalProfile.parsed.mihomo.mode === "direct"
+        ? originalProfile.parsed.mihomo.mode
+        : "rule"))
+    : undefined;
+
+  const routingMode = running
+    ? (liveRouting ?? work.workspace.routingMode)
+    : (preferredOriginalMode ?? work.workspace.routingMode);
+
   const session = useRef<SessionPlan>();
   const telemetry = useTelemetry(running && !recovering);
   const [port, setPort] = useState<number>();
+  const [portCopied, setPortCopied] = useState(false);
   const [connectionError, setConnectionError] = useState("");
   const [checkResult, setCheckResult] = useState("");
   const [checking, setChecking] = useState(false);
   const diagnosticsEpoch = useRef(0);
   const [diagnosticsVersion, setDiagnosticsVersion] = useState(0);
   const confirmedSession = useRef<string | null>(null);
-  const [latencies, setLatencies] = useState<Record<string, Probe>>({});
+
+  const [latencies, setLatencies] = useState<Record<string, LatencyRecord>>({});
   const [testing, setTesting] = useState(false);
-  const [exitIp, setExitIp] = useState("");
+  const [exitIp, setExitIp] = useState<ExitIpDetail>();
+  const [exitIpError, setExitIpError] = useState("");
   const [localTcp, setLocalTcp] = useState("尚未测试");
   const [localTcpBusy, setLocalTcpBusy] = useState(false);
+  const [elevated, setElevated] = useState(false);
   const cancelTesting = useRef(false);
   const probeBatch = useRef<string>();
+  const autoConnectRan = useRef(false);
+
+  const currentRulesKey = useMemo(() => JSON.stringify({ rules, ruleDefaultAction }), [rules, ruleDefaultAction]);
+  const rulesDirtyWhileRunning = running && !runningOriginal && appliedRulesKey !== "" && appliedRulesKey !== currentRulesKey;
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
+
+  useEffect(() => {
+    setLatencies(prev => ({ ...nodeLatencies, ...prev }));
+  }, [nodeLatencies]);
+
+  useEffect(() => {
+    if (!isTauri() || !work.ready) return;
+    void invoke<boolean>("is_elevated").then(setElevated).catch(() => {});
+    void invoke("set_close_action", { exitOnClose: closeAction === "exit" }).catch(() => {});
+  }, [closeAction, work.ready]);
+
   async function saveSettings(edit: (previous: Workspace) => Workspace) {
     setSettingsError("");
     try {
       await work.commit(edit);
-    } catch (error) {
-      setSettingsError(typeof error === "string" ? error : error instanceof Error ? error.message : "设置保存失败");
+    } catch (e) {
+      setSettingsError(typeof e === "string" ? e : e instanceof Error ? e.message : "设置保存失败");
     }
   }
+
   function resetDiagnostics() {
     diagnosticsEpoch.current += 1;
     setDiagnosticsVersion(diagnosticsEpoch.current);
     setChecking(false);
-    setExitIp("");
+    setExitIp(undefined);
+    setExitIpError("");
     setCheckResult("");
   }
+
   function clearSession() {
     session.current = undefined;
     confirmedSession.current = null;
@@ -153,8 +265,10 @@ function App() {
     setRunningOriginal(undefined);
     setLiveRouting(undefined);
     setPort(undefined);
+    setAppliedRulesKey("");
     resetDiagnostics();
   }
+
   useEffect(() => {
     if (!isTauri() || busy || !running) return;
     let cancelled = false;
@@ -185,7 +299,7 @@ function App() {
           resetDiagnostics();
         }
       } catch {
-        // A transient IPC failure leaves the last confirmed status visible.
+        // Keep last confirmed UI state during transient IPC stalls.
       } finally {
         if (!cancelled) timer = window.setTimeout(poll, 1000);
       }
@@ -193,68 +307,94 @@ function App() {
     timer = window.setTimeout(poll, 600);
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
+      window.clearTimeout(timer);
     };
   }, [busy, running]);
+
   useEffect(() => {
     if (!isTauri() || !work.ready) return;
     void invoke("configure_recovery", { enabled: autoReconnect }).catch(() =>
-      setSettingsError("无法更新当前会话的自动恢复设置"));
+      setSettingsError("无法更新当前会话的自动恢复设置"),
+    );
   }, [autoReconnect, work.ready]);
+
   useEffect(() => {
     if (!isTauri() || !running || runningOriginal || !work.ready) return;
     void invoke("configure_failover", { enabled: autoFailover, fallbackGroups: fallbackGroups(session.current, subscriptions, starred) })
       .catch(() => setSettingsError("无法更新当前会话的自动换线设置"));
   }, [autoFailover, running, runningOriginal, starred, subscriptions, work.ready]);
+
+  const preferred = nodes.find(n => n.id === selected);
+  const current = running ? runningNode ?? preferred : preferred;
+
+  useEffect(() => {
+    if (!isTauri() || !work.ready) return;
+    const summary = originalName
+      ? `${originalName} (Mihomo)`
+      : current?.name ?? "未选择节点";
+    void invoke("update_tray_state", { running, summary, routingMode }).catch(() => {});
+  }, [current?.name, originalName, routingMode, running, work.ready]);
+
   const activeFilter = subscriptions.find(profile => profile.id === subscriptionFilter);
   function probe(node: NodeProfile) {
     const value = latencies[node.id];
     return value?.revision === nodeRevision(node) ? value : undefined;
   }
-  const filtered = (activeFilter?.parsed.nodes ?? nodes).filter((n) =>
-    (!onlyFavorites || starred.has(n.id)) && `#${n.sourceIndex ?? ""} ${n.name} ${n.protocol} ${n.server}`
-      .toLowerCase()
-      .includes(search.trim().toLowerCase()),
-  );
-  if (nodeSort === "latency") {
-    filtered.sort((a, b) => (probe(a)?.milliseconds ?? Number.MAX_SAFE_INTEGER)
-      - (probe(b)?.milliseconds ?? Number.MAX_SAFE_INTEGER));
-  }
-  async function add() {
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const list = (activeFilter?.parsed.nodes ?? nodes).filter(n => {
+      if (onlyFavorites && !starred.has(n.id)) return false;
+      if (onlySupported && unavailableNodes.get(n.id)) return false;
+      if (protocolFilter && n.protocol !== protocolFilter) return false;
+      if (!q) return true;
+      return `#${n.sourceIndex ?? ""} ${n.name} ${n.protocol} ${n.server}`.toLowerCase().includes(q);
+    });
+    if (nodeSort === "latency") {
+      return [...list].sort(
+        (a, b) => (probe(a)?.milliseconds ?? Number.MAX_SAFE_INTEGER) - (probe(b)?.milliseconds ?? Number.MAX_SAFE_INTEGER),
+      );
+    }
+    if (nodeSort === "name") {
+      return [...list].sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+    }
+    return list;
+  }, [activeFilter, latencies, nodeSort, nodes, onlyFavorites, onlySupported, protocolFilter, search, starred, unavailableNodes]);
+
+  const quickNodes = useMemo(() => {
+    const usable = nodes.filter(n => !unavailableNodes.get(n.id));
+    const sorted = [...usable].sort((a, b) => Number(starred.has(b.id)) - Number(starred.has(a.id)));
+    return sorted.slice(0, 6);
+  }, [nodes, starred, unavailableNodes]);
+
+  async function importSubscription(text: string, request?: SubscriptionRequest, customName?: string) {
     setImporting(true);
     setError("");
     try {
-      const request = importRequest && { ...importRequest, userAgent: importRequest.userAgent.trim() };
-      const original = await work.add(text, request);
+      const original = await work.add(text, request, customName);
       setSubscriptionFilter("");
-      setText("");
-      setImportRequest(undefined);
       setDialog(false);
       setPage(original ? "订阅" : "节点");
     } catch (e) {
-      setError(
-        typeof e === "string" ? e : e instanceof Error ? e.message : "导入失败",
-      );
+      setError(typeof e === "string" ? e : e instanceof Error ? e.message : "导入失败");
     } finally {
       setImporting(false);
     }
   }
-  const preferred = nodes.find(n => n.id === selected);
-  const current = running ? runningNode ?? preferred : preferred;
-  const originalProfile = subscriptions.find(profile => profile.id === work.workspace.mihomoProfile && profile.parsed.mihomo);
-  const liveOriginalProfile = runningOriginal && subscriptions.find(profile => profile.id === runningOriginal.id);
-  const originalName = running ? (liveOriginalProfile?.name ?? runningOriginal?.name) : originalProfile?.name;
-  const originalUpdated = runningOriginal && liveOriginalProfile && runningOriginal.content !== liveOriginalProfile.content;
-  const isSelected = (node: NodeProfile) => !originalName && (running
-    ? runningNode?.id === node.id && nodeRevision(runningNode) === nodeRevision(node)
-    : node.id === selected);
+
+  const isSelected = (node: NodeProfile) =>
+    !originalName &&
+    (running
+      ? runningNode?.id === node.id && nodeRevision(runningNode) === nodeRevision(node)
+      : node.id === selected);
+
   async function checkProxy() {
     if (!port || busy || recovering) return;
     const epoch = diagnosticsEpoch.current;
     setChecking(true);
     setCheckResult("");
     try {
-      const ms = await invoke<number>("check_connection", { port });
+      const ms = await invoke<number>("check_connection", { port, probeUrl });
       if (epoch === diagnosticsEpoch.current) setCheckResult(`当前路由可达 · ${ms} ms`);
     } catch (e) {
       if (epoch === diagnosticsEpoch.current) setCheckResult(typeof e === "string" ? e : "网络验证失败");
@@ -262,21 +402,31 @@ function App() {
       if (epoch === diagnosticsEpoch.current) setChecking(false);
     }
   }
+
   async function prepareSession(node: NodeProfile, localPort: number): Promise<SessionPlan> {
-    const candidate = buildSessionConfig(node, nodes, localPort, rules);
+    const candidate = buildSessionConfig(node, nodes, localPort, rules, ruleDefaultAction);
     if (await invoke<boolean>("validate_proxy_config", { config: candidate.config })) return candidate;
-    const single = buildConfig(node, localPort, rules);
-    if (!await invoke<boolean>("validate_proxy_config", { config: single })) {
+    const single = buildConfig(node, localPort, rules, ruleDefaultAction);
+    if (!(await invoke<boolean>("validate_proxy_config", { config: single }))) {
       throw new Error("所选节点或规则未通过内核配置检查");
     }
     return { config: single, loaded: new Map() };
   }
+
   function startProxy(plan: SessionPlan) {
     return invoke("start_proxy", {
-      config: plan.config, mode, routingMode, autoReconnect, autoFailover,
+      config: plan.config,
+      mode,
+      routingMode,
+      autoReconnect,
+      autoFailover,
       fallbackGroups: fallbackGroups(plan, subscriptions, starred),
+      allowLan,
+      bypass: systemProxyBypass,
+      tunIpv6,
     });
   }
+
   async function changeRouting(value: RoutingMode) {
     if (busy || recovering || value === routingMode) return;
     setBusy(true);
@@ -287,100 +437,251 @@ function App() {
         setLiveRouting(value);
         resetDiagnostics();
       }
-      await saveSettings(state => runningOriginal ? { ...state, subscriptions: state.subscriptions.map(profile =>
-        profile.id === runningOriginal.id ? { ...profile, mihomoMode: value } : profile,
-      ) } : { ...state, routingMode: value });
-    } catch (error) {
-      setConnectionError(typeof error === "string" ? error : "路由模式切换失败");
+      const targetOriginalId = running ? runningOriginal?.id : originalProfile?.id;
+      await saveSettings(state =>
+        targetOriginalId
+          ? {
+              ...state,
+              subscriptions: state.subscriptions.map(profile =>
+                profile.id === targetOriginalId ? { ...profile, mihomoMode: value } : profile,
+              ),
+            }
+          : { ...state, routingMode: value },
+      );
+    } catch (e) {
+      setConnectionError(typeof e === "string" ? e : "路由模式切换失败");
     } finally {
       setBusy(false);
     }
   }
+
+  async function connectNode(node: NodeProfile) {
+    if (busy || recovering || !isTauri() || unavailableNodes.get(node.id)) return;
+    const remember = () =>
+      saveSettings(state => ({
+        ...state,
+        selected: preferredNode(state.subscriptions, node.id),
+        mihomoProfile: undefined,
+      }));
+    const previous = session.current;
+    if (running && !runningOriginal && port && previous) {
+      if (isSelected(node)) return;
+      setBusy(true);
+      setConnectionError("");
+      resetDiagnostics();
+      try {
+        const loaded = previous.loaded.get(node.id);
+        if (loaded && loaded.revision === nodeRevision(node)) {
+          await invoke("switch_proxy_node", { tag: loaded.tag });
+          session.current = withSelectedOutbound(previous, loaded.tag);
+          setRunningNode(node);
+          await remember();
+          return;
+        }
+        const next = await prepareSession(node, port);
+        confirmedSession.current = null;
+        await invoke("stop_proxy");
+        try {
+          await startProxy(next);
+          session.current = next;
+          setRunningNode(node);
+          setRunning(true);
+          setAppliedRulesKey(currentRulesKey);
+          await remember();
+        } catch (failure) {
+          try {
+            await startProxy(previous);
+            setRunning(true);
+          } catch {
+            clearSession();
+          }
+          throw failure;
+        }
+      } catch (e) {
+        setConnectionError(`切换失败：${typeof e === "string" ? e : e instanceof Error ? e.message : "未知错误"}`);
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
+    // Start (or switch from Mihomo original config) directly into this node.
+    setBusy(true);
+    setConnectionError("");
+    resetDiagnostics();
+    setRecoveryMessage("");
+    try {
+      if (running) {
+        await invoke("stop_proxy");
+        clearSession();
+      }
+      await remember();
+      const localPort = proxyPort ?? (await invoke<number>("allocate_port"));
+      const next = await prepareSession(node, localPort);
+      await invoke("start_proxy", {
+        config: next.config,
+        mode,
+        routingMode: work.workspace.routingMode,
+        autoReconnect,
+        autoFailover,
+        fallbackGroups: fallbackGroups(next, subscriptions, starred),
+        allowLan,
+        bypass: systemProxyBypass,
+        tunIpv6,
+      });
+      session.current = next;
+      setRunningNode(node);
+      setLiveRouting(work.workspace.routingMode);
+      setAppliedRulesKey(currentRulesKey);
+      setPort(localPort);
+      setRunning(true);
+    } catch (e) {
+      setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "连接失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function selectNode(node: NodeProfile) {
-    if (busy || recovering || runningOriginal || testing || isSelected(node)) return;
-    const remember = () => saveSettings(state => ({ ...state,
+    if (busy || recovering || unavailableNodes.get(node.id)) return;
+    if (running) {
+      await connectNode(node);
+      return;
+    }
+    await saveSettings(state => ({
+      ...state,
       selected: preferredNode(state.subscriptions, node.id),
       mihomoProfile: undefined,
     }));
-    const previous = session.current;
-    if (!running || !port || !previous) {
-      await remember();
+  }
+
+  async function switchToOriginal(profileId: string) {
+    const profile = subscriptions.find(item => item.id === profileId && item.parsed.mihomo);
+    if (!profile?.parsed.mihomo || busy || recovering) return;
+    if (!running) {
+      await saveSettings(state => ({ ...state, mihomoProfile: profile.id }));
+      setPage("概览");
       return;
     }
     setBusy(true);
     setConnectionError("");
     resetDiagnostics();
     try {
-      const loaded = previous.loaded.get(node.id);
-      if (loaded && loaded.revision === nodeRevision(node)) {
-        await invoke("switch_proxy_node", { tag: loaded.tag });
-        session.current = withSelectedOutbound(previous, loaded.tag);
-        setRunningNode(node);
-        await remember();
-        return;
-      }
-      const next = await prepareSession(node, port);
-      confirmedSession.current = null;
       await invoke("stop_proxy");
-      try {
-        await startProxy(next);
-        session.current = next;
-        setRunningNode(node);
-        setRunning(true);
-        await remember();
-      } catch (failure) {
-        try {
-          await startProxy(previous);
-          setRunning(true);
-        } catch {
-          clearSession();
-        }
-        throw failure;
-      }
+      clearSession();
+      await saveSettings(state => ({ ...state, mihomoProfile: profile.id }));
+      const localPort = proxyPort ?? (await invoke<number>("allocate_port"));
+      const originalMode =
+        profile.mihomoMode ??
+        (profile.parsed.mihomo.mode === "global" || profile.parsed.mihomo.mode === "direct"
+          ? profile.parsed.mihomo.mode
+          : "rule");
+      await invoke("start_mihomo", {
+        config: profile.parsed.mihomo,
+        port: localPort,
+        mode,
+        routingMode: originalMode,
+        autoReconnect,
+        selections: profile.mihomoSelections,
+        allowLan,
+        bypass: systemProxyBypass,
+        tunIpv6,
+      });
+      setRunningOriginal({ id: profile.id, name: profile.name, content: profile.content });
+      setLiveRouting(originalMode);
+      setPort(localPort);
+      setRunning(true);
+      setPage("概览");
     } catch (e) {
-      setConnectionError(
-        `切换失败：${typeof e === "string" ? e : e instanceof Error ? e.message : "未知错误"}`,
-      );
+      setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "切换原配置失败");
     } finally {
       setBusy(false);
     }
   }
+
+  async function switchBackToNodeMode() {
+    if (busy || recovering) return;
+    const fallbackNode = preferred ?? nodes.find(n => !unavailableNodes.get(n.id));
+    if (!running) {
+      await saveSettings(state => ({ ...state, mihomoProfile: undefined }));
+      return;
+    }
+    if (!fallbackNode) {
+      await invoke("stop_proxy");
+      clearSession();
+      await saveSettings(state => ({ ...state, mihomoProfile: undefined }));
+      return;
+    }
+    await connectNode(fallbackNode);
+  }
+
   async function testNodes(items: NodeProfile[]) {
-    if (!isTauri() || testing || busy) return;
+    if (!isTauri() || testing) return;
     cancelTesting.current = false;
     setTesting(true);
+    const updates: Record<string, LatencyRecord> = {};
     try {
       const batch = await invoke<string>("begin_probe_batch");
       probeBatch.current = batch;
       const queue = items.filter(node => !unavailableNodes.get(node.id));
       let next = 0;
+      const loadedMap = running && !runningOriginal ? session.current?.loaded : undefined;
+
       async function testQueue() {
         while (next < queue.length && !cancelTesting.current) {
           const node = queue[next++];
-          setLatencies((previous) => ({ ...previous, [node.id]: { revision: nodeRevision(node), label: "测试中" } }));
+          const rev = nodeRevision(node);
+          setLatencies(previous => ({ ...previous, [node.id]: { revision: rev, label: "测试中…" } }));
           let label: string;
           let milliseconds: number | undefined;
           try {
-            const localPort = await invoke<number>("allocate_port");
-            if (cancelTesting.current) {
-              label = "已取消";
-            } else {
-              const ms = await invoke<number>("probe_node", { config: buildConfig(node, localPort), port: localPort, batch });
+            const loaded = loadedMap?.get(node.id);
+            if (loaded && loaded.revision === rev && !recovering) {
+              const ms = await invoke<number>("probe_loaded_node", {
+                tag: loaded.tag,
+                probeUrl,
+                timeoutMs: 5000,
+              });
               milliseconds = ms;
               label = `${ms} ms`;
+            } else {
+              const localPort = await invoke<number>("allocate_port");
+              if (cancelTesting.current) {
+                label = "已取消";
+              } else {
+                const ms = await invoke<number>("probe_node", {
+                  config: buildConfig(node, localPort),
+                  port: localPort,
+                  batch,
+                  probeUrl,
+                });
+                milliseconds = ms;
+                label = `${ms} ms`;
+              }
             }
           } catch (e) {
-            label = typeof e === "string" ? e : "代理请求失败";
+            label = typeof e === "string" ? e : "测速失败";
           }
-          setLatencies((previous) => ({
-            ...previous,
-            [node.id]: { revision: nodeRevision(node), label: `${label} · ${new Date().toLocaleTimeString()}`, milliseconds },
-          }));
+          const record: LatencyRecord = {
+            revision: rev,
+            label,
+            milliseconds,
+            testedAt: Date.now(),
+          };
+          updates[node.id] = record;
+          setLatencies(previous => ({ ...previous, [node.id]: record }));
         }
       }
-      await Promise.all(Array.from({ length: Math.min(4, queue.length) }, testQueue));
-    } catch (error) {
-      setConnectionError(typeof error === "string" ? error : "启动测速失败");
+
+      await Promise.all(Array.from({ length: Math.min(6, queue.length) }, testQueue));
+      if (Object.keys(updates).length) {
+        await saveSettings(state => ({
+          ...state,
+          nodeLatencies: { ...state.nodeLatencies, ...updates },
+        }));
+      }
+    } catch (e) {
+      setConnectionError(typeof e === "string" ? e : "启动测速失败");
     } finally {
       const batch = probeBatch.current;
       probeBatch.current = undefined;
@@ -388,25 +689,28 @@ function App() {
       setTesting(false);
     }
   }
+
   function stopNodeTests() {
     cancelTesting.current = true;
     const batch = probeBatch.current;
     if (batch) void invoke("cancel_probe_batch", { batch }).catch(() => setConnectionError("无法取消正在运行的测速"));
   }
+
   async function showExitIp() {
     if (!port || busy || recovering) return;
     const epoch = diagnosticsEpoch.current;
     setChecking(true);
-    setExitIp("查询中");
+    setExitIpError("");
     try {
-      const result = await invoke<string>("check_exit_ip", { port });
-      if (epoch === diagnosticsEpoch.current) setExitIp(result);
+      const detail = await invoke<ExitIpDetail>("check_exit_ip_detail", { port });
+      if (epoch === diagnosticsEpoch.current) setExitIp(detail);
     } catch (e) {
-      if (epoch === diagnosticsEpoch.current) setExitIp(typeof e === "string" ? e : "查询失败");
+      if (epoch === diagnosticsEpoch.current) setExitIpError(typeof e === "string" ? e : "查询失败");
     } finally {
       if (epoch === diagnosticsEpoch.current) setChecking(false);
     }
   }
+
   async function testLocalTcp() {
     setLocalTcpBusy(true);
     try {
@@ -418,6 +722,7 @@ function App() {
       setLocalTcpBusy(false);
     }
   }
+
   async function applyOriginalUpdate() {
     const next = liveOriginalProfile;
     if (busy || recovering || !runningOriginal || !next?.parsed.mihomo) return;
@@ -433,6 +738,7 @@ function App() {
       setBusy(false);
     }
   }
+
   async function toggleProxy() {
     setBusy(true);
     setConnectionError("");
@@ -446,12 +752,22 @@ function App() {
       } else {
         const original = originalProfile?.parsed.mihomo;
         if (!original && !preferred) throw new Error("请先导入并选择节点或原配置");
-        const localPort = proxyPort ?? await invoke<number>("allocate_port");
+        const localPort = proxyPort ?? (await invoke<number>("allocate_port"));
         if (original && originalProfile) {
-          const originalMode = originalProfile.mihomoMode ??
+          const originalMode =
+            originalProfile.mihomoMode ??
             (original.mode === "global" || original.mode === "direct" ? original.mode : "rule");
-          await invoke("start_mihomo", { config: original, port: localPort, mode, routingMode: originalMode, autoReconnect,
-            selections: originalProfile.mihomoSelections });
+          await invoke("start_mihomo", {
+            config: original,
+            port: localPort,
+            mode,
+            routingMode: originalMode,
+            autoReconnect,
+            selections: originalProfile.mihomoSelections,
+            allowLan,
+            bypass: systemProxyBypass,
+            tunIpv6,
+          });
           setRunningOriginal({ id: originalProfile.id, name: originalProfile.name, content: originalProfile.content });
           setLiveRouting(originalMode);
         } else if (preferred) {
@@ -460,520 +776,758 @@ function App() {
           session.current = next;
           setRunningNode(preferred);
           setLiveRouting(routingMode);
+          setAppliedRulesKey(currentRulesKey);
         }
         setPort(localPort);
         setRunning(true);
       }
     } catch (e) {
-      setConnectionError(
-        typeof e === "string" ? e : e instanceof Error ? e.message : "连接失败",
-      );
+      setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "连接失败");
     } finally {
       setBusy(false);
     }
   }
+
+  async function reconnectNodeSession() {
+    if (!running || runningOriginal || !current) return;
+    setBusy(true);
+    setConnectionError("");
+    resetDiagnostics();
+    try {
+      await invoke("stop_proxy");
+      const localPort = proxyPort ?? (await invoke<number>("allocate_port"));
+      const next = await prepareSession(current, localPort);
+      await startProxy(next);
+      session.current = next;
+      setRunningNode(current);
+      setLiveRouting(routingMode);
+      setAppliedRulesKey(currentRulesKey);
+      setPort(localPort);
+      setRunning(true);
+    } catch (e) {
+      clearSession();
+      setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "重连失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const toggleProxyRef = useRef(toggleProxy);
+  toggleProxyRef.current = toggleProxy;
+  const changeRoutingRef = useRef(changeRouting);
+  changeRoutingRef.current = changeRouting;
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    void listen<string>("tray-action", event => {
+      const action = event.payload;
+      if (action === "toggle") void toggleProxyRef.current();
+      else if (action === "mode:rule") void changeRoutingRef.current("rule");
+      else if (action === "mode:global") void changeRoutingRef.current("global");
+      else if (action === "mode:direct") void changeRoutingRef.current("direct");
+    }).then(fn => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri() || !work.ready || autoConnectRan.current) return;
+    autoConnectRan.current = true;
+    if (autoConnect && !running && !busy && (originalProfile?.parsed.mihomo || preferred)) {
+      void toggleProxy();
+    }
+  }, [autoConnect, busy, originalProfile?.parsed.mihomo, preferred, running, work.ready]);
+
+  function copyLocalEndpoint() {
+    if (!port) return;
+    void navigator.clipboard.writeText(`127.0.0.1:${port}`).then(() => {
+      setPortCopied(true);
+      window.setTimeout(() => setPortCopied(false), 1600);
+    }).catch(() => {});
+  }
+
+  function cycleTheme() {
+    const order: ThemeMode[] = ["system", "light", "dark"];
+    const next = order[(order.indexOf(theme) + 1) % order.length];
+    void saveSettings(state => ({ ...state, theme: next }));
+  }
+
+  const themeLabel = theme === "light" ? "浅色" : theme === "dark" ? "深色" : "跟随系统";
+  const ThemeIcon = theme === "light" ? Sun : theme === "dark" ? Moon : SunMoon;
+  const statusStateClass = recovering ? "is-recovering" : running ? "is-running" : "";
+  const activeCount = telemetry.snapshot?.connections.length;
+
   return (
     <div className="app">
       <aside>
         <div className="brand">
-          <Cat size={30} />
+          <div className="brand-mark"><Cat size={20} /></div>
           <div>
             <strong>RelayDesk</strong>
-            <small>代理工作台</small>
+            <small>Windows 代理工作台</small>
           </div>
         </div>
-        <div className="side-label">工作区</div>
         <nav>
-          {nav.map(({ name, icon: Icon }) => (
-            <button
-              className={page === name ? "active" : ""}
-              onClick={() => setPage(name)}
-              key={name}
-            >
-              <Icon size={17} />
-              {name}
-            </button>
-          ))}
+          {navOrder.map(name => {
+            const Icon = pageMeta[name].icon;
+            const badge = name === "节点" && nodes.length ? nodes.length
+              : name === "订阅" && subscriptions.length ? subscriptions.length
+              : name === "连接" && running && activeCount != null ? activeCount
+              : undefined;
+            return (
+              <button
+                className={page === name ? "active" : ""}
+                onClick={() => setPage(name)}
+                key={name}
+              >
+                <Icon size={17} />
+                <span>{name}</span>
+                {badge !== undefined && <span className="nav-badge">{badge}</span>}
+              </button>
+            );
+          })}
         </nav>
         <TrafficSidebar telemetry={telemetry} />
       </aside>
+
       <div className="workspace">
         <header>
-          <span>个人工作区</span>
-          <span className="header-right">
-            <span className="dot" />
-            {recovering ? "正在恢复代理" : running ? "内核运行中" : "内核未运行"}
-          </span>
+          <div className="header-left">
+            <span className={`status-pill ${statusStateClass}`}>
+              <span className="dot" />
+              {recovering ? "正在恢复" : running ? (runningOriginal ? "Mihomo 运行中" : "sing-box 运行中") : "未连接"}
+            </span>
+            {running && port && (
+              <button type="button" className="chip-button" onClick={copyLocalEndpoint} title="点击复制本地代理地址">
+                {portCopied ? <Check size={12} /> : <Copy size={12} />}
+                <span>{allowLan ? "0.0.0.0" : "127.0.0.1"}:{port}</span>
+              </button>
+            )}
+          </div>
+          <div className="header-right">
+            {isTauri() && (
+              <span className={`badge ${elevated ? "is-good" : ""}`} title={elevated ? "管理员权限" : "普通用户权限"}>
+                {elevated ? <><ShieldCheck size={12} /> 管理员</> : <><ShieldAlert size={12} /> 普通权限</>}
+              </span>
+            )}
+            <button type="button" className="chip-button" onClick={cycleTheme} title="切换主题模式">
+              <ThemeIcon size={13} />
+              <span>{themeLabel}</span>
+            </button>
+          </div>
         </header>
+
         <main>
           <div className="title">
             <div>
               <h1>{page}</h1>
-              <p>
-                {page === "概览"
-                  ? "管理连接、节点和本地代理状态"
-                  : page === "节点"
-                    ? "查看和选择导入的代理节点"
-                    : page === "订阅"
-                      ? "导入和管理节点来源"
-                      : page === "规则"
-                        ? "管理流量的路由方式"
-                        : page === "诊断"
-                          ? "检查代理服务与连接状态"
-                          : "管理应用与运行环境"}
-              </p>
+              <p>{pageMeta[page].subtitle}</p>
             </div>
-            {["概览", "节点", "订阅"].includes(page) && (
-              <button className="primary" disabled={!work.ready} onClick={() => setDialog(true)}>
-                <Plus size={16} />
-                导入订阅
-              </button>
-            )}
+            <div className="title-actions">
+              {["概览", "节点", "订阅"].includes(page) && (
+                <button className="btn primary" disabled={!work.ready} onClick={() => setDialog(true)}>
+                  <Plus size={16} />
+                  导入订阅
+                </button>
+              )}
+            </div>
           </div>
-          {(work.storageError || settingsError) && <p className="notice" role="alert">{work.storageError || settingsError}</p>}
+
+          {(work.storageError || settingsError) && (
+            <p className="notice is-error" role="alert">{work.storageError || settingsError}</p>
+          )}
+
           {page === "概览" && (
             <>
               <section className="connection">
-                <div>
-                  <div className="section-label">连接状态</div>
-                  <div className="status">
+                <div className="connection-info">
+                  <div className="section-label">连接控制中心</div>
+                  <div className={`status ${statusStateClass}`}>
                     <span className="status-dot" />
-                    {recovering ? "正在恢复代理" : running ? "内核运行中" : "未连接"}
+                    {recovering ? "正在恢复代理连接" : running ? "代理内核运行中" : "代理未连接"}
                   </div>
                   <p>
-                    {connectionError || recoveryMessage ||
-                      (running
-                        ? `本地 HTTP / SOCKS5：127.0.0.1:${port}`
-                        : "代理未运行")}
+                    {connectionError || recoveryMessage || (running
+                      ? `本地混合入口：${allowLan ? "0.0.0.0" : "127.0.0.1"}:${port}`
+                      : originalName
+                        ? `已准备使用 Mihomo 原配置：${originalName}`
+                        : current
+                          ? `已就绪节点：${current.name}`
+                          : "请先导入订阅并选择节点或 Mihomo 原配置")}
                     {running && !recovering && (
                       <>
-                        <br />
-                        {checkResult || "尚未验证远程连接"}{" "}
-                        <button
-                          className="link"
-                          disabled={checking || busy}
-                          onClick={checkProxy}
-                        >
-                          {checking ? "检查中…" : "检查连接"}
+                        {" · "}
+                        <span>{checkResult || "尚未检测远程路由"}</span>
+                        <button className="link inline-action" disabled={checking || busy} onClick={() => void checkProxy()}>
+                          {checking ? "检测中…" : "测试连通性"}
                         </button>
                       </>
                     )}
                   </p>
                 </div>
+
                 <div className="connection-actions">
-                  <label>
-                    <span>接管方式</span>
-                    <select value={mode} disabled={busy || running || !work.ready} onChange={(e) => {
-                      const entryMode = e.target.value as EntryMode;
-                      void saveSettings(state => ({ ...state, entryMode }));
-                    }}>
-                      {entryModes.map(({ value, label }) => <option key={value} value={value}>{label}</option>)}
-                    </select>
-                  </label>
-                  {mode === "tun" && !running && <small>启动时需要管理员授权</small>}
-                  <button
-                    className="connect"
-                    disabled={busy || (!running && ((!current && !originalName) || testing)) || !isTauri()}
-                    onClick={toggleProxy}
-                  >
-                    {busy ? "处理中…" : running ? "停止" : "连接"}
-                  </button>
+                  <div className="connection-controls">
+                    <label style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                      <span className="muted">接管</span>
+                      <select
+                        aria-label="接管方式"
+                        value={mode}
+                        disabled={busy || running || !work.ready}
+                        onChange={e => {
+                          const entryMode = e.target.value as EntryMode;
+                          void saveSettings(state => ({ ...state, entryMode }));
+                        }}
+                      >
+                        {entryModes.map(({ value, label }) => <option key={value} value={value}>{label}</option>)}
+                      </select>
+                    </label>
+
+                    <div className="mode-switch" role="group" aria-label="路由模式">
+                      {routingModes.map(option => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          aria-pressed={routingMode === option.value}
+                          disabled={busy || recovering || !work.ready}
+                          onClick={() => void changeRouting(option.value)}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <button
+                      className={`connect ${running ? "is-stop" : ""}`}
+                      disabled={busy || (!running && !current && !originalName) || !isTauri()}
+                      onClick={() => void toggleProxy()}
+                    >
+                      {busy ? "处理中…" : running ? "断开连接" : "立即连接"}
+                    </button>
+                  </div>
+                  {mode === "tun" && !running && !elevated && (
+                    <small className="muted">当前为普通权限，启动 TUN 时将请求管理员授权（可在设置中切换管理员重启）</small>
+                  )}
                 </div>
               </section>
-              {originalName && mode === "tun" && <div className="notice">
-                TUN 转发后，Mihomo 的进程、来源地址、来源端口和入口名称规则按内部连接匹配。
-              </div>}
-              {originalUpdated && <div className="notice" role="status">
-                订阅配置已更新。
-                <button className="link inline-action" disabled={busy || recovering}
-                  onClick={() => void applyOriginalUpdate()}>应用到当前连接</button>
-              </div>}
-              {runningOriginal && <MihomoGroups mode={routingMode} disabled={busy || recovering}
-                onMode={value => void changeRouting(value)} onChange={async (group, choice) => {
-                  resetDiagnostics();
-                  await saveSettings(state => ({ ...state, subscriptions: state.subscriptions.map(profile =>
-                    profile.id === runningOriginal.id
-                      ? { ...profile, mihomoSelections: { ...profile.mihomoSelections, [group]: choice } }
-                      : profile,
-                  ) }));
-                }} />}
-              <TrafficDashboard telemetry={telemetry} />
-              <div className="stats">
-                <div>
-                  <span>{originalName ? "当前配置" : "当前节点"}</span>
-                  <strong>{originalName || current?.name || "尚未选择"}</strong>
-                  <small>
-                    {originalName ? "Mihomo 原配置" : current
-                      ? current.protocol.toUpperCase()
-                      : "导入订阅后选择节点"}
-                  </small>
-                  {originalName && !running && <button className="link" disabled={busy}
-                    onClick={() => void saveSettings(state => ({ ...state, mihomoProfile: undefined }))}>切回节点模式</button>}
-                  {nodeHealth && <small role="status">{nodeHealthLabels[nodeHealth]}</small>}
+
+              {connectionError && <div className="notice is-error" role="alert">{connectionError}</div>}
+              {rulesDirtyWhileRunning && (
+                <div className="notice is-warn" role="status">
+                  <span>分流规则已修改，重新连接后生效。</span>
+                  <button type="button" className="mini-btn is-primary" disabled={busy} onClick={() => void reconnectNodeSession()}>
+                    立即重连应用
+                  </button>
                 </div>
-                <div>
-                  <span>代理模式</span>
-                  <strong>{entryModes.find((entry) => entry.value === mode)?.label}</strong>
-                  <small>{routingModes.find(entry => entry.value === routingMode)?.label}路由</small>
+              )}
+              {originalName && mode === "tun" && (
+                <div className="notice">
+                  TUN 转发模式下，Mihomo 的进程/来源地址/入口规则按内部转发连接匹配。
+                </div>
+              )}
+              {originalUpdated && (
+                <div className="notice is-warn" role="status">
+                  <span>当前使用的 Mihomo 订阅内容已更新。</span>
+                  <button className="mini-btn is-primary" disabled={busy || recovering} onClick={() => void applyOriginalUpdate()}>
+                    立即热重载应用
+                  </button>
+                </div>
+              )}
+
+              <div className="stats">
+                <div className="stat-card">
+                  <div className="stat-card-head">
+                    <span>{originalName ? "当前配置（Mihomo）" : "当前节点（sing-box）"}</span>
+                    {originalName ? (
+                      <button type="button" className="link" disabled={busy || recovering} onClick={() => void switchBackToNodeMode()}>
+                        切回节点模式
+                      </button>
+                    ) : subscriptions.some(s => s.parsed.mihomo) ? (
+                      <button
+                        type="button"
+                        className="link"
+                        disabled={busy || recovering}
+                        onClick={() => {
+                          const firstMihomo = subscriptions.find(s => s.parsed.mihomo);
+                          if (firstMihomo) void switchToOriginal(firstMihomo.id);
+                        }}
+                      >
+                        切到原配置
+                      </button>
+                    ) : null}
+                  </div>
+                  <strong title={originalName || current?.name}>{originalName || current?.name || "尚未选择"}</strong>
+                  <small>
+                    {originalName ? "保留原策略组与完整规则" : current ? `${current.protocol.toUpperCase()} · ${current.server}:${current.port}` : "导入订阅后选择节点"}
+                  </small>
+                </div>
+
+                <div className="stat-card">
+                  <div className="stat-card-head">
+                    <span>入口与路由</span>
+                    <span className="badge">{allowLan ? "允许局域网" : "仅本机"}</span>
+                  </div>
+                  <strong>{entryModes.find(e => e.value === mode)?.label} · {routingModes.find(r => r.value === routingMode)?.label}模式</strong>
+                  <small>{mode === "tun" ? (tunIpv6 ? "虚拟网卡双栈接管" : "虚拟网卡仅 IPv4") : mode === "system" ? "自动管理 WinINet 系统代理" : "手动配置应用代理端口"}</small>
+                </div>
+
+                <div className="stat-card">
+                  <div className="stat-card-head">
+                    <span>节点健康与延迟</span>
+                    {!originalName && current && isTauri() && (
+                      <button type="button" className="link" disabled={testing} onClick={() => void testNodes([current])}>
+                        测速
+                      </button>
+                    )}
+                  </div>
+                  <strong>
+                    {nodeHealth ? nodeHealthLabels[nodeHealth] : (!originalName && current && probe(current)?.label) || (running ? "运行正常" : "待连接")}
+                  </strong>
+                  <small>{checkResult || "点击上方“测试连通性”核实真实出站"}</small>
+                </div>
+
+                <div className="stat-card">
+                  <div className="stat-card-head">
+                    <span>当前出口 IP</span>
+                    <button type="button" className="link" disabled={!running || recovering || checking || busy} onClick={() => void showExitIp()}>
+                      {checking ? "查询中…" : "查询"}
+                    </button>
+                  </div>
+                  <strong title={exitIp?.ip}>{exitIp?.ip || exitIpError || (running ? "点击右上角查询" : "未连接")}</strong>
+                  <small>
+                    {exitIp
+                      ? [exitIp.country, exitIp.city, exitIp.isp].filter(Boolean).join(" · ") || "出口 IP 已确认"
+                      : "通过当前路由访问 IP 归属服务"}
+                  </small>
                 </div>
               </div>
+
+              {runningOriginal && (
+                <MihomoGroups
+                  mode={routingMode}
+                  disabled={busy || recovering}
+                  probeUrl={probeUrl}
+                  onMode={value => void changeRouting(value)}
+                  onChange={async (group, choice) => {
+                    resetDiagnostics();
+                    await saveSettings(state => ({
+                      ...state,
+                      subscriptions: state.subscriptions.map(profile =>
+                        profile.id === runningOriginal.id
+                          ? { ...profile, mihomoSelections: { ...profile.mihomoSelections, [group]: choice } }
+                          : profile,
+                      ),
+                    }));
+                  }}
+                />
+              )}
+
+              <TrafficDashboard telemetry={telemetry} />
+
               <div className="columns">
                 <WebsiteChecks key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
                 <section className="panel">
-                  <div className="panel-head"><h2>当前路由出口 IP</h2><button className="link" disabled={!running || recovering || checking || busy} onClick={showExitIp}>刷新</button></div>
-                  <div className="empty">{exitIp || (running ? "尚未检查出口 IP" : "连接后可检查出口 IP")}</div>
-                </section>
-                <section className="panel">
                   <div className="panel-head">
-                    <h2>节点</h2>
-                    <button className="link" onClick={() => setPage("节点")}>
-                      查看全部
-                    </button>
+                    <h2>快捷切换节点</h2>
+                    <button className="link" onClick={() => setPage("节点")}>全部节点 ({nodes.length})</button>
                   </div>
-                  {nodes.length ? (
-                    nodes.slice(0, 4).map((n) => (
-                      <div className="node-row" key={n.id}>
-                        <div className="node-name">
-                          <span className="node-icon">
-                            <Globe2 size={17} />
-                          </span>
-                          <div>
-                            <strong>{n.name}</strong>
-                            <small>
-                              {n.protocol.toUpperCase()} · {n.transport}
-                            </small>
-                          </div>
-                        </div>
-                        <span className="muted">未测速</span>
-                      </div>
-                    ))
-                  ) : (
+                  {originalName ? (
                     <div className="empty">
-                      还没有节点。导入订阅后，节点会显示在这里。
-                      <button className="link" onClick={() => setDialog(true)}>
-                        导入订阅 →
+                      当前正在使用 Mihomo 原配置「{originalName}」，请在上方「Mihomo 策略组」切换节点，或
+                      <button type="button" className="link inline-action" onClick={() => void switchBackToNodeMode()}>
+                        切回节点模式
                       </button>
                     </div>
+                  ) : quickNodes.length ? (
+                    quickNodes.map(n => {
+                      const p = probe(n);
+                      const active = isSelected(n);
+                      return (
+                        <div
+                          className={`node-row is-clickable ${active ? "is-selected" : ""}`}
+                          key={n.id}
+                          onClick={() => void selectNode(n)}
+                        >
+                          <div className="node-name">
+                            <span className="node-icon">
+                              {starred.has(n.id) ? <Star size={15} fill="#fbbf24" color="#d97706" /> : <Globe2 size={15} />}
+                            </span>
+                            <div>
+                              <strong>{n.name}</strong>
+                              <small>{n.protocol.toUpperCase()} · {n.transport}</small>
+                            </div>
+                          </div>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                            <span className={`badge ${p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
+                              {p?.label ?? "未测速"}
+                            </span>
+                            {active ? (
+                              <span className="badge is-accent">{running ? "使用中" : "已选中"}</span>
+                            ) : (
+                              <button
+                                type="button"
+                                className="mini-btn"
+                                disabled={busy || recovering}
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  void connectNode(n);
+                                }}
+                              >
+                                {running ? "切换" : "连接"}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="empty">
+                      还没有可用节点。
+                      <button className="link inline-action" onClick={() => setDialog(true)}>导入订阅 →</button>
+                    </div>
                   )}
-                </section>
-                <section className="panel">
-                  <div className="panel-head">
-                    <h2>运行环境</h2>
-                  </div>
-                  <div className="env-row">
-                    <span>代理内核</span>
-                    <span className="muted">
-                      {running ? (runningOriginal ? "Mihomo" : "sing-box") : "未运行"}
-                    </span>
-                  </div>
-                  <div className="env-row">
-                    <span>接管方式</span>
-                    <span className="muted">{running ? entryModes.find((entry) => entry.value === mode)?.label : "未启用"}</span>
-                  </div>
-                  <div className="notice">
-                    点击窗口关闭后继续在托盘运行。停止代理或从托盘彻底退出会结束网络接管。
-                  </div>
                 </section>
               </div>
             </>
           )}
+
           {page === "节点" && (
             <section>
+              {runningOriginal && (
+                <div className="notice is-warn" style={{ marginBottom: 14 }}>
+                  <span>当前正在运行 Mihomo 原配置「{runningOriginal.name}」。点击任意节点「连接」将自动停止原配置并切换到 sing-box 节点模式。</span>
+                  <button type="button" className="mini-btn" onClick={() => setPage("概览")}>返回策略组</button>
+                </div>
+              )}
+
               <div className="toolbar">
                 <label className="search">
-                  <Search size={16} />
-                  <input
-                    placeholder="搜索节点、序号、协议或地址"
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                  />
+                  <Search size={15} />
+                  <input placeholder="搜索节点名、序号、协议或域名" value={search} onChange={e => setSearch(e.target.value)} />
                 </label>
-                {subscriptions.length > 1 && <select className="toolbar-select" aria-label="筛选订阅来源" value={activeFilter?.id ?? ""} onChange={event => setSubscriptionFilter(event.target.value)}>
-                  <option value="">全部订阅</option>
-                  {subscriptions.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
-                </select>}
-                <select className="toolbar-select" aria-label="排序节点" value={nodeSort} onChange={event => setNodeSort(event.target.value)}>
+                {subscriptions.length > 1 && (
+                  <select className="toolbar-select" aria-label="筛选订阅来源" value={activeFilter?.id ?? ""} onChange={e => setSubscriptionFilter(e.target.value)}>
+                    <option value="">全部订阅</option>
+                    {subscriptions.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                  </select>
+                )}
+                {protocols.length > 1 && (
+                  <select className="toolbar-select" aria-label="筛选协议" value={protocolFilter} onChange={e => setProtocolFilter(e.target.value)}>
+                    <option value="">全部协议</option>
+                    {protocols.map(p => <option key={p} value={p}>{p.toUpperCase()}</option>)}
+                  </select>
+                )}
+                <select className="toolbar-select" aria-label="排序节点" value={nodeSort} onChange={e => setNodeSort(e.target.value)}>
                   <option value="source">订阅顺序</option>
                   <option value="latency">延迟优先</option>
+                  <option value="name">名称排序</option>
                 </select>
-                <button className="link" aria-pressed={onlyFavorites} onClick={() => setOnlyFavorites(value => !value)}>
-                  {onlyFavorites ? "显示全部" : "仅看收藏"}
+                <button type="button" className="toolbar-pill" aria-pressed={onlyFavorites} onClick={() => setOnlyFavorites(v => !v)}>
+                  仅看收藏
+                </button>
+                <button type="button" className="toolbar-pill" aria-pressed={onlySupported} onClick={() => setOnlySupported(v => !v)}>
+                  隐藏不可用
                 </button>
                 <button
-                  className="link"
-                  disabled={busy || (!testing && !filtered.length) || !isTauri()}
-                  onClick={() =>
-                    testing
-                      ? stopNodeTests()
-                      : testNodes(filtered)
-                  }
+                  type="button"
+                  className="mini-btn is-primary"
+                  disabled={(!testing && !filtered.length) || !isTauri()}
+                  onClick={() => (testing ? stopNodeTests() : void testNodes(filtered))}
                 >
-                  {testing ? "取消测速" : "一键测试延迟"}
+                  {testing ? "停止测速" : "一键测速"}
                 </button>
-                <span>{filtered.length} 个节点</span>
-                <div className="mode-switch" role="group" aria-label="路由模式">
-                  {routingModes.map(option => <button className="link" key={option.value}
-                    aria-pressed={routingMode === option.value} disabled={busy || recovering || !work.ready}
-                    onClick={() => void changeRouting(option.value)}>{option.label}</button>)}
+                <span className="muted">{filtered.length} 个节点</span>
+                <div className="mode-switch" role="group" aria-label="路由模式" style={{ marginLeft: "auto" }}>
+                  {routingModes.map(option => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      aria-pressed={routingMode === option.value}
+                      disabled={busy || recovering || !work.ready}
+                      onClick={() => void changeRouting(option.value)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
                 </div>
               </div>
-              <div className="group-heading"><strong>已导入节点</strong><span>手动选择 · {filtered.length} 个节点</span></div>
-              {connectionError && (
-                <div className="notice" role="alert">
-                  {connectionError}
-                </div>
-              )}
-              {running && (
-                <div className="notice">
-                  当前路由出口 IP：{exitIp || "尚未检查"}{" "}
-                  <button
-                    className="link"
-                    disabled={checking || busy || recovering}
-                    onClick={showExitIp}
-                  >
-                    检查出口 IP
-                  </button>
-                </div>
-              )}
+
+              {connectionError && <div className="notice is-error" role="alert" style={{ marginBottom: 12 }}>{connectionError}</div>}
               {activeFilter?.parsed.warnings.length ? (
-                <div className="notice">
-                  {activeFilter.parsed.warnings.length} 项未导入，请检查订阅格式。
+                <div className="notice is-warn" style={{ marginBottom: 12 }}>
+                  <span>该订阅有 {activeFilter.parsed.warnings.length} 项因格式或协议不支持未导入。</span>
                 </div>
               ) : null}
+
               <div className="node-grid">
-                {filtered.map((n) => (
-                  <div className={`node-card ${isSelected(n) ? "selected" : ""}`} key={n.id}>
-                    <div className="node-name">
-                      <span className="node-icon">
-                        <Globe2 size={17} />
-                      </span>
-                      <div>
+                {filtered.map(n => {
+                  const reason = unavailableNodes.get(n.id);
+                  const p = probe(n);
+                  const active = isSelected(n);
+                  return (
+                    <div
+                      className={`node-card ${active ? "selected" : ""} ${reason ? "is-unavailable" : ""}`}
+                      key={n.id}
+                      onDoubleClick={() => { if (!reason) void connectNode(n); }}
+                    >
+                      <div className="node-name">
+                        <span className="node-icon"><Globe2 size={17} /></span>
+                        <div>
                           <strong title={n.name}><span className="source-index">#{n.sourceIndex}</span> {n.name}</strong>
-                        <small>
-                          {n.server}:{n.port}
-                        </small>
+                          <small>{n.server}:{n.port}</small>
+                        </div>
+                      </div>
+                      <div className="node-meta-row">
+                        <span className="badge">{n.protocol.toUpperCase()} · {n.transport}{n.security !== "none" ? ` · ${n.security}` : ""}</span>
+                        <span className={`badge ${reason ? "is-bad" : p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
+                          {reason ? "不可用" : p?.label || "未测速"}
+                        </span>
+                      </div>
+                      {reason && <div className="error" style={{ lineHeight: 1.4 }}>{reason}</div>}
+                      <div className="node-actions">
+                        <div className="node-actions-left">
+                          {!reason && (
+                            <>
+                              <button
+                                type="button"
+                                className={`mini-btn ${active ? "is-primary" : ""}`}
+                                disabled={busy || recovering || (running && !runningOriginal && active)}
+                                onClick={() => void selectNode(n)}
+                              >
+                                {active ? (running ? "使用中" : "已选中") : running ? "切换" : "选中"}
+                              </button>
+                              {(!running || runningOriginal) && (
+                                <button
+                                  type="button"
+                                  className="mini-btn is-primary"
+                                  disabled={busy || recovering || !isTauri()}
+                                  onClick={() => void connectNode(n)}
+                                >
+                                  连接
+                                </button>
+                              )}
+                            </>
+                          )}
+                          <button type="button" className="link" onClick={() => setDetailNode(n)}>详情</button>
+                        </div>
+                        <button
+                          type="button"
+                          className="link node-favorite"
+                          aria-pressed={starred.has(n.id)}
+                          aria-label={starred.has(n.id) ? `取消收藏 ${n.name}` : `收藏 ${n.name}`}
+                          onClick={() =>
+                            void saveSettings(state => ({
+                              ...state,
+                              favorites: state.favorites.includes(n.id)
+                                ? state.favorites.filter(id => id !== n.id)
+                                : [...state.favorites, n.id],
+                            }))
+                          }
+                        >
+                          <Star size={16} aria-hidden />
+                        </button>
                       </div>
                     </div>
-                    <span>
-                      {n.protocol.toUpperCase()} · {n.transport}
-                    </span>
-                    <span className="probe-result" title={unavailableNodes.get(n.id) || probe(n)?.label}>
-                      {unavailableNodes.get(n.id)
-                        ? "暂不支持"
-                        : probe(n)?.label || "未测试"}
-                    </span>
-                    <div className="node-actions">
-                      <button
-                      className="link"
-                      disabled={
-                        busy ||
-                        recovering ||
-                        !!runningOriginal ||
-                        testing ||
-                        !!unavailableNodes.get(n.id) ||
-                        isSelected(n)
-                      }
-                      title={unavailableNodes.get(n.id) || undefined}
-                      onClick={() => selectNode(n)}
-                    >
-                      {isSelected(n)
-                        ? "已选择"
-                        : unavailableNodes.get(n.id)
-                          ? "不可用"
-                          : runningNode?.id === n.id ? "应用更新" : "切换"}
-                      </button>
-                      <button className="link node-favorite" aria-pressed={starred.has(n.id)}
-                        aria-label={starred.has(n.id) ? `取消收藏 ${n.name}` : `收藏 ${n.name}`}
-                        onClick={() => void saveSettings(state => ({
-                          ...state,
-                          favorites: state.favorites.includes(n.id) ? state.favorites.filter(id => id !== n.id) : [...state.favorites, n.id],
-                        }))}>
-                        <Star size={16} aria-hidden />
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
                 {!filtered.length && (
                   <div className="empty">
-                    {nodes.length
-                      ? "没有匹配的节点"
-                      : "还没有节点，先导入订阅。"}
+                    {nodes.length ? "没有符合筛选条件的节点" : "还没有节点，点击右上角「导入订阅」。"}
                   </div>
                 )}
               </div>
-              <p className="rule-hint">
-                编号对应订阅源顺序。延迟为代理请求总耗时，最多同时测试四个节点。
+              <p className="rule-hint" style={{ marginTop: 12 }}>
+                提示：双击节点卡片可直接连接/切换。运行节点模式时测速将直接复用当前内核通道，无需重拉进程。
               </p>
             </section>
           )}
+
           {page === "订阅" && (
             <section className="panel">
               <div className="panel-head">
                 <h2>订阅来源</h2>
                 <label className="refresh-setting">默认自动更新
-                  <select value={work.workspace.refreshHours} disabled={!work.ready || !isTauri()} onChange={event => {
-                    const refreshHours = parseRefreshHours(Number(event.target.value)) ?? 0;
-                    void saveSettings(state => ({ ...state, refreshHours }));
-                  }}>
+                  <select
+                    value={work.workspace.refreshHours}
+                    disabled={!work.ready || !isTauri()}
+                    onChange={event => {
+                      const refreshHours = parseRefreshHours(Number(event.target.value)) ?? 0;
+                      void saveSettings(state => ({ ...state, refreshHours }));
+                    }}
+                  >
                     {refreshOptions.map(([hours, label]) => <option key={hours} value={hours}>{label}</option>)}
                   </select>
                 </label>
               </div>
-              {subscriptions.length ? <div className="subscription-grid">
-                {subscriptions.map(profile => <SubscriptionCard key={profile.id} profile={profile}
-                  pending={work.refreshStatus[profile.id]?.pending ?? false}
-                  error={work.refreshStatus[profile.id]?.error}
-                  refreshable={isTauri()}
-                  originalSelected={originalProfile?.id === profile.id}
-                  canSelectOriginal={isTauri() && !running && !busy && !testing}
-                  onSelectOriginal={async () => {
-                    await saveSettings(state => ({ ...state, mihomoProfile: profile.id }));
-                    setPage("概览");
-                  }}
-                  onRefresh={() => void work.refresh(profile.id).catch(() => {})}
-                  onConfigure={(request, refreshHours) => work.configureSubscription(profile.id, { request, refreshHours })}
-                  onBrowse={() => { setSubscriptionFilter(profile.id); setSearch(""); setOnlyFavorites(false); setPage("节点"); }}
-                  onRename={name => void saveSettings(state => ({ ...state, subscriptions:
-                    state.subscriptions.map(item => item.id === profile.id ? { ...item, name } : item) }))}
-                  onRemove={() => void saveSettings(state => {
-                    const remaining = state.subscriptions.filter(item => item.id !== profile.id);
-                    const nodeIds = new Set(profile.parsed.nodes.map(node => node.id));
-                    return { ...state, subscriptions: remaining, selected: preferredNode(remaining, state.selected),
-                      mihomoProfile: state.mihomoProfile === profile.id ? undefined : state.mihomoProfile,
-                      favorites: state.favorites.filter(id => !nodeIds.has(id)) };
-                  })}
-                />)}
-              </div> : <p className="empty">{work.ready ? "尚未导入订阅" : "等待本地订阅读取"}</p>}
+              {subscriptions.length ? (
+                <div className="subscription-grid">
+                  {subscriptions.map(profile => (
+                    <SubscriptionCard
+                      key={profile.id}
+                      profile={profile}
+                      pending={work.refreshStatus[profile.id]?.pending ?? false}
+                      error={work.refreshStatus[profile.id]?.error}
+                      refreshable={isTauri()}
+                      originalSelected={originalProfile?.id === profile.id}
+                      canSelectOriginal={isTauri() && !busy && !recovering}
+                      onSelectOriginal={() => void switchToOriginal(profile.id)}
+                      onRefresh={() => void work.refresh(profile.id).catch(() => {})}
+                      onConfigure={(request, refreshHours) => work.configureSubscription(profile.id, { request, refreshHours })}
+                      onBrowse={() => {
+                        setSubscriptionFilter(profile.id);
+                        setProtocolFilter("");
+                        setSearch("");
+                        setOnlyFavorites(false);
+                        setOnlySupported(false);
+                        setPage("节点");
+                      }}
+                      onRename={name =>
+                        void saveSettings(state => ({
+                          ...state,
+                          subscriptions: state.subscriptions.map(item => (item.id === profile.id ? { ...item, name } : item)),
+                        }))
+                      }
+                      onRemove={() =>
+                        void saveSettings(state => {
+                          const remaining = state.subscriptions.filter(item => item.id !== profile.id);
+                          const nodeIds = new Set(profile.parsed.nodes.map(node => node.id));
+                          const nextLatencies = { ...state.nodeLatencies };
+                          for (const id of nodeIds) delete nextLatencies[id];
+                          return {
+                            ...state,
+                            subscriptions: remaining,
+                            selected: preferredNode(remaining, state.selected),
+                            mihomoProfile: state.mihomoProfile === profile.id ? undefined : state.mihomoProfile,
+                            favorites: state.favorites.filter(id => !nodeIds.has(id)),
+                            nodeLatencies: nextLatencies,
+                          };
+                        })
+                      }
+                    />
+                  ))}
+                </div>
+              ) : (
+                <p className="empty">{work.ready ? "尚未导入订阅，点击右上角「导入订阅」开始。" : "正在读取本地加密工作区…"}</p>
+              )}
             </section>
           )}
-          {page === "测试" && <>
-            <DownloadCheck key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
-            <UnlockTests />
-          </>}
-          {page === "连接" && <ConnectionMonitor telemetry={telemetry} running={running} />}
-          {page === "日志" && <EventLog />}
+
+          {page === "连接" && (
+            <ConnectionMonitor
+              telemetry={telemetry}
+              running={running}
+              onQuickRule={rule =>
+                void saveSettings(state => {
+                  const exists = state.rules.some(
+                    r => r.type === rule.type && r.value === rule.value && r.action === rule.action,
+                  );
+                  return exists ? state : { ...state, rules: [rule, ...state.rules] };
+                })
+              }
+            />
+          )}
+
           {page === "规则" && (
-            <RulesEditor rules={rules} targets={ruleTargets} onChange={edit => void saveSettings(state => ({ ...state, rules: edit(state.rules) }))} running={running} />
+            <RulesEditor
+              rules={rules}
+              targets={ruleTargets}
+              defaultAction={ruleDefaultAction}
+              dirtyWhileRunning={rulesDirtyWhileRunning}
+              running={running && !runningOriginal}
+              onDefaultAction={action => void saveSettings(state => ({ ...state, ruleDefaultAction: action }))}
+              onChange={edit => void saveSettings(state => ({ ...state, rules: edit(state.rules) }))}
+              onApplyReconnect={() => void reconnectNodeSession()}
+            />
           )}
-          {page === "诊断" && (
-            <section className="panel">
-              <div className="panel-head">
-                <h2>本地网络测试</h2>
-              </div>
-              <div className="env-row">
-                <span>Google TCP 443（含 DNS 解析）</span>
-                <span>{localTcp}</span>
-                <button
-                  className="link"
-                  disabled={localTcpBusy || !isTauri()}
-                  onClick={testLocalTcp}
-                >
-                  {localTcpBusy ? "测试中…" : "测试"}
-                </button>
-              </div>
-              <p className="rule-hint">
-                此测试不经过 RelayDesk 的代理入口；若已启用其他 TUN
-                或系统级代理，结果可能受其影响。
-              </p>
-            </section>
+
+          {page === "日志" && <EventLog />}
+
+          {page === "测试" && (
+            <>
+              <DownloadCheck key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
+              <WebsiteChecks key={`site-${diagnosticsVersion}`} port={running && !recovering ? port : undefined} disabled={busy} />
+              <UnlockTests port={running && !recovering ? port : undefined} disabled={busy} />
+              <section className="panel" style={{ marginTop: 16 }}>
+                <div className="panel-head">
+                  <h2>本机直连诊断</h2>
+                  <button className="mini-btn" disabled={localTcpBusy || !isTauri()} onClick={() => void testLocalTcp()}>
+                    {localTcpBusy ? "测试中…" : "测试 TCP 443"}
+                  </button>
+                </div>
+                <div className="env-row">
+                  <span>Google TCP 443（含本机 DNS 解析）</span>
+                  <span className="badge">{localTcp}</span>
+                </div>
+                <p className="rule-hint">此诊断直接从本机发起连接以排查底层网络问题（启用 TUN 时可能经过虚拟网卡）。</p>
+              </section>
+            </>
           )}
+
           {page === "设置" && (
-            <section className="panel">
-              <div className="panel-head">
-                <h2>设置</h2>
-              </div>
-              <div className="empty">
-                系统代理适用于遵循 Windows 代理设置的应用。TUN 接管 TCP/UDP 和 DNS，启动时需要管理员授权。本地端口模式需要在目标应用中手动填写代理地址。
-              </div>
-              <div className="env-row">
-                <label>
-                  <input type="checkbox" checked={autoReconnect} disabled={!work.ready} onChange={event => {
-                    const enabled = event.target.checked;
-                    void saveSettings(state => ({ ...state, autoReconnect: enabled }));
-                  }} />
-                  内核意外退出时自动恢复
-                </label>
-              </div>
-              <p className="rule-hint">TUN 可在本次授权内恢复接管内核。手动重新连接仍需授权。</p>
-              <div className="env-row">
-                <label>
-                  <input type="checkbox" checked={autoFailover} disabled={!work.ready} onChange={event => {
-                    const enabled = event.target.checked;
-                    void saveSettings(state => ({ ...state, autoFailover: enabled }));
-                  }} />
-                  节点失联时自动换线
-                </label>
-              </div>
-              <p className="rule-hint">后台检查两个网站。连续失败后尝试同订阅的其他节点，优先选择收藏。</p>
-              <FixedPortSetting key={String(proxyPort)} value={proxyPort} disabled={!work.ready || busy || running}
-                onChange={changed => saveSettings(state => ({ ...state, proxyPort: changed }))} />
-            </section>
+            <SettingsPage
+              workspace={work.workspace}
+              ready={work.ready}
+              busy={busy}
+              running={running}
+              elevated={elevated}
+              onSave={saveSettings}
+            />
           )}
         </main>
       </div>
+
       {dialog && (
-        <div className="overlay" onMouseDown={() => !importing && setDialog(false)}>
-          <div
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="dialog-title"
-            onMouseDown={(e) => e.stopPropagation()}
-          >
+        <ImportModal
+          ready={work.ready}
+          importing={importing}
+          error={error}
+          onClose={() => setDialog(false)}
+          onImport={importSubscription}
+        />
+      )}
+
+      {detailNode && (
+        <div className="overlay" onMouseDown={() => setDetailNode(undefined)}>
+          <div className="modal" role="dialog" aria-modal="true" onMouseDown={e => e.stopPropagation()}>
             <div className="modal-head">
               <div>
-                <h2 id="dialog-title">导入订阅</h2>
-                <p>
-                  粘贴 HTTPS 订阅地址、节点链接、Base64、Clash YAML 或 sing-box
-                  JSON。
-                </p>
+                <h2>{detailNode.name}</h2>
+                <p>{detailNode.protocol.toUpperCase()} · {detailNode.server}:{detailNode.port}</p>
               </div>
-              <button
-                className="icon-button"
-                aria-label="关闭"
-                disabled={importing}
-                onClick={() => setDialog(false)}
-              >
+              <button className="icon-button" aria-label="关闭详情" onClick={() => setDetailNode(undefined)}>
                 <X size={18} />
               </button>
             </div>
-            <textarea
-              autoFocus
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              placeholder="粘贴订阅地址、内容或节点链接"
-            />
-            {/^https?:\/\//i.test(text.trim()) && (
-              <details className="subscription-request-details">
-                <summary>请求设置</summary>
-                <SubscriptionRequestFields value={importRequest ?? defaultSubscriptionRequest}
-                  disabled={importing} onChange={setImportRequest} />
-              </details>
+            {unavailableNodes.get(detailNode.id) && (
+              <div className="notice is-error" style={{ marginBottom: 12 }}>
+                不可用原因：{unavailableNodes.get(detailNode.id)}
+              </div>
             )}
-            <input
-              hidden
-              ref={file}
-              type="file"
-              accept=".txt,.yaml,.yml,.json"
-              onChange={async (e) => {
-                const f = e.target.files?.[0];
-                if (f) setText(await f.text());
-              }}
-            />
+            <div className="env-row"><span>协议</span><strong>{detailNode.protocol}</strong></div>
+            <div className="env-row"><span>传输方式</span><strong>{detailNode.transport}</strong></div>
+            <div className="env-row"><span>安全传输</span><strong>{detailNode.security}</strong></div>
+            <div className="env-row"><span>订阅序号</span><strong>#{detailNode.sourceIndex ?? "—"}</strong></div>
             <div className="modal-actions">
-              <button disabled={importing} onClick={() => file.current?.click()}>
-                <Upload size={16} />
-                选择文件
-              </button>
-              <span className="error">{error}</span>
-              <button className="primary" disabled={importing || !work.ready} onClick={add}>
-                {importing ? "正在导入…" : "解析并导入"}
-              </button>
+              <button type="button" className="btn" onClick={() => setDetailNode(undefined)}>关闭</button>
+              {!unavailableNodes.get(detailNode.id) && isTauri() && (
+                <button
+                  type="button"
+                  className="btn primary"
+                  disabled={busy || recovering}
+                  onClick={() => {
+                    const target = detailNode;
+                    setDetailNode(undefined);
+                    void connectNode(target);
+                  }}
+                >
+                  {running ? "切换到此节点" : "立即连接此节点"}
+                </button>
+              )}
             </div>
-            <p className="privacy">
-              <FileText size={14} />
-              订阅内容使用 Windows 数据保护加密保存在本机。
-            </p>
           </div>
         </div>
       )}
@@ -981,140 +1535,6 @@ function App() {
   );
 }
 
-function FixedPortSetting({ value, disabled, onChange }: {
-  value: number | null;
-  disabled: boolean;
-  onChange: (port: number | null) => Promise<void>;
-}) {
-  const [port, setPort] = useState(value == null ? "" : String(value));
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  const isUnchanged = port.trim() === (value == null ? "" : String(value));
-  return <form className="rule-form" onSubmit={event => {
-    event.preventDefault();
-    const input = port.trim();
-    const number = input ? Number(input) : null;
-    if (number != null && (!/^\d{1,5}$/.test(input) || number < 1024 || number > 65535)) {
-      setError("端口须为 1024 至 65535 的整数");
-      return;
-    }
-    setError("");
-    setSaving(true);
-    void onChange(number).finally(() => setSaving(false));
-  }}>
-    <label className="port-setting"><span>本地 HTTP / SOCKS5 端口</span>
-      <input inputMode="numeric" value={port} disabled={disabled || saving} placeholder="自动分配"
-        aria-describedby="proxy-port-note" onChange={event => { setPort(event.target.value); setError(""); }} />
-    </label>
-    <button disabled={disabled || saving || isUnchanged}>保存端口</button>
-    <p className="rule-hint port-setting-note" id="proxy-port-note">留空自动分配。停止代理后可更改。</p>
-    {error && <span className="error" role="alert">{error}</span>}
-  </form>;
-}
-function UnlockTests() {
-  const services = ["哔哩哔哩大陆", "哔哩哔哩港澳台", "Bahamut Anime", "ChatGPT iOS", "ChatGPT Web", "Claude", "Disney+", "Gemini", "Netflix", "Prime Video", "Spotify", "TikTok", "YouTube Premium"];
-  return <><div className="unlock-heading"><span>服务解锁测试</span><button disabled title="解锁检测尚未接入">测试全部</button></div><div className="unlock-grid">{services.map(service => <TestCard key={service} serviceName={service} />)}</div></>;
-}
-function TestCard({serviceName}:{serviceName:string}) {
-  return <section className="test-card"><div><strong>{serviceName}</strong><button disabled aria-label={`${serviceName} 测试尚未接入`}>↻</button></div><span>尚未接入</span><footer>—</footer></section>;
-}
-function RulesEditor({
-  rules,
-  targets,
-  onChange,
-  running,
-}: {
-  rules: RouteRule[];
-  targets: { id: string; label: string }[];
-  onChange: (edit: (rules: RouteRule[]) => RouteRule[]) => void;
-  running: boolean;
-}) {
-  const [type, setType] = useState<RouteRule["type"]>("domain_suffix");
-  const [action, setAction] = useState<RouteRule["action"]>("direct");
-  const [target, setTarget] = useState("");
-  const [value, setValue] = useState("");
-  const [validationError, setValidationError] = useState("");
-  function move(rule: RouteRule, offset: number) {
-    onChange(current => {
-      const index = current.indexOf(rule);
-      const destination = index + offset;
-      if (index < 0 || destination < 0 || destination >= current.length) return current;
-      const reordered = [...current];
-      [reordered[destination], reordered[index]] = [reordered[index], reordered[destination]];
-      return reordered;
-    });
-  }
-  return (
-    <section className="panel">
-      <div className="panel-head">
-        <h2>路由规则</h2>
-      </div>
-      <p className="rule-hint">
-        规则模式按顺序匹配，未命中时使用当前节点。指定的节点无法加载时，匹配该规则的流量会被拦截。
-        {running ? "修改将在重新连接后生效。" : ""}
-      </p>
-      <div className="rule-form">
-        <select
-          aria-label="规则类型"
-          value={type}
-          onChange={(e) => { setType(e.target.value as RouteRule["type"]); setValidationError(""); }}
-        >
-          {ruleTypes.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </select>
-        <input
-          aria-label="规则内容"
-          placeholder={ruleTypes.find(option => option.value === type)?.example}
-          value={value}
-          onChange={(e) => { setValue(e.target.value); setValidationError(""); }}
-        />
-        <select
-          aria-label="规则动作"
-          value={action}
-          onChange={(e) => setAction(e.target.value as RouteRule["action"])}
-        >
-          <option value="direct">直连</option>
-          <option value="proxy">代理</option>
-          <option value="reject">拦截</option>
-        </select>
-        {action === "proxy" && <select aria-label="规则使用的节点" className="rule-target" value={target}
-          onChange={event => setTarget(event.target.value)}>
-          <option value="">当前节点</option>
-          {targets.map(node => <option key={node.id} value={node.id}>{node.label}</option>)}
-        </select>}
-        <button
-          disabled={!value.trim()}
-          onClick={() => {
-            try {
-              const match = normalizeRuleValue(type, value);
-              if (action === "proxy" && target && !targets.some(node => node.id === target)) throw new Error("请选择可用节点");
-              onChange(current => [...current, { type, value: match, action, target: action === "proxy" && target ? target : undefined }]);
-              setValue("");
-              setValidationError("");
-            } catch (error) {
-              setValidationError(error instanceof Error ? error.message : "规则格式有误");
-            }
-          }}
-        >
-          添加
-        </button>
-      </div>
-      {validationError && <p className="error" role="alert">{validationError}</p>}
-      {rules.map((rule, index) => {
-        const label = ruleTypes.find(option => option.value === rule.type)?.label;
-        const route = rule.action === "direct" ? "直连" : rule.action === "reject" ? "拦截"
-          : rule.target ? targets.find(node => node.id === rule.target)?.label ?? "指定节点已不可用" : "当前节点";
-        return <div className="env-row rule-row" key={index}>
-          <span>{label} · {rule.value} · {route}</span>
-          <div className="rule-actions">
-            <button className="link" disabled={index === 0} onClick={() => move(rule, -1)} aria-label={`上移规则 ${rule.value}`}>上移</button>
-            <button className="link" disabled={index === rules.length - 1} onClick={() => move(rule, 1)} aria-label={`下移规则 ${rule.value}`}>下移</button>
-            <button className="link" onClick={() => onChange(current => current.filter(item => item !== rule))}>删除</button>
-          </div>
-        </div>;
-      })}
-    </section>
-  );
-}
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <App />

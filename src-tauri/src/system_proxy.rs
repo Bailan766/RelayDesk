@@ -181,12 +181,21 @@ pub fn recover(path: &Path) -> Result<(), ()> {
 }
 
 pub fn enable(path: &Path, port: u16) -> Result<(), ()> {
+    enable_with_bypass(path, port, "localhost;127.0.0.1;[::1];<local>")
+}
+
+pub fn enable_with_bypass(path: &Path, port: u16, bypass: &str) -> Result<(), ()> {
+    let bypass = if bypass.trim().is_empty() {
+        "localhost;127.0.0.1;[::1];<local>"
+    } else {
+        bypass.trim()
+    };
     let journal = Journal {
         previous: query()?,
         active: Settings {
             flags: 3,
             server: format!("127.0.0.1:{port}").encode_utf16().collect(),
-            bypass: "localhost;127.0.0.1;[::1];<local>".encode_utf16().collect(),
+            bypass: bypass.encode_utf16().collect(),
             pac: Vec::new(),
         },
     };

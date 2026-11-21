@@ -12,6 +12,279 @@ pub struct DownloadMeasurement {
     pub megabits_per_second: f64,
 }
 
+#[derive(serde::Serialize)]
+pub struct ExitIpDetail {
+    pub ip: String,
+    pub country: Option<String>,
+    pub region: Option<String>,
+    pub city: Option<String>,
+    pub isp: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct UnlockResult {
+    pub service: String,
+    pub status: &'static str,
+    pub region: Option<String>,
+    pub detail: String,
+    pub milliseconds: u64,
+}
+
+pub async fn check_exit_ip_detail(port: u16) -> Result<ExitIpDetail, String> {
+    let proxy =
+        reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|_| "代理地址无效")?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "无法初始化出口检查")?;
+    if let Ok(response) = client.get("https://ipwho.is/").send().await {
+        if response.status().is_success() {
+            if let Ok(body) = response.json::<Value>().await {
+                if body.get("success").and_then(Value::as_bool) != Some(false) {
+                    if let Some(ip_str) = body.get("ip").and_then(Value::as_str) {
+                        if ip_str.trim().parse::<std::net::IpAddr>().is_ok() {
+                            let non_empty = |v: Option<&str>| {
+                                v.map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned)
+                            };
+                            return Ok(ExitIpDetail {
+                                ip: ip_str.trim().to_owned(),
+                                country: non_empty(body.get("country").and_then(Value::as_str)),
+                                region: non_empty(body.get("region").and_then(Value::as_str)),
+                                city: non_empty(body.get("city").and_then(Value::as_str)),
+                                isp: non_empty(
+                                    body.get("connection")
+                                        .and_then(|c| c.get("isp"))
+                                        .and_then(Value::as_str),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let response = client
+        .get("https://api.ipify.org")
+        .send()
+        .await
+        .map_err(|_| "出口地址检查失败")?
+        .error_for_status()
+        .map_err(|_| "出口地址服务异常")?;
+    let text = response.text().await.map_err(|_| "读取出口地址失败")?;
+    let ip: std::net::IpAddr = text
+        .trim()
+        .parse()
+        .map_err(|_| "出口地址服务返回无效数据")?;
+    Ok(ExitIpDetail {
+        ip: ip.to_string(),
+        country: None,
+        region: None,
+        city: None,
+        isp: None,
+    })
+}
+
+pub async fn check_unlock_service(service: &str, port: u16) -> Result<UnlockResult, String> {
+    let proxy =
+        reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).map_err(|_| "代理地址无效")?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .timeout(Duration::from_secs(9))
+        .redirect(reqwest::redirect::Policy::limited(4))
+        .build()
+        .map_err(|_| "无法初始化解锁测试")?;
+    const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    let started = std::time::Instant::now();
+    let get = |url: &str| client.get(url).header(reqwest::header::USER_AGENT, UA).send();
+    let cf_region = |body: &str| -> Option<String> {
+        body.lines()
+            .find_map(|line| line.strip_prefix("loc="))
+            .map(str::trim)
+            .filter(|loc| !loc.is_empty())
+            .map(str::to_owned)
+    };
+    let (status, region, detail) = match service {
+        "ChatGPT Web" => match get("https://chatgpt.com/cdn-cgi/trace").await {
+            Ok(resp) if resp.status().is_success() => {
+                let text = resp.text().await.unwrap_or_default();
+                let loc = cf_region(&text);
+                if matches!(loc.as_deref(), Some("CN" | "HK" | "RU" | "BY" | "IR" | "KP")) {
+                    ("blocked", loc, "所在地区不在支持范围".to_owned())
+                } else {
+                    ("available", loc, "可访问 Web 入口".to_owned())
+                }
+            }
+            Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        "ChatGPT iOS" => {
+            match get("https://ios.chat.openai.com/public-api/mobile/server_status/v1").await {
+                Ok(resp) if resp.status().is_success() => {
+                    ("available", None, "API 接口可访问".to_owned())
+                }
+                Ok(resp) if resp.status().as_u16() == 403 => {
+                    ("blocked", None, "IP 或地区受限 (403)".to_owned())
+                }
+                Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+                Err(_) => ("error", None, "请求失败或超时".to_owned()),
+            }
+        }
+        "Claude" => match get("https://claude.ai/cdn-cgi/trace").await {
+            Ok(resp) if resp.status().is_success() => {
+                let text = resp.text().await.unwrap_or_default();
+                let loc = cf_region(&text);
+                if matches!(loc.as_deref(), Some("CN" | "HK" | "MO" | "RU" | "BY")) {
+                    ("blocked", loc, "所在地区不受支持".to_owned())
+                } else {
+                    match get("https://claude.ai/login").await {
+                        Ok(login) if login.status().as_u16() < 400 => {
+                            ("available", loc, "登录页可正常访问".to_owned())
+                        }
+                        Ok(login) => ("blocked", loc, format!("HTTP {}", login.status().as_u16())),
+                        Err(_) => ("error", loc, "登录页连接超时".to_owned()),
+                    }
+                }
+            }
+            Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        "Gemini" => match get("https://gemini.google.com/").await {
+            Ok(resp) if resp.status().is_success() => {
+                let final_url = resp.url().as_str().to_owned();
+                let body = resp.text().await.unwrap_or_default();
+                if final_url.contains("unavailable") || body.contains("not available in your country")
+                {
+                    ("blocked", None, "所在地区暂不可用".to_owned())
+                } else {
+                    ("available", None, "页面可访问".to_owned())
+                }
+            }
+            Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        "Netflix" => match get("https://www.netflix.com/title/81280792").await {
+            Ok(resp) if resp.status().is_success() => {
+                let region = resp
+                    .url()
+                    .path_segments()
+                    .and_then(|mut segs| segs.next())
+                    .filter(|s| s.len() == 2 || (s.len() == 5 && s.contains('-')))
+                    .map(|s| s.to_uppercase());
+                ("available", region, "完整解锁非自制剧".to_owned())
+            }
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                match get("https://www.netflix.com/title/80018499").await {
+                    Ok(orig) if orig.status().is_success() => {
+                        ("originals", None, "仅解锁自制剧".to_owned())
+                    }
+                    _ => ("blocked", None, "地区受限".to_owned()),
+                }
+            }
+            Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        "Disney+" => match get("https://www.disneyplus.com/").await {
+            Ok(resp) => {
+                let final_url = resp.url().as_str().to_owned();
+                if resp.status().is_success() && !final_url.contains("unavailable") {
+                    ("available", None, "可正常打开".to_owned())
+                } else {
+                    ("blocked", None, "地区不可用或受限".to_owned())
+                }
+            }
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        "YouTube Premium" => match get("https://www.youtube.com/premium").await {
+            Ok(resp) if resp.status().is_success() => {
+                let body = resp.text().await.unwrap_or_default();
+                if body.contains("Premium is not available in your country") {
+                    ("blocked", None, "所在地区不支持 Premium".to_owned())
+                } else {
+                    ("available", None, "支持访问 Premium".to_owned())
+                }
+            }
+            Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        "Spotify" => match get("https://open.spotify.com/").await {
+            Ok(resp) if resp.status().is_success() => ("available", None, "可正常访问".to_owned()),
+            Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        "TikTok" => match get("https://www.tiktok.com/").await {
+            Ok(resp) if resp.status().is_success() => {
+                let body = resp.text().await.unwrap_or_default();
+                if body.contains("not available in your region") {
+                    ("blocked", None, "所在地区不可用".to_owned())
+                } else {
+                    ("available", None, "网页可访问".to_owned())
+                }
+            }
+            Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        "Prime Video" => match get("https://www.primevideo.com/").await {
+            Ok(resp) if resp.status().is_success() => ("available", None, "页面可访问".to_owned()),
+            Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        "哔哩哔哩大陆" => {
+            match get("https://api.bilibili.com/pgc/player/web/playurl?avid=82846771&cid=141738666&qn=0&type=&otype=json&ep_id=300998&fourk=1&fnver=0&fnval=16&module=bangumi").await {
+                Ok(resp) if resp.status().is_success() => {
+                    let json = resp.json::<Value>().await.unwrap_or_default();
+                    if json.get("code").and_then(Value::as_i64) == Some(0) {
+                        ("available", Some("CN".to_owned()), "可播放大陆限定番剧".to_owned())
+                    } else {
+                        ("blocked", None, "仅限大陆地区".to_owned())
+                    }
+                }
+                Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+                Err(_) => ("error", None, "请求失败或超时".to_owned()),
+            }
+        }
+        "哔哩哔哩港澳台" => {
+            match get("https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=183799&fourk=1&fnver=0&fnval=16&module=bangumi").await {
+                Ok(resp) if resp.status().is_success() => {
+                    let json = resp.json::<Value>().await.unwrap_or_default();
+                    if json.get("code").and_then(Value::as_i64) == Some(0) {
+                        ("available", Some("HK/TW".to_owned()), "可播放港澳台限定番剧".to_owned())
+                    } else {
+                        ("blocked", None, "仅限港澳台地区".to_owned())
+                    }
+                }
+                Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+                Err(_) => ("error", None, "请求失败或超时".to_owned()),
+            }
+        }
+        "Bahamut Anime" => match get("https://ani.gamer.com.tw/ajax/token.php?adID=89422&sn=14667").await {
+            Ok(resp) if resp.status().is_success() => {
+                let json = resp.json::<Value>().await.unwrap_or_default();
+                if json.get("animeSn").is_some() {
+                    ("available", Some("TW".to_owned()), "解锁动画疯".to_owned())
+                } else {
+                    ("blocked", None, "仅限台湾地区".to_owned())
+                }
+            }
+            Ok(resp) => ("blocked", None, format!("HTTP {}", resp.status().as_u16())),
+            Err(_) => ("error", None, "请求失败或超时".to_owned()),
+        },
+        _ => return Err("不支持的服务检测项".into()),
+    };
+    Ok(UnlockResult {
+        service: service.to_owned(),
+        status,
+        region,
+        detail,
+        milliseconds: started.elapsed().as_millis() as u64,
+    })
+}
+
 pub async fn measure_download(port: u16) -> Result<DownloadMeasurement, String> {
     let _permit = DOWNLOAD_SLOT
         .try_acquire()
@@ -134,7 +407,7 @@ async fn launch(core: &Path, action: &str, content: &[u8]) -> Result<Child, Stri
     Ok(child)
 }
 
-async fn measure(core: &Path, config: Value, port: u16) -> Result<u64, String> {
+async fn measure(core: &Path, config: Value, port: u16, probe_url: &str) -> Result<u64, String> {
     let inbound = config
         .get("inbounds")
         .and_then(Value::as_array)
@@ -199,7 +472,7 @@ async fn measure(core: &Path, config: Value, port: u16) -> Result<u64, String> {
         .map_err(|_| "无法初始化测速")?;
     let started = std::time::Instant::now();
     let response = client
-        .get("https://www.gstatic.com/generate_204")
+        .get(probe_url)
         .send()
         .await
         .map_err(|error| {
@@ -211,7 +484,7 @@ async fn measure(core: &Path, config: Value, port: u16) -> Result<u64, String> {
                 "代理请求失败"
             }
         })?;
-    if response.status() != reqwest::StatusCode::NO_CONTENT {
+    if !response.status().is_success() && response.status() != reqwest::StatusCode::NO_CONTENT {
         return Err("测速服务返回异常".into());
     }
     Ok(started.elapsed().as_millis() as u64)
@@ -222,22 +495,29 @@ pub async fn probe_node(
     config: Value,
     port: u16,
     batch: uuid::Uuid,
+    probe_url: Option<String>,
     state: tauri::State<'_, ProbeBatch>,
 ) -> Result<u64, String> {
     let core = crate::core_path()?;
-    cancellable_measure(&core, config, port, state.receive(batch)?).await
+    let url = probe_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+        .unwrap_or("https://www.gstatic.com/generate_204");
+    cancellable_measure(&core, config, port, url, state.receive(batch)?).await
 }
 
 async fn cancellable_measure(
     core: &Path,
     config: Value,
     port: u16,
+    probe_url: &str,
     mut cancel: watch::Receiver<()>,
 ) -> Result<u64, String> {
     tokio::select! {
         biased;
         _ = cancel.changed() => Err("已取消".into()),
-        result = measure(core, config, port) => result,
+        result = measure(core, config, port, probe_url) => result,
     }
 }
 
@@ -318,8 +598,16 @@ mod tests {
             "outbounds":[{"type":"http","tag":"proxy","server":"127.0.0.1","server_port":upstream_port}],
             "route":{"final":"proxy"}
         });
-        let worker =
-            tokio::spawn(async move { cancellable_measure(&core, config, port, cancel).await });
+        let worker = tokio::spawn(async move {
+            cancellable_measure(
+                &core,
+                config,
+                port,
+                "https://www.gstatic.com/generate_204",
+                cancel,
+            )
+            .await
+        });
         let (_unfinished, _) =
             tokio::time::timeout(Duration::from_secs(8), delayed_upstream.accept())
                 .await

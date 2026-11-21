@@ -22,18 +22,22 @@ export function DownloadCheck({ port, disabled }: { port?: number; disabled: boo
     }
   }
 
-  return <section className="panel download-check">
+  return <section className="panel" style={{ marginBottom: 16 }}>
     <div className="panel-head">
       <h2>当前路由下载速度</h2>
-      <button type="button" className="link" disabled={!port || disabled || pending} onClick={() => void measure()}>
-        {pending ? "正在下载…" : "开始测速"}
+      <button type="button" className="mini-btn is-primary" disabled={!port || disabled || pending} onClick={() => void measure()}>
+        {pending ? "正在测速…" : "开始测速"}
       </button>
     </div>
-    {sample && <div role="status">
-      <strong>{sample.megabits_per_second.toLocaleString("zh-CN", { maximumFractionDigits: 2 })} Mbps</strong>
-      {" · "}{(sample.bytes / (1024 * 1024)).toFixed(2)} MiB{" · "}{(sample.milliseconds / 1000).toFixed(2)} 秒
+    {sample && <div role="status" style={{ marginBottom: 8 }}>
+      <span className="badge is-good" style={{ fontSize: 13 }}>
+        {sample.megabits_per_second.toLocaleString("zh-CN", { maximumFractionDigits: 2 })} Mbps
+      </span>
+      <span className="muted" style={{ marginLeft: 10 }}>
+        {(sample.bytes / (1024 * 1024)).toFixed(2)} MiB · {(sample.milliseconds / 1000).toFixed(2)} 秒
+      </span>
     </div>}
     {error && <p className="error" role="status">{error}</p>}
-    <p className="rule-hint">{port ? "按当前路由从 Cloudflare 下载单次样本，最多使用 8 MiB 流量。" : "连接后可以测速。"}</p>
+    <p className="rule-hint">{port ? "按当前路由从 Cloudflare 下载单次样本，最多使用 8 MiB 流量。" : "连接代理后可以测试下载吞吐。"}</p>
   </section>;
 }

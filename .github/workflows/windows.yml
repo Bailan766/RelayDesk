@@ -109,4 +109,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME relaydesk-windows-x64-setup.exe relaydesk-windows-x64-portable.zip --title "RelayDesk $env:GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md --prerelease
+        run: |
+          $args = @('release', 'create', $env:GITHUB_REF_NAME, 'relaydesk-windows-x64-setup.exe', 'relaydesk-windows-x64-portable.zip', '--title', "RelayDesk $env:GITHUB_REF_NAME", '--notes-file', 'RELEASE_NOTES.md')
+          if ($env:GITHUB_REF_NAME -match '-') { $args += '--prerelease' }
+          & gh @args
