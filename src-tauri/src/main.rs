@@ -336,6 +336,7 @@ struct AppUpdateInfo {
     release_url: String,
     download_url: Option<String>,
     mirror_download_url: Option<String>,
+    expected_sha256: Option<String>,
     notes: String,
 }
 
@@ -354,12 +355,23 @@ fn parse_semver(tag: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+fn extract_sha256_digest(raw: Option<&str>) -> Option<String> {
+    let hex = raw?.trim().strip_prefix("sha256:")?.trim();
+    if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(hex.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 #[tauri::command]
 async fn check_app_update(state: tauri::State<'_, ProxyState>) -> Result<AppUpdateInfo, String> {
     #[derive(serde::Deserialize)]
     struct ReleaseAsset {
         name: String,
         browser_download_url: String,
+        #[serde(default)]
+        digest: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct LatestRelease {
@@ -418,11 +430,15 @@ async fn check_app_update(state: tauri::State<'_, ProxyState>) -> Result<AppUpda
         (Some(cur), Some(lat)) => lat > cur,
         _ => false,
     };
-    let download_url = release
-        .assets
-        .into_iter()
-        .find(|a| a.name.ends_with("-setup.exe") && a.browser_download_url.starts_with("https://github.com/Bailan766/RelayDesk/"))
-        .map(|a| a.browser_download_url);
+    let installer_asset = release.assets.into_iter().find(|a| {
+        a.name.ends_with("-setup.exe")
+            && a.browser_download_url
+                .starts_with("https://github.com/Bailan766/RelayDesk/releases/download/")
+    });
+    let expected_sha256 = installer_asset
+        .as_ref()
+        .and_then(|a| extract_sha256_digest(a.digest.as_deref()));
+    let download_url = installer_asset.map(|a| a.browser_download_url);
     let mirror_download_url = download_url
         .as_ref()
         .map(|url| format!("https://gh-proxy.com/{url}"));
@@ -445,6 +461,7 @@ async fn check_app_update(state: tauri::State<'_, ProxyState>) -> Result<AppUpda
         release_url,
         download_url,
         mirror_download_url,
+        expected_sha256,
         notes,
     })
 }
@@ -462,6 +479,199 @@ fn open_release_page(url: String) -> Result<(), String> {
         .spawn()
         .map_err(|_| "无法打开下载页面")?;
     Ok(())
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateDownloadProgress {
+    downloaded: u64,
+    total: Option<u64>,
+    stage: &'static str,
+}
+
+#[tauri::command]
+async fn download_and_install_update(
+    download_url: String,
+    expected_sha256: Option<String>,
+    use_mirror: bool,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<bool, String> {
+    use sha2::{Digest, Sha256};
+
+    if !download_url.starts_with("https://github.com/Bailan766/RelayDesk/releases/download/")
+        || !download_url.ends_with("-setup.exe")
+    {
+        return Err("非官方安装包下载地址，已拒绝下载".into());
+    }
+    let expected = match expected_sha256 {
+        Some(raw) => {
+            let trimmed = raw.trim().to_ascii_lowercase();
+            if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("安装包的 SHA-256 摘要格式无效".into());
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+
+    let target_url = if use_mirror {
+        format!("https://gh-proxy.com/{download_url}")
+    } else {
+        download_url.clone()
+    };
+    let current = env!("CARGO_PKG_VERSION").to_owned();
+    let client = if !use_mirror {
+        if let Some(port) = running_port(&state) {
+            let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}"))
+                .map_err(|_| "无法通过当前代理下载更新")?;
+            reqwest::Client::builder()
+                .no_proxy()
+                .proxy(proxy)
+                .timeout(Duration::from_secs(180))
+                .user_agent(format!("RelayDesk/{current}"))
+                .build()
+                .map_err(|_| "无法初始化下载器")?
+        } else {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(180))
+                .user_agent(format!("RelayDesk/{current}"))
+                .build()
+                .map_err(|_| "无法初始化下载器")?
+        }
+    } else {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(180))
+            .user_agent(format!("RelayDesk/{current}"))
+            .build()
+            .map_err(|_| "无法初始化加速下载器")?
+    };
+
+    let mut response = client
+        .get(&target_url)
+        .send()
+        .await
+        .map_err(|_| "下载安装包失败，请检查网络或切换下载线路".to_string())?
+        .error_for_status()
+        .map_err(|status| format!("下载服务器返回异常（HTTP {:?}）", status.status().map(|s| s.as_u16())))?;
+
+    const MAX_INSTALLER_BYTES: u64 = 128 * 1024 * 1024;
+    let total = response.content_length();
+    if total.is_some_and(|len| len > MAX_INSTALLER_BYTES) {
+        return Err("安装包体积异常（超过 128 MB），已中止下载".into());
+    }
+
+    let part_path = std::env::temp_dir().join(format!(
+        "RelayDesk-update-{}.tmp",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let final_path = std::env::temp_dir().join("RelayDesk-update-setup.exe");
+    let _cleanup_part = TemporaryConfig(part_path.clone());
+
+    let mut file = fs::File::create(&part_path).map_err(|_| "无法创建临时安装文件")?;
+    let mut hasher = Sha256::new();
+    let mut downloaded: u64 = 0;
+    let mut header = [0u8; 2];
+    let mut header_len = 0usize;
+    let mut last_emit = std::time::Instant::now();
+
+    while let Some(chunk) = response.chunk().await.map_err(|_| "读取安装包数据流中断")? {
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded > MAX_INSTALLER_BYTES {
+            return Err("安装包体积超出限制，已中止下载".into());
+        }
+        if header_len < 2 {
+            let need = (2 - header_len).min(chunk.len());
+            header[header_len..header_len + need].copy_from_slice(&chunk[..need]);
+            header_len += need;
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).map_err(|_| "写入临时安装包失败")?;
+        if last_emit.elapsed() >= Duration::from_millis(120) {
+            last_emit = std::time::Instant::now();
+            let _ = app.emit(
+                "update-download-progress",
+                UpdateDownloadProgress {
+                    downloaded,
+                    total,
+                    stage: "downloading",
+                },
+            );
+        }
+    }
+    file.flush().map_err(|_| "写入安装包缓冲区失败")?;
+    drop(file);
+
+    let _ = app.emit(
+        "update-download-progress",
+        UpdateDownloadProgress {
+            downloaded,
+            total,
+            stage: "verifying",
+        },
+    );
+
+    if downloaded < 1024 * 1024 || header_len < 2 || header != *b"MZ" {
+        return Err("下载内容不是有效的 Windows 安装包".into());
+    }
+
+    let actual_hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let sha256_verified = match expected {
+        Some(exp) => {
+            if actual_hex != exp {
+                return Err(format!("安装包 SHA-256 校验失败，已中止安装"));
+            }
+            true
+        }
+        None => false,
+    };
+
+    let _ = fs::remove_file(&final_path);
+    fs::rename(&part_path, &final_path).map_err(|_| "无法准备更新安装文件")?;
+
+    let _ = app.emit(
+        "update-download-progress",
+        UpdateDownloadProgress {
+            downloaded,
+            total: Some(downloaded),
+            stage: "installing",
+        },
+    );
+
+    let relaunch_exe = std::env::current_exe()
+        .ok()
+        .unwrap_or_else(|| PathBuf::from("relaydesk.exe"));
+    let pid = std::process::id().to_string();
+
+    let stop_app = app.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        let _ = stop_app.state::<ProxyState>().shutdown();
+    })
+    .await;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let script = "Wait-Process -Id ([int]$env:RELAYDESK_PARENT_PID) -Timeout 15 -ErrorAction SilentlyContinue; \
+                      $p = Start-Process -FilePath $env:RELAYDESK_UPDATER_EXE -ArgumentList '/S' -Wait -PassThru; \
+                      if ($p.ExitCode -eq 0 -and (Test-Path $env:RELAYDESK_TARGET_EXE)) { Start-Process -FilePath $env:RELAYDESK_TARGET_EXE }";
+        Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script])
+            .env("RELAYDESK_PARENT_PID", &pid)
+            .env("RELAYDESK_UPDATER_EXE", &final_path)
+            .env("RELAYDESK_TARGET_EXE", &relaunch_exe)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|_| "无法拉起静默安装程序")?;
+    }
+
+    app.exit(0);
+    Ok(sha256_verified)
 }
 
 #[tauri::command]
@@ -1356,6 +1566,7 @@ fn main() {
             repair_system_proxy,
             check_app_update,
             open_release_page,
+            download_and_install_update,
             probe_loaded_node,
             probe_mihomo_group,
             close_proxy_connection,
@@ -1406,5 +1617,32 @@ fn show_main(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+
+#[cfg(test)]
+mod updater_tests {
+    use super::{extract_sha256_digest, parse_semver};
+
+    #[test]
+    fn parses_clean_semver_tags_and_ignores_prereleases() {
+        assert_eq!(parse_semver("v1.4.0"), Some((1, 4, 0)));
+        assert_eq!(parse_semver("1.3.2"), Some((1, 3, 2)));
+        assert!(parse_semver("v1.4.0") > parse_semver("1.3.9"));
+        assert_eq!(parse_semver("v1.4.0-beta.1"), None);
+        assert_eq!(parse_semver("invalid"), None);
+    }
+
+    #[test]
+    fn validates_sha256_asset_digests() {
+        let valid = "sha256:7412C2DE2EBAA756FF7D416AA9485B4500B56C4F423FDA0F03925A1561E66DF3";
+        assert_eq!(
+            extract_sha256_digest(Some(valid)).as_deref(),
+            Some("7412c2de2ebaa756ff7d416aa9485b4500b56c4f423fda0f03925a1561e66df3")
+        );
+        assert_eq!(extract_sha256_digest(Some("sha256:short")), None);
+        assert_eq!(extract_sha256_digest(Some("md5:1234")), None);
+        assert_eq!(extract_sha256_digest(None), None);
     }
 }

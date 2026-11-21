@@ -194,6 +194,83 @@ function processExeName(metadata: Connection["metadata"]): string | undefined {
   return base || undefined;
 }
 
+export type ProcessAggregate = {
+  key: string;
+  process: string;
+  processPath?: string;
+  canProcessRule: boolean;
+  count: number;
+  upload: number;
+  download: number;
+  ids: string[];
+  topDestinations: string[];
+  routes: string[];
+};
+
+export function aggregateConnectionsByProcess(
+  items: Connection[],
+  sortBy: "default" | "download" | "upload" = "download",
+): ProcessAggregate[] {
+  const groups = new Map<string, {
+    process: string;
+    processPath?: string;
+    canProcessRule: boolean;
+    count: number;
+    upload: number;
+    download: number;
+    ids: string[];
+    destinations: Map<string, number>;
+    routes: Set<string>;
+  }>();
+  for (const conn of items) {
+    const exe = processExeName(conn.metadata);
+    const process = exe || "未知进程";
+    const key = exe ? exe.toLowerCase() : "__unknown__";
+    let entry = groups.get(key);
+    if (!entry) {
+      entry = {
+        process,
+        processPath: conn.metadata.processPath?.trim() || undefined,
+        canProcessRule: !!exe && /^[^<>:"/\\|?*]+\.exe$/i.test(exe),
+        count: 0,
+        upload: 0,
+        download: 0,
+        ids: [],
+        destinations: new Map(),
+        routes: new Set(),
+      };
+      groups.set(key, entry);
+    }
+    entry.count += 1;
+    entry.upload += conn.upload;
+    entry.download += conn.download;
+    entry.ids.push(conn.id);
+    const dest = conn.metadata.host || conn.metadata.destinationIP || "—";
+    entry.destinations.set(dest, (entry.destinations.get(dest) ?? 0) + conn.download + conn.upload);
+    const chain = conn.chains?.slice().reverse().join(" → ") || (conn.rule === "final" ? "默认路由" : conn.rule);
+    if (chain) entry.routes.add(chain);
+  }
+  const result: ProcessAggregate[] = Array.from(groups.entries()).map(([key, g]) => ({
+    key,
+    process: g.process,
+    processPath: g.processPath,
+    canProcessRule: g.canProcessRule,
+    count: g.count,
+    upload: g.upload,
+    download: g.download,
+    ids: g.ids,
+    topDestinations: Array.from(g.destinations.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([dest]) => dest),
+    routes: Array.from(g.routes).slice(0, 3),
+  }));
+  if (sortBy === "download") result.sort((a, b) => b.download - a.download || b.count - a.count);
+  else if (sortBy === "upload") result.sort((a, b) => b.upload - a.upload || b.count - a.count);
+  else result.sort((a, b) => b.count - a.count || b.download - a.download);
+  return result;
+}
+
 export function ConnectionMonitor({
   telemetry,
   running,
@@ -204,6 +281,7 @@ export function ConnectionMonitor({
   onQuickRule?: (rule: RouteRule) => void;
 }) {
   const { snapshot, message } = telemetry;
+  const [viewMode, setViewMode] = useState<"connections" | "processes">("connections");
   const [query, setQuery] = useState("");
   const [sortBy, setSortBy] = useState<"default" | "download" | "upload">("download");
   const [busyId, setBusyId] = useState<string>();
@@ -224,6 +302,25 @@ export function ConnectionMonitor({
     else if (sortBy === "upload") matched.sort((a, b) => b.upload - a.upload);
     return matched;
   }, [snapshot?.connections, query, sortBy]);
+
+  const processGroups = useMemo(
+    () => aggregateConnectionsByProcess(filtered, sortBy),
+    [filtered, sortBy],
+  );
+
+  async function closeGroup(ids: string[], label: string) {
+    if (!isTauri() || !ids.length) return;
+    setBusyId(`group:${label}`);
+    setActionMsg("");
+    try {
+      await Promise.all(ids.map(id => invoke("close_proxy_connection", { id })));
+      setActionMsg(`已请求断开「${label}」的 ${ids.length} 条连接`);
+    } catch (e) {
+      setActionMsg(typeof e === "string" ? e : "批量关闭连接失败");
+    } finally {
+      setBusyId(undefined);
+    }
+  }
 
   async function closeOne(id: string) {
     if (!isTauri()) return;
@@ -254,8 +351,20 @@ export function ConnectionMonitor({
 
   return <section className="panel connection-monitor">
     <div className="panel-head">
-      <h2>活跃连接 {snapshot ? `(${filtered.length}/${snapshot.connections.length})` : ""}</h2>
+      <h2>
+        {viewMode === "processes"
+          ? `按进程连接 (${processGroups.length} 个进程 · ${filtered.length} 条)`
+          : `活跃连接 ${snapshot ? `(${filtered.length}/${snapshot.connections.length})` : ""}`}
+      </h2>
       <div className="event-controls">
+        <div className="mode-switch" role="tablist" aria-label="连接视图">
+          <button type="button" aria-pressed={viewMode === "connections"} onClick={() => setViewMode("connections")}>
+            明细
+          </button>
+          <button type="button" aria-pressed={viewMode === "processes"} onClick={() => setViewMode("processes")}>
+            按进程
+          </button>
+        </div>
         <label className="search" style={{ maxWidth: 220 }}>
           <Search size={14} />
           <input
@@ -267,7 +376,7 @@ export function ConnectionMonitor({
         <select aria-label="连接排序" value={sortBy} onChange={e => setSortBy(e.target.value as typeof sortBy)}>
           <option value="download">按下载量</option>
           <option value="upload">按上传量</option>
-          <option value="default">按内核顺序</option>
+          <option value="default">{viewMode === "processes" ? "按连接数" : "按内核顺序"}</option>
         </select>
         <button
           className="mini-btn"
@@ -280,6 +389,81 @@ export function ConnectionMonitor({
     </div>
     {actionMsg && <p className="rule-hint" role="status" style={{ marginBottom: 10 }}>{actionMsg}</p>}
     {filtered.length ? (
+      viewMode === "processes" ? (
+        <div className="connection-table">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">进程 / 常访目标</th>
+                <th scope="col" style={{ width: "6em", textAlign: "right" }}>连接数</th>
+                <th scope="col">主要路由 / 出站</th>
+                <th scope="col" style={{ width: "6.5em", textAlign: "right" }}>上传</th>
+                <th scope="col" style={{ width: "6.5em", textAlign: "right" }}>下载</th>
+                <th scope="col" style={{ width: "12.5em", textAlign: "right" }}>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {processGroups.map(group => (
+                <tr key={group.key}>
+                  <td>
+                    <strong title={group.processPath || group.process}>{group.process}</strong>
+                    <small title={group.topDestinations.join(", ")}>
+                      {group.topDestinations.join(" · ") || "—"}
+                    </small>
+                  </td>
+                  <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
+                    <strong>{group.count}</strong>
+                  </td>
+                  <td>
+                    <strong title={group.routes.join(" / ")}>{group.routes[0] || "—"}</strong>
+                    {group.routes.length > 1 && <small>{group.routes.slice(1).join(" · ")}</small>}
+                  </td>
+                  <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatBytes(group.upload)}</td>
+                  <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatBytes(group.download)}</td>
+                  <td style={{ textAlign: "right" }}>
+                    <div style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+                      {group.canProcessRule && (
+                        <button
+                          type="button"
+                          className="link"
+                          onClick={() => {
+                            setQuery(group.process);
+                            setViewMode("connections");
+                          }}
+                        >
+                          明细
+                        </button>
+                      )}
+                      {onQuickRule && group.canProcessRule && (
+                        <button
+                          type="button"
+                          className="link"
+                          title={`将进程 ${group.process} 设为直连规则`}
+                          onClick={() => {
+                            onQuickRule({ type: "process_name", value: group.process, action: "direct" });
+                            setActionMsg(`已添加进程直连：${group.process}（热重载或重连后生效）`);
+                          }}
+                        >
+                          进程直连
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="icon-button"
+                        aria-label={`断开 ${group.process} 的全部连接`}
+                        disabled={busyId === `group:${group.process}`}
+                        onClick={() => void closeGroup(group.ids, group.process)}
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
       <div className="connection-table">
         <table>
           <thead>
@@ -358,6 +542,7 @@ export function ConnectionMonitor({
           </tbody>
         </table>
       </div>
+      )
     ) : <p className="empty">{snapshot ? (query ? "没有匹配的连接" : "当前没有活跃连接") : running ? message : "启动代理后显示活跃连接"}</p>}
   </section>;
 }

@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { normalizeRuleValue, rulePresets, ruleTypes, type RouteRule, type RuleDefaultAction } from "../config";
+import { useMemo, useState } from "react";
+import { evaluateRuleMatch, normalizeRuleValue, rulePresets, ruleTypes, type RouteRule, type RuleDefaultAction } from "../config";
 
 export function RulesEditor({
   rules,
@@ -29,6 +29,16 @@ export function RulesEditor({
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [validationError, setValidationError] = useState("");
   const [presetHint, setPresetHint] = useState("");
+  const [probeInput, setProbeInput] = useState("");
+
+  const matchResult = useMemo(() => {
+    if (!probeInput.trim()) return undefined;
+    try {
+      return { ok: true as const, value: evaluateRuleMatch(probeInput, rules, defaultAction) };
+    } catch (error) {
+      return { ok: false as const, message: error instanceof Error ? error.message : "测试目标格式无效" };
+    }
+  }, [probeInput, rules, defaultAction]);
 
   function move(index: number, offset: number) {
     onChange(current => {
@@ -192,13 +202,59 @@ export function RulesEditor({
         )}
       </div>
       {validationError && <p className="error" role="alert">{validationError}</p>}
+
+      <div className="rule-form" style={{ marginTop: 8, marginBottom: 12 }}>
+        <input
+          aria-label="规则命中演练"
+          placeholder="规则命中演练：输入域名、URL、IP 或 .exe 进程名（如 api.openai.com）"
+          value={probeInput}
+          onChange={e => setProbeInput(e.target.value)}
+        />
+        {probeInput.trim() && (
+          <button type="button" className="mini-btn" onClick={() => setProbeInput("")}>清空测试</button>
+        )}
+      </div>
+      {matchResult && (
+        matchResult.ok ? (
+          <div className="notice" role="status" style={{ marginBottom: 12 }}>
+            <span>
+              目标 <strong>{matchResult.value.normalized}</strong>{" "}
+              {matchResult.value.matchedIndex !== null && matchResult.value.matchedRule ? (
+                <>
+                  命中第 <strong>{matchResult.value.matchedIndex + 1}</strong> 条规则（
+                  {ruleTypes.find(t => t.value === matchResult.value.matchedRule!.type)?.label}：
+                  <code>{matchResult.value.matchedRule.value}</code>）→{" "}
+                  <strong>
+                    {matchResult.value.action === "direct"
+                      ? "直连"
+                      : matchResult.value.action === "reject"
+                        ? "拦截"
+                        : matchResult.value.target
+                          ? targets.find(n => n.id === matchResult.value.target)?.label ?? "指定节点已不可用"
+                          : "代理（当前节点）"}
+                  </strong>
+                </>
+              ) : (
+                <>
+                  未命中上方规则，将走默认动作 →{" "}
+                  <strong>{matchResult.value.action === "direct" ? "直连" : "代理（当前节点）"}</strong>
+                </>
+              )}
+            </span>
+          </div>
+        ) : (
+          <p className="error" role="alert" style={{ marginBottom: 12 }}>{matchResult.message}</p>
+        )
+      )}
+
       {rules.length ? (
         rules.map((rule, index) => {
           const label = ruleTypes.find(option => option.value === rule.type)?.label;
           const route = rule.action === "direct" ? "直连" : rule.action === "reject" ? "拦截"
             : rule.target ? targets.find(node => node.id === rule.target)?.label ?? "指定节点已不可用" : "当前节点";
           const badgeClass = rule.action === "direct" ? "is-good" : rule.action === "reject" ? "is-bad" : "is-accent";
-          return <div className="env-row rule-row" key={`${rule.type}:${rule.value}:${index}`}>
+          const isMatched = matchResult?.ok && matchResult.value.matchedIndex === index;
+          return <div className={`env-row rule-row ${isMatched ? "is-matched" : ""}`} key={`${rule.type}:${rule.value}:${index}`}>
             <span>
               <span className="tag" style={{ marginRight: 8 }}>{label}</span>
               <strong>{rule.value}</strong>

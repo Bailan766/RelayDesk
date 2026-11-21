@@ -1,6 +1,6 @@
 [package]
 name = "relaydesk"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2021"
 
 [build-dependencies]
@@ -15,4 +15,5 @@ serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["time", "net", "sync", "macros", "process", "io-util"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
 winapi = { version = "0.3", features = ["dpapi", "wincrypt", "winbase", "minwinbase", "winerror", "handleapi", "processthreadsapi", "synchapi", "shellapi", "jobapi2", "winnt", "consoleapi", "wincon", "minwindef", "errhandlingapi", "netioapi", "iphlpapi", "memoryapi", "tlhelp32", "winsvc", "namedpipeapi", "sddl", "fileapi"] }

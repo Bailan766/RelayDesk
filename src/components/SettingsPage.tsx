@@ -1,4 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
 import {
   defaultProbeUrl,
@@ -17,7 +18,14 @@ type AppUpdateInfo = {
   releaseUrl: string;
   downloadUrl?: string | null;
   mirrorDownloadUrl?: string | null;
+  expectedSha256?: string | null;
   notes: string;
+};
+
+type UpdateDownloadProgress = {
+  downloaded: number;
+  total?: number | null;
+  stage: "downloading" | "verifying" | "installing";
 };
 
 export type TunServiceStatus = {
@@ -58,8 +66,41 @@ export function SettingsPage({
   const [repoCopied, setRepoCopied] = useState(false);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo>();
+  const [updateInstalling, setUpdateInstalling] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress>();
   const [error, setError] = useState("");
   const backupInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!isTauri() || !updateInstalling) return;
+    let unlisten: (() => void) | undefined;
+    void listen<UpdateDownloadProgress>("update-download-progress", event => {
+      setUpdateProgress(event.payload);
+    }).then(fn => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [updateInstalling]);
+
+  async function installUpdate(useMirror: boolean) {
+    if (!updateInfo?.downloadUrl || updateInstalling) return;
+    setUpdateInstalling(true);
+    setUpdateProgress({ downloaded: 0, total: null, stage: "downloading" });
+    setError("");
+    try {
+      await invoke<boolean>("download_and_install_update", {
+        downloadUrl: updateInfo.downloadUrl,
+        expectedSha256: updateInfo.expectedSha256 ?? null,
+        useMirror,
+      });
+    } catch (failure) {
+      setError(typeof failure === "string" ? failure : "下载或安装更新失败");
+      setUpdateInstalling(false);
+      setUpdateProgress(undefined);
+    }
+  }
 
   useEffect(() => {
     setBypassDraft(workspace.systemProxyBypass);
@@ -477,36 +518,76 @@ export function SettingsPage({
           </button>
         </div>
         {updateInfo?.hasUpdate && (
-          <div className="notice is-warn" role="status" style={{ marginBottom: 12 }}>
-            <span>
-              发现新版本 <strong>v{updateInfo.latest}</strong>（当前 v{updateInfo.current}）
-            </span>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {updateInfo.mirrorDownloadUrl && (
+          <div className="notice is-warn" role="status" style={{ marginBottom: 12, display: "grid", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+              <span>
+                发现新版本 <strong>v{updateInfo.latest}</strong>（当前 v{updateInfo.current}）
+                {updateInfo.expectedSha256 ? " · 支持 SHA-256 校验安装" : ""}
+              </span>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {updateInfo.downloadUrl && (
+                  <button
+                    type="button"
+                    className="mini-btn is-primary"
+                    disabled={updateInstalling}
+                    onClick={() => void installUpdate(true)}
+                  >
+                    {updateInstalling ? "升级准备中…" : "国内加速一键升级"}
+                  </button>
+                )}
+                {updateInfo.downloadUrl && (
+                  <button
+                    type="button"
+                    className="mini-btn"
+                    disabled={updateInstalling}
+                    onClick={() => void installUpdate(false)}
+                  >
+                    GitHub 一键升级
+                  </button>
+                )}
                 <button
                   type="button"
-                  className="mini-btn is-primary"
+                  className="mini-btn"
+                  disabled={updateInstalling}
                   onClick={() =>
-                    void invoke("open_release_page", { url: updateInfo.mirrorDownloadUrl }).catch(() =>
-                      setError("无法打开加速下载地址"),
+                    void invoke("open_release_page", { url: updateInfo.mirrorDownloadUrl ?? updateInfo.releaseUrl }).catch(() =>
+                      setError("无法打开更新发布页"),
                     )
                   }
                 >
-                  国内加速下载
+                  浏览器下载
                 </button>
-              )}
-              <button
-                type="button"
-                className={updateInfo.mirrorDownloadUrl ? "mini-btn" : "mini-btn is-primary"}
-                onClick={() =>
-                  void invoke("open_release_page", { url: updateInfo.downloadUrl ?? updateInfo.releaseUrl }).catch(() =>
-                    setError("无法打开更新发布页"),
-                  )
-                }
-              >
-                GitHub 下载
-              </button>
+              </div>
             </div>
+            {updateInstalling && updateProgress && (
+              <div className="probe-progress" style={{ marginBottom: 0 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                  <span>
+                    {updateProgress.stage === "verifying"
+                      ? "正在校验安装包 SHA-256 指纹…"
+                      : updateProgress.stage === "installing"
+                        ? "校验通过，正在启动静默覆盖安装并重启…"
+                        : "正在下载更新包…"}
+                  </span>
+                  <span>
+                    {(updateProgress.downloaded / (1024 * 1024)).toFixed(1)}
+                    {updateProgress.total ? ` / ${(updateProgress.total / (1024 * 1024)).toFixed(1)}` : ""} MiB
+                  </span>
+                </div>
+                <div className="probe-progress-track">
+                  <div
+                    className="probe-progress-fill"
+                    style={{
+                      width: updateProgress.stage !== "downloading"
+                        ? "100%"
+                        : updateProgress.total
+                          ? `${Math.min(100, Math.round((updateProgress.downloaded / updateProgress.total) * 100))}%`
+                          : "45%",
+                    }}
+                  />
+                </div>
+              </div>
+            )}
           </div>
         )}
         <div className="setting-item">

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { buildConfig, buildSessionConfig, normalizeRuleValue, rulePresets, withMihomoCustomRules } from './config';
+import { buildConfig, buildSessionConfig, evaluateRuleMatch, normalizeRuleValue, rulePresets, withMihomoCustomRules } from './config';
+import { aggregateConnectionsByProcess } from './telemetry';
 import { parseSubscription } from './subscription';
 
 describe('sing-box configuration', () => {
@@ -98,5 +99,93 @@ describe('sing-box configuration', () => {
       'PROCESS-NAME,antigravity.exe,HK-01',
       'MATCH,Proxy',
     ]);
+  });
+});
+
+
+describe('rule matching evaluator and process aggregation', () => {
+  it('evaluates ordered domain, IPv4/IPv6 CIDR, URL, and Windows process matches cleanly', () => {
+    const rules = [
+      { type: 'domain' as const, value: 'direct.openai.com', action: 'direct' as const },
+      ...rulePresets.find(p => p.id === 'ai-services-proxy')!.rules,
+      ...rulePresets.find(p => p.id === 'lan-direct')!.rules,
+      { type: 'process_name' as const, value: 'Antigravity.exe', action: 'proxy' as const, target: 'node-hk' },
+    ];
+    expect(evaluateRuleMatch('https://direct.openai.com/v1', rules, 'proxy')).toMatchObject({
+      inputKind: 'domain',
+      normalized: 'direct.openai.com',
+      matchedIndex: 0,
+      action: 'direct',
+    });
+    expect(evaluateRuleMatch('generativelanguage.googleapis.com', rules, 'direct')).toMatchObject({
+      inputKind: 'domain',
+      action: 'proxy',
+    });
+    expect(evaluateRuleMatch('192.168.50.12', rules, 'proxy')).toMatchObject({
+      inputKind: 'ip',
+      normalized: '192.168.50.12',
+      action: 'direct',
+    });
+    expect(evaluateRuleMatch('fe80::1', rules, 'proxy')).toMatchObject({
+      inputKind: 'ip',
+      action: 'direct',
+    });
+    expect(evaluateRuleMatch('C:\\Program Files\\Antigravity\\antigravity.exe', rules, 'direct')).toMatchObject({
+      inputKind: 'process_name',
+      normalized: 'antigravity.exe',
+      action: 'proxy',
+      target: 'node-hk',
+    });
+    expect(evaluateRuleMatch('unmatched.example.org', rules, 'direct')).toMatchObject({
+      matchedIndex: null,
+      action: 'direct',
+    });
+  });
+
+  it('includes valid AI, Dev, and Telegram rule presets', () => {
+    for (const id of ['ai-services-proxy', 'dev-github-proxy', 'telegram-proxy']) {
+      const preset = rulePresets.find(p => p.id === id);
+      expect(preset).toBeDefined();
+      expect(preset!.rules.length).toBeGreaterThan(3);
+    }
+  });
+
+  it('aggregates active connections by process with accurate totals and sorting', () => {
+    const aggregated = aggregateConnectionsByProcess([
+      {
+        id: '1',
+        metadata: { host: 'api.github.com', sourceIP: '127.0.0.1', sourcePort: '1', destinationIP: null, destinationPort: '443', processPath: 'C:\\Tools\\antigravity.exe', network: 'tcp', type: 'HTTP' },
+        upload: 100,
+        download: 500,
+        chains: ['HK-01'],
+        rule: 'final',
+      },
+      {
+        id: '2',
+        metadata: { host: 'generativelanguage.googleapis.com', sourceIP: '127.0.0.1', sourcePort: '2', destinationIP: null, destinationPort: '443', processPath: 'C:\\Tools\\Antigravity.exe', network: 'tcp', type: 'HTTP' },
+        upload: 50,
+        download: 900,
+        chains: ['HK-01'],
+        rule: 'final',
+      },
+      {
+        id: '3',
+        metadata: { host: 'baidu.com', sourceIP: '127.0.0.1', sourcePort: '3', destinationIP: null, destinationPort: '443', process: 'chrome.exe', network: 'tcp', type: 'HTTP' },
+        upload: 300,
+        download: 200,
+        chains: ['DIRECT'],
+        rule: 'DomainSuffix',
+      },
+    ], 'download');
+    expect(aggregated).toHaveLength(2);
+    expect(aggregated[0]).toMatchObject({
+      process: 'antigravity.exe',
+      count: 2,
+      upload: 150,
+      download: 1400,
+      canProcessRule: true,
+    });
+    expect(aggregated[0].ids).toEqual(['1', '2']);
+    expect(aggregated[1]).toMatchObject({ process: 'chrome.exe', count: 1, upload: 300, download: 200 });
   });
 });

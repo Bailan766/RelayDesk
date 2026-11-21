@@ -150,6 +150,11 @@ textarea {
   animation: notice-enter 140ms var(--ease-fluent);
 }
 
+.rule-row.is-matched {
+  border-color: var(--accent);
+  background: var(--bg-active);
+}
+
 /* Live status indicators */
 .is-running .dot,
 .is-running .status-dot {

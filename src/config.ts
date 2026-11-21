@@ -38,6 +38,38 @@ export const rulePresets: { id: string; label: string; description: string; rule
       '163.com', '126.com', 'xiaomi.com', 'mi.com', 'huawei.com', 'apple.com', 'icloud.com',
     ].map(value => ({ type: 'domain_suffix', value, action: 'direct' })),
   },
+  {
+    id: 'ai-services-proxy',
+    label: 'AI 服务走代理',
+    description: '将 OpenAI / ChatGPT、Claude、Gemini、Perplexity 与 Cursor 域名设为代理',
+    rules: [
+      'openai.com', 'chatgpt.com', 'oaistatic.com', 'oaiusercontent.com',
+      'anthropic.com', 'claude.ai', 'gemini.google.com', 'generativelanguage.googleapis.com',
+      'aistudio.google.com', 'makersuite.google.com', 'perplexity.ai',
+      'cursor.sh', 'cursor.com', 'copilot.github.com',
+    ].map(value => ({ type: 'domain_suffix', value, action: 'proxy' })),
+  },
+  {
+    id: 'dev-github-proxy',
+    label: 'GitHub / 开发走代理',
+    description: '将 GitHub、npm、PyPI、Crates、Docker Hub、HuggingFace 等开发服务设为代理',
+    rules: [
+      'github.com', 'githubusercontent.com', 'githubassets.com', 'github.io',
+      'npmjs.org', 'pypi.org', 'crates.io', 'docker.io', 'gcr.io', 'quay.io',
+      'stackoverflow.com', 'huggingface.co',
+    ].map(value => ({ type: 'domain_suffix', value, action: 'proxy' })),
+  },
+  {
+    id: 'telegram-proxy',
+    label: 'Telegram 走代理',
+    description: '将 Telegram 域名与官方 DC 网段设为代理',
+    rules: [
+      ...['t.me', 'telegram.org', 'telegram.me', 'tdesktop.com', 'telesco.pe']
+        .map((value): RouteRule => ({ type: 'domain_suffix', value, action: 'proxy' })),
+      ...['91.108.4.0/22', '91.108.8.0/22', '91.108.56.0/22', '149.154.160.0/20']
+        .map((value): RouteRule => ({ type: 'ip_cidr', value, action: 'proxy' })),
+    ],
+  },
 ];
 
 export function normalizeRuleDomain(input: string): string {
@@ -186,4 +218,155 @@ export function withMihomoCustomRules(
   const existing = Array.isArray(config.rules) ? config.rules.map(String) : [];
   const prepended = compiled.filter((item, idx) => compiled.indexOf(item) === idx && !existing.includes(item));
   return { ...config, rules: [...prepended, ...existing] };
+}
+
+
+export type RuleMatchEvaluation = {
+  inputKind: 'domain' | 'ip' | 'process_name';
+  normalized: string;
+  matchedIndex: number | null;
+  matchedRule?: RouteRule;
+  action: 'direct' | 'proxy' | 'reject';
+  target?: string;
+};
+
+function parseIpv4BigInt(ip: string): bigint | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let value = 0n;
+  for (const part of parts) {
+    if (!/^(?:0|[1-9]\d{0,2})$/.test(part)) return null;
+    const n = Number(part);
+    if (n > 255) return null;
+    value = (value << 8n) + BigInt(n);
+  }
+  return value;
+}
+
+function parseIpv6BigInt(ip: string): bigint | null {
+  if (!ip.includes(':') || !/^[\da-f:.]+$/i.test(ip)) return null;
+  try {
+    const normalized = new URL(`http://[${ip}]/`).hostname.slice(1, -1);
+    const halves = normalized.split('::');
+    if (halves.length > 2) return null;
+    const expandGroup = (side: string): string[] => (side ? side.split(':') : []);
+    const left = expandGroup(halves[0] ?? '');
+    const right = halves.length === 2 ? expandGroup(halves[1] ?? '') : [];
+    const groups: string[] = [];
+    for (const seg of left) {
+      if (seg.includes('.')) {
+        const v4 = parseIpv4BigInt(seg);
+        if (v4 == null) return null;
+        groups.push(Number((v4 >> 16n) & 0xffffn).toString(16), Number(v4 & 0xffffn).toString(16));
+      } else groups.push(seg);
+    }
+    const rightGroups: string[] = [];
+    for (const seg of right) {
+      if (seg.includes('.')) {
+        const v4 = parseIpv4BigInt(seg);
+        if (v4 == null) return null;
+        rightGroups.push(Number((v4 >> 16n) & 0xffffn).toString(16), Number(v4 & 0xffffn).toString(16));
+      } else rightGroups.push(seg);
+    }
+    if (halves.length === 2) {
+      const missing = 8 - (groups.length + rightGroups.length);
+      if (missing < 1) return null;
+      groups.push(...Array(missing).fill('0'), ...rightGroups);
+    } else if (groups.length !== 8) {
+      return null;
+    }
+    let out = 0n;
+    for (const hex of groups) {
+      if (!/^[\da-f]{1,4}$/i.test(hex)) return null;
+      out = (out << 16n) + BigInt(parseInt(hex, 16));
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+function cidrContains(cidr: string, candidateIp: string): boolean {
+  const [net, prefixStr] = cidr.split('/');
+  if (!net || !prefixStr) return false;
+  const prefix = Number(prefixStr);
+  if (!Number.isInteger(prefix)) return false;
+  if (net.includes(':') !== candidateIp.includes(':')) return false;
+  if (net.includes(':')) {
+    const netVal = parseIpv6BigInt(net);
+    const candVal = parseIpv6BigInt(candidateIp);
+    if (netVal == null || candVal == null || prefix < 0 || prefix > 128) return false;
+    const shift = BigInt(128 - prefix);
+    return (netVal >> shift) === (candVal >> shift);
+  }
+  const netVal = parseIpv4BigInt(net);
+  const candVal = parseIpv4BigInt(candidateIp);
+  if (netVal == null || candVal == null || prefix < 0 || prefix > 32) return false;
+  const shift = BigInt(32 - prefix);
+  return (netVal >> shift) === (candVal >> shift);
+}
+
+export function evaluateRuleMatch(
+  rawInput: string,
+  rules: RouteRule[],
+  defaultAction: RuleDefaultAction = 'proxy',
+): RuleMatchEvaluation {
+  let trimmed = rawInput.trim();
+  if (!trimmed) throw new Error('请输入要测试的域名、IP 或 .exe 进程名');
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      trimmed = new URL(trimmed).hostname;
+    } catch {
+      throw new Error('URL 地址格式无效');
+    }
+  }
+  const maybeExe = trimmed.split(/[\\/]/).pop()?.trim() ?? trimmed;
+  let inputKind: RuleMatchEvaluation['inputKind'];
+  let normalized: string;
+  if (/\.exe$/i.test(maybeExe)) {
+    normalized = normalizeRuleValue('process_name', maybeExe);
+    inputKind = 'process_name';
+  } else {
+    const bareIp = trimmed.replace(/^\[|\]$/g, '');
+    if (parseIpv4BigInt(bareIp) != null || parseIpv6BigInt(bareIp) != null) {
+      normalized = bareIp.includes(':') ? new URL(`http://[${bareIp}]/`).hostname.slice(1, -1) : bareIp;
+      inputKind = 'ip';
+    } else {
+      normalized = normalizeRuleDomain(trimmed);
+      inputKind = 'domain';
+    }
+  }
+
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i];
+    try {
+      const ruleVal = normalizeRuleValue(rule.type, rule.value);
+      let matched = false;
+      if (inputKind === 'domain') {
+        if (rule.type === 'domain') matched = normalized === ruleVal;
+        else if (rule.type === 'domain_suffix') matched = normalized === ruleVal || normalized.endsWith(`.${ruleVal}`);
+      } else if (inputKind === 'ip' && rule.type === 'ip_cidr') {
+        matched = cidrContains(ruleVal, normalized);
+      } else if (inputKind === 'process_name' && rule.type === 'process_name') {
+        matched = normalized.toLowerCase() === ruleVal.toLowerCase();
+      }
+      if (matched) {
+        return {
+          inputKind,
+          normalized,
+          matchedIndex: i,
+          matchedRule: rule,
+          action: rule.action,
+          target: rule.target,
+        };
+      }
+    } catch { /* ignore invalid draft rules */ }
+  }
+
+  return {
+    inputKind,
+    normalized,
+    matchedIndex: null,
+    action: defaultAction,
+  };
 }
