@@ -293,7 +293,13 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         &app,
         true,
     )
-    .unwrap();
+    .unwrap_or_else(|e| {
+        let tail: Vec<String> = crate::logs::read_tail(20)
+            .into_iter()
+            .map(|(_, lvl, msg)| format!("[{lvl}] {msg}"))
+            .collect();
+        panic!("{e}\nlogs:\n{}", tail.join("\n"));
+    });
     assert!(session.running() && session.controller.ready());
     assert!(UdpSocket::bind((TUN_ADDRESS, 0)).is_ok());
     let target_address: std::net::Ipv4Addr = TARGET.parse().unwrap();

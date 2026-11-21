@@ -177,10 +177,6 @@ pub fn prepare_native_tun_with_lan(
         ("auto-detect-interface".into(), json!(true)),
         ("dns-hijack".into(), json!(["any:53", "tcp://any:53"])),
         ("inet4-address".into(), json!(["172.28.254.1/30"])),
-        (
-            "route-exclude-address".into(),
-            json!(["127.0.0.0/8", "::1/128"]),
-        ),
     ]);
     if tun_ipv6 {
         tun.insert("inet6-address".into(), json!(["fdfe:dcba:9876::1/126"]));

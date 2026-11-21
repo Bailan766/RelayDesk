@@ -1050,23 +1050,6 @@ impl Drop for MihomoHome {
 }
 
 impl Session {
-    pub fn start(
-        settings: CoreSettings,
-        port: u16,
-        mode: &str,
-        routing_mode: RoutingMode,
-        recover: bool,
-    ) -> Result<Self, String> {
-        Self::start_with_options(
-            settings,
-            port,
-            mode,
-            routing_mode,
-            recover,
-            SessionOptions::default(),
-        )
-    }
-
     pub fn start_with_options(
         settings: CoreSettings,
         port: u16,
@@ -1533,20 +1516,25 @@ fn stop_core(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn attach_stderr_logger(child: &mut Child, label: &'static str) -> Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>> {
+fn attach_pipe_logger<R: std::io::Read + Send + 'static>(
+    stream: Option<R>,
+    label: &'static str,
+    level: &'static str,
+    tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+) {
     use std::io::{BufRead, BufReader};
-    let stderr = child.stderr.take()?;
-    let tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(12)));
-    let sink = std::sync::Arc::clone(&tail);
+    let Some(stream) = stream else {
+        return;
+    };
     thread::spawn(move || {
-        let reader = BufReader::new(stderr);
+        let reader = BufReader::new(stream);
         for line in reader.lines().map_while(Result::ok) {
             let clean = crate::telemetry::redact_log_payload(&line);
             if clean.is_empty() {
                 continue;
             }
-            crate::logs::append(label, "error", &clean);
-            if let Ok(mut lines) = sink.lock() {
+            crate::logs::append(label, level, &clean);
+            if let Ok(mut lines) = tail.lock() {
                 if lines.len() >= 12 {
                     lines.pop_front();
                 }
@@ -1554,7 +1542,16 @@ fn attach_stderr_logger(child: &mut Child, label: &'static str) -> Option<std::s
             }
         }
     });
-    Some(tail)
+}
+
+fn attach_core_logger(
+    child: &mut Child,
+    label: &'static str,
+) -> std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>> {
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(12)));
+    attach_pipe_logger(child.stdout.take(), label, "info", std::sync::Arc::clone(&tail));
+    attach_pipe_logger(child.stderr.take(), label, "error", std::sync::Arc::clone(&tail));
+    tail
 }
 
 fn start_core(command: &mut Command, job: &Handle, config: &[u8]) -> Result<Child, String> {
@@ -1799,7 +1796,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         }
         command
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(if home.is_some() { Stdio::piped() } else { Stdio::null() })
             .stderr(Stdio::piped());
         command
     };
@@ -1816,13 +1813,14 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     };
     let initial_deadline = Instant::now() + timeout;
     let mut check = start_core(&mut config_command(true), &job, &initial)?;
-    let check_stderr = attach_stderr_logger(&mut check, "core-check");
+    let check_logs = attach_core_logger(&mut check, "core-check");
     loop {
         if let Some(status) = check.try_wait().map_err(|_| "无法完成内核检查")? {
             if !status.success() {
-                let detail = check_stderr
-                    .as_ref()
-                    .and_then(|lines| lines.lock().ok()?.back().cloned());
+                let detail = check_logs
+                    .lock()
+                    .ok()
+                    .and_then(|lines| lines.back().cloned());
                 return Err(match detail {
                     Some(msg) => format!("内核配置检查失败：{msg}"),
                     None => "内核配置检查失败".into(),
@@ -1838,7 +1836,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let launch = |config: &[u8], deadline, interface: &str, recovery: Option<&TunControl>| {
         let mut child = start_core(&mut config_command(false), &job, config)?;
-        let core_stderr = attach_stderr_logger(&mut child, "core");
+        let core_logs = attach_core_logger(&mut child, "core");
         let mut route = None;
         let mut ipv4_ready_at: Option<Instant> = None;
         if let Err(err) = await_core(&mut child, &lifetime, deadline, recovery, || {
@@ -1861,9 +1859,10 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
                 && controller.ready()
         }) {
-            let detail = core_stderr
-                .as_ref()
-                .and_then(|lines| lines.lock().ok()?.back().cloned());
+            let detail = core_logs
+                .lock()
+                .ok()
+                .and_then(|lines| lines.back().cloned());
             return Err(match detail {
                 Some(msg) => format!("{err}：{msg}"),
                 None => err,
