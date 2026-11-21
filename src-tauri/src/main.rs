@@ -392,7 +392,9 @@ async fn check_app_update(state: tauri::State<'_, ProxyState>) -> Result<AppUpda
     if let Some(client) = &proxy_client {
         if let Ok(resp) = client.get(OFFICIAL_API).send().await {
             if let Ok(ok) = resp.error_for_status() {
-                release = ok.json::<LatestRelease>().await.ok();
+                if let Ok(bytes) = ok.bytes().await {
+                    release = serde_json::from_slice::<LatestRelease>(&bytes).ok();
+                }
             }
         }
     }
@@ -400,9 +402,11 @@ async fn check_app_update(state: tauri::State<'_, ProxyState>) -> Result<AppUpda
         for endpoint in [OFFICIAL_API, MIRROR_API] {
             if let Ok(resp) = direct_client.get(endpoint).send().await {
                 if let Ok(ok) = resp.error_for_status() {
-                    if let Ok(parsed) = ok.json::<LatestRelease>().await {
-                        release = Some(parsed);
-                        break;
+                    if let Ok(bytes) = ok.bytes().await {
+                        if let Ok(parsed) = serde_json::from_slice::<LatestRelease>(&bytes) {
+                            release = Some(parsed);
+                            break;
+                        }
                     }
                 }
             }
