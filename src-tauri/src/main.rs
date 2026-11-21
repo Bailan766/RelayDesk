@@ -13,6 +13,7 @@ mod failover;
 mod mihomo;
 mod network;
 mod probes;
+mod service;
 mod storage;
 mod supervisor;
 mod system_proxy;
@@ -330,6 +331,31 @@ async fn close_all_connections(state: tauri::State<'_, ProxyState>) -> Result<()
 }
 
 #[tauri::command]
+fn get_tun_service_status() -> service::ServiceStatusInfo {
+    service::query_status()
+}
+
+#[tauri::command]
+async fn install_tun_service(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = app.state::<ProxyState>().stop();
+        service::install_elevated()
+    })
+    .await
+    .map_err(|_| "安装后台服务任务异常".to_string())?
+}
+
+#[tauri::command]
+async fn uninstall_tun_service(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = app.state::<ProxyState>().stop();
+        service::uninstall_elevated()
+    })
+    .await
+    .map_err(|_| "卸载后台服务任务异常".to_string())?
+}
+
+#[tauri::command]
 fn is_elevated() -> bool {
     network::is_elevated()
 }
@@ -391,8 +417,10 @@ fn update_tray_state(
     running: bool,
     summary: String,
     routing_mode: String,
+    entry_mode: Option<String>,
     app: tauri::AppHandle,
 ) {
+    let entry = entry_mode.unwrap_or_else(|| "system".to_owned());
     if let Some(ui) = app.try_state::<TrayUi>() {
         let status_text = if running {
             format!("状态：运行中 · {summary}")
@@ -404,6 +432,9 @@ fn update_tray_state(
         let _ = ui.rule.set_checked(routing_mode == "rule");
         let _ = ui.global.set_checked(routing_mode == "global");
         let _ = ui.direct.set_checked(routing_mode == "direct");
+        let _ = ui.entry_system.set_checked(entry == "system");
+        let _ = ui.entry_tun.set_checked(entry == "tun");
+        let _ = ui.entry_local.set_checked(entry == "local");
     }
     if let Some(tray) = app.tray_by_id("main-tray") {
         let tip = if running {
@@ -821,6 +852,9 @@ struct TrayUi {
     rule: tauri::menu::CheckMenuItem<tauri::Wry>,
     global: tauri::menu::CheckMenuItem<tauri::Wry>,
     direct: tauri::menu::CheckMenuItem<tauri::Wry>,
+    entry_system: tauri::menu::CheckMenuItem<tauri::Wry>,
+    entry_tun: tauri::menu::CheckMenuItem<tauri::Wry>,
+    entry_local: tauri::menu::CheckMenuItem<tauri::Wry>,
 }
 
 #[cfg(windows)]
@@ -937,6 +971,9 @@ mod win_reg {
 }
 
 fn main() {
+    if let Some(code) = service::cli() {
+        std::process::exit(code);
+    }
     if let Some(code) = network::cli() {
         std::process::exit(code);
     }
@@ -959,12 +996,16 @@ fn main() {
             let global = CheckMenuItem::with_id(app, "mode_global", "全局模式", true, false, None::<&str>)?;
             let direct = CheckMenuItem::with_id(app, "mode_direct", "直连模式", true, false, None::<&str>)?;
             let mode_menu = Submenu::with_items(app, "路由模式", true, &[&rule, &global, &direct])?;
+            let entry_system = CheckMenuItem::with_id(app, "entry_system", "系统代理", true, true, None::<&str>)?;
+            let entry_tun = CheckMenuItem::with_id(app, "entry_tun", "TUN 虚拟网卡", true, false, None::<&str>)?;
+            let entry_local = CheckMenuItem::with_id(app, "entry_local", "仅本地端口", true, false, None::<&str>)?;
+            let entry_menu = Submenu::with_items(app, "接管方式", true, &[&entry_system, &entry_tun, &entry_local])?;
             let stop = MenuItem::with_id(app, "stop", "停止代理", true, None::<&str>)?;
             let sep2 = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "彻底退出", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
-                &[&status, &sep1, &show, &toggle, &mode_menu, &stop, &sep2, &quit],
+                &[&status, &sep1, &show, &toggle, &mode_menu, &entry_menu, &stop, &sep2, &quit],
             )?;
             app.manage(TrayUi {
                 status,
@@ -972,6 +1013,9 @@ fn main() {
                 rule,
                 global,
                 direct,
+                entry_system,
+                entry_tun,
+                entry_local,
             });
             let mut tray = TrayIconBuilder::with_id("main-tray")
                 .tooltip("RelayDesk · 未连接")
@@ -990,6 +1034,15 @@ fn main() {
                     }
                     "mode_direct" => {
                         let _ = app.emit("tray-action", "mode:direct");
+                    }
+                    "entry_system" => {
+                        let _ = app.emit("tray-action", "entry:system");
+                    }
+                    "entry_tun" => {
+                        let _ = app.emit("tray-action", "entry:tun");
+                    }
+                    "entry_local" => {
+                        let _ = app.emit("tray-action", "entry:local");
                     }
                     "stop" => {
                         let app = app.clone();
@@ -1071,6 +1124,9 @@ fn main() {
             check_unlock_service,
             local_tcp_google,
             is_elevated,
+            get_tun_service_status,
+            install_tun_service,
+            uninstall_tun_service,
             relaunch_elevated,
             get_autostart,
             set_autostart,

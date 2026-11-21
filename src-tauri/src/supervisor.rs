@@ -105,7 +105,7 @@ impl Running {
             self.plan.recover,
             &self.plan.mode,
             self.failures,
-            network::is_elevated(),
+            network::is_elevated() || self.session.using_service(),
         )
     }
 }
@@ -343,6 +343,12 @@ impl Supervisor {
                 active
                     .session
                     .remember_tun_route(active.plan.routing_mode, &active.plan.settings.config);
+                if active.plan.settings.core == network::Core::Mihomo {
+                    active.session.sync_mihomo_config(
+                        &active.plan.settings.config,
+                        &active.plan.settings.selections,
+                    );
+                }
                 active.health.reset();
                 slot.message = notice;
                 slot.record("info", event);

@@ -242,14 +242,19 @@ impl Handle {
     }
 
     fn signaled(&self, timeout: u32) -> bool {
+        if self.0.is_null() {
+            return false;
+        }
         unsafe { WaitForSingleObject(self.0, timeout) == WAIT_OBJECT_0 }
     }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.0);
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
         }
     }
 }
@@ -807,6 +812,7 @@ pub struct Session {
     policy: Option<Box<Session>>,
     tun_control: Option<TunControl>,
     staged_policy_recovery: Option<u32>,
+    service: Option<crate::service::ServiceSession>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1006,6 +1012,26 @@ impl Session {
         recover: bool,
         options: SessionOptions,
     ) -> Result<Self, String> {
+        if mode == "tun" {
+            if let Some(result) =
+                crate::service::try_start_tun(&settings, port, routing_mode, recover, &options)
+            {
+                let service = result?;
+                return Ok(Self {
+                    worker: Handle(ptr::null_mut()),
+                    stop: Handle(ptr::null_mut()),
+                    port: service.port,
+                    controller: service.controller.clone(),
+                    id: service.id.clone(),
+                    tun_dns: service.tun_dns,
+                    allow_lan: service.allow_lan,
+                    policy: None,
+                    tun_control: None,
+                    staged_policy_recovery: None,
+                    service: Some(service),
+                });
+            }
+        }
         let executable = env::current_exe().map_err(|_| "无法定位当前应用")?;
         Self::start_using_with_options(
             settings,
@@ -1238,6 +1264,7 @@ impl Session {
             policy: None,
             tun_control,
             staged_policy_recovery: None,
+            service: None,
         };
         let deadline = Instant::now()
             + if core == Core::Mihomo {
@@ -1265,11 +1292,24 @@ impl Session {
         .into())
     }
 
+    pub fn using_service(&self) -> bool {
+        self.service.is_some()
+    }
+
     pub fn running(&self) -> bool {
+        if let Some(svc) = &self.service {
+            return svc.state.running.load(std::sync::atomic::Ordering::Acquire);
+        }
         !self.worker.signaled(0) && self.policy.as_ref().is_none_or(|policy| policy.running())
     }
 
     pub fn recovering_tun(&self) -> bool {
+        if let Some(svc) = &self.service {
+            return svc
+                .state
+                .recovering
+                .load(std::sync::atomic::Ordering::Acquire);
+        }
         self.tun_control
             .as_ref()
             .is_some_and(TunControl::recovering)
@@ -1284,6 +1324,12 @@ impl Session {
     }
 
     pub fn generation(&self) -> u32 {
+        if let Some(svc) = &self.service {
+            return svc
+                .state
+                .generation
+                .load(std::sync::atomic::Ordering::Acquire);
+        }
         self.tun_control
             .as_ref()
             .map_or(0, TunControl::generation)
@@ -1291,6 +1337,10 @@ impl Session {
     }
 
     pub fn configure_tun_recovery(&self, enabled: bool) {
+        if let Some(svc) = &self.service {
+            let _ = svc.send_command(&crate::service::PipeCommand::SetRecovery { enabled });
+            return;
+        }
         if let Some(control) = &self.tun_control {
             control.set_recovery(enabled);
         }
@@ -1300,6 +1350,9 @@ impl Session {
     }
 
     pub fn needs_policy_restart(&self) -> bool {
+        if self.service.is_some() {
+            return false;
+        }
         self.policy
             .as_ref()
             .and_then(|policy| policy.tun_control.as_ref())
@@ -1315,6 +1368,9 @@ impl Session {
         settings: &CoreSettings,
         mode: RoutingMode,
     ) -> Result<(), String> {
+        if self.service.is_some() {
+            return Ok(());
+        }
         let Some((policy, (dns, system_dns))) = self.policy.as_ref().zip(self.tun_dns) else {
             return Ok(());
         };
@@ -1340,8 +1396,24 @@ impl Session {
     }
 
     pub fn remember_tun_route(&self, mode: RoutingMode, config: &Value) {
+        if let Some(svc) = &self.service {
+            let _ = svc.send_command(&crate::service::PipeCommand::SyncRouting {
+                routing_mode: mode,
+                config: config.clone(),
+            });
+            return;
+        }
         if let Some(control) = &self.tun_control {
             control.set_routing(mode, config);
+        }
+    }
+
+    pub fn sync_mihomo_config(&self, config: &Value, selections: &BTreeMap<String, String>) {
+        if let Some(svc) = &self.service {
+            let _ = svc.send_command(&crate::service::PipeCommand::SyncMihomo {
+                config: config.clone(),
+                selections: selections.clone(),
+            });
         }
     }
 
@@ -1353,6 +1425,9 @@ impl Session {
     }
 
     pub fn stop(mut self) -> Result<(), String> {
+        if let Some(svc) = self.service.take() {
+            return svc.stop();
+        }
         let capture = self.stop_worker();
         let policy = self
             .policy
@@ -1395,8 +1470,10 @@ fn auxiliary_port(excluded: &[u16]) -> Result<u16, String> {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        unsafe {
-            SetEvent(self.stop.0);
+        if !self.stop.0.is_null() {
+            unsafe {
+                SetEvent(self.stop.0);
+            }
         }
     }
 }

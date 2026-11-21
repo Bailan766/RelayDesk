@@ -7,6 +7,7 @@ export function RulesEditor({
   defaultAction,
   dirtyWhileRunning,
   running,
+  isMihomo = false,
   onDefaultAction,
   onChange,
   onApplyReconnect,
@@ -16,6 +17,7 @@ export function RulesEditor({
   defaultAction: RuleDefaultAction;
   dirtyWhileRunning: boolean;
   running: boolean;
+  isMihomo?: boolean;
   onDefaultAction: (action: RuleDefaultAction) => void;
   onChange: (edit: (rules: RouteRule[]) => RouteRule[]) => void;
   onApplyReconnect: () => void;
@@ -101,9 +103,9 @@ export function RulesEditor({
   return (
     <section className="panel">
       <div className="panel-head">
-        <h2>节点模式分流规则 ({rules.length})</h2>
+        <h2>分流规则 ({rules.length})</h2>
         <label className="refresh-setting">
-          未命中时默认动作
+          未命中时默认动作{isMihomo ? "（节点模式）" : ""}
           <select value={defaultAction} onChange={e => onDefaultAction(e.target.value as RuleDefaultAction)}>
             <option value="proxy">代理（当前节点）</option>
             <option value="direct">直连（仅命中规则走代理）</option>
@@ -111,13 +113,13 @@ export function RulesEditor({
         </label>
       </div>
       <p className="rule-hint">
-        按从上到下顺序匹配，仅作用于节点模式；使用 Mihomo 原配置时以其自带规则为准。
+        按从上到下优先匹配，同时作用于节点模式与 Mihomo 原配置头部前置规则。
       </p>
       {dirtyWhileRunning && running && (
         <div className="notice is-warn" role="status">
-          <span>规则或默认动作已修改，重新连接节点模式后立即生效。</span>
+          <span>{isMihomo ? "分流规则已修改，点击热重载即时生效（不断网）。" : "规则或默认动作已修改，重新连接后立即生效。"}</span>
           <button type="button" className="mini-btn is-primary" onClick={onApplyReconnect}>
-            立即重连应用
+            {isMihomo ? "立即热重载生效" : "立即重连应用"}
           </button>
         </div>
       )}

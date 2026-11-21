@@ -8,12 +8,23 @@ import {
   type Workspace,
 } from "../workspace";
 
+export type TunServiceStatus = {
+  installed: boolean;
+  running: boolean;
+  version: string | null;
+  upToDate: boolean;
+};
+
 export function SettingsPage({
   workspace,
   ready,
   busy,
   running,
   elevated,
+  serviceStatus,
+  serviceBusy,
+  onInstallService,
+  onUninstallService,
   onSave,
 }: {
   workspace: Workspace;
@@ -21,6 +32,10 @@ export function SettingsPage({
   busy: boolean;
   running: boolean;
   elevated: boolean;
+  serviceStatus: TunServiceStatus | null;
+  serviceBusy: boolean;
+  onInstallService: () => void;
+  onUninstallService: () => void;
   onSave: (edit: (previous: Workspace) => Workspace) => Promise<void>;
 }) {
   const [autostart, setAutostart] = useState(false);
@@ -199,6 +214,54 @@ export function SettingsPage({
 
       <section className="panel">
         <div className="panel-head"><h2>Windows TUN 与权限</h2></div>
+        <div className="setting-item">
+          <div className="setting-label">
+            <strong>后台服务模式（免 UAC 开 TUN）</strong>
+            <small>
+              {serviceStatus?.installed && serviceStatus.running && serviceStatus.upToDate
+                ? `服务已运行（v${serviceStatus.version}）：开启 TUN 无需再次提权或弹 UAC`
+                : serviceStatus?.installed
+                  ? "服务已安装但未启动或版本过期，建议更新后即可免 UAC 开 TUN"
+                  : "一次授权安装 Windows 后台服务，之后普通权限启停 TUN 零弹窗"}
+            </small>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {serviceStatus?.installed ? (
+              <>
+                <span className={`tag ${serviceStatus.running && serviceStatus.upToDate ? "is-good" : "is-warn"}`}>
+                  {serviceStatus.running && serviceStatus.upToDate ? "运行中 · 免 UAC" : "需更新 / 未启动"}
+                </span>
+                {(!serviceStatus.running || !serviceStatus.upToDate) && (
+                  <button
+                    type="button"
+                    className="mini-btn is-primary"
+                    disabled={!isTauri() || serviceBusy || busy}
+                    onClick={onInstallService}
+                  >
+                    {serviceBusy ? "处理中…" : "更新并启动服务"}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={!isTauri() || serviceBusy || busy}
+                  onClick={onUninstallService}
+                >
+                  {serviceBusy ? "处理中…" : "卸载服务"}
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="mini-btn is-primary"
+                disabled={!isTauri() || serviceBusy || busy}
+                onClick={onInstallService}
+              >
+                {serviceBusy ? "安装中…" : "安装并启用服务"}
+              </button>
+            )}
+          </div>
+        </div>
         <div className="setting-item">
           <div className="setting-label">
             <strong>当前进程权限</strong>

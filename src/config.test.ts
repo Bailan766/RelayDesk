@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildConfig, buildSessionConfig, normalizeRuleValue, rulePresets } from './config';
+import { buildConfig, buildSessionConfig, normalizeRuleValue, rulePresets, withMihomoCustomRules } from './config';
 import { parseSubscription } from './subscription';
 
 describe('sing-box configuration', () => {
@@ -77,5 +77,26 @@ describe('sing-box configuration', () => {
     expect(built.outbounds[0].tls).toMatchObject({ enabled: true, server_name: 'tls.test', disable_sni: true });
     expect(built.route.final).toBe('direct');
     expect(built.route.rules.length).toBe(rulePresets[0].rules.length);
+  });
+
+  it('compiles custom RelayDesk rules cleanly ahead of Mihomo original rules', () => {
+    const base = {
+      proxies: [{ name: 'HK-01', type: 'trojan', server: 'hk.test', port: 443, password: 'x' }],
+      'proxy-groups': [{ name: 'Proxy', type: 'select', proxies: ['HK-01', 'DIRECT'] }],
+      rules: ['MATCH,Proxy'],
+    };
+    const merged = withMihomoCustomRules(base, [
+      { type: 'domain', value: 'internal.corp', action: 'direct' },
+      { type: 'domain_suffix', value: 'ads.test', action: 'reject' },
+      { type: 'ip_cidr', value: '192.168.0.0/16', action: 'direct' },
+      { type: 'process_name', value: 'antigravity.exe', action: 'proxy', target: 'node-hk' },
+    ], new Map([['node-hk', 'HK-01']]));
+    expect(merged.rules).toEqual([
+      'DOMAIN,internal.corp,DIRECT',
+      'DOMAIN-SUFFIX,ads.test,REJECT',
+      'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve',
+      'PROCESS-NAME,antigravity.exe,HK-01',
+      'MATCH,Proxy',
+    ]);
   });
 });

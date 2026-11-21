@@ -148,3 +148,42 @@ export function connectionSupport(node: NodeProfile): string | null {
   try { buildConfig(node, 12345); return null; }
   catch (error) { return error instanceof Error ? error.message : '此节点暂不支持连接'; }
 }
+
+export function withMihomoCustomRules(
+  config: Fields,
+  rules: RouteRule[],
+  targetNames?: ReadonlyMap<string, string>,
+): Fields {
+  if (!rules.length) return config;
+  const groups = Array.isArray(config['proxy-groups']) ? (config['proxy-groups'] as Fields[]) : [];
+  const proxies = Array.isArray(config.proxies) ? (config.proxies as Fields[]) : [];
+  const validTargets = new Set<string>(['DIRECT', 'REJECT']);
+  for (const g of groups) if (typeof g?.name === 'string' && g.name) validTargets.add(g.name);
+  for (const p of proxies) if (typeof p?.name === 'string' && p.name) validTargets.add(p.name);
+
+  const primaryGroup =
+    groups.find(g => g?.type === 'select' && typeof g.name === 'string' && g.name !== 'GLOBAL')?.name ??
+    groups.find(g => typeof g?.name === 'string' && g.name !== 'GLOBAL')?.name ??
+    (typeof proxies[0]?.name === 'string' ? proxies[0].name : 'DIRECT');
+
+  const compiled: string[] = [];
+  for (const rule of rules) {
+    try {
+      const value = normalizeRuleValue(rule.type, rule.value);
+      let actionTarget = rule.action === 'direct' ? 'DIRECT' : rule.action === 'reject' ? 'REJECT' : String(primaryGroup);
+      if (rule.action === 'proxy' && rule.target) {
+        const mapped = targetNames?.get(rule.target);
+        if (!mapped || !validTargets.has(mapped)) actionTarget = 'REJECT';
+        else actionTarget = mapped;
+      }
+      if (rule.type === 'domain') compiled.push(`DOMAIN,${value},${actionTarget}`);
+      else if (rule.type === 'domain_suffix') compiled.push(`DOMAIN-SUFFIX,${value},${actionTarget}`);
+      else if (rule.type === 'ip_cidr') compiled.push(`IP-CIDR,${value},${actionTarget},no-resolve`);
+      else if (rule.type === 'process_name') compiled.push(`PROCESS-NAME,${value},${actionTarget}`);
+    } catch { /* ignore malformed draft rule */ }
+  }
+  if (!compiled.length) return config;
+  const existing = Array.isArray(config.rules) ? config.rules.map(String) : [];
+  const prepended = compiled.filter((item, idx) => compiled.indexOf(item) === idx && !existing.includes(item));
+  return { ...config, rules: [...prepended, ...existing] };
+}

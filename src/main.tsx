@@ -34,6 +34,7 @@ import {
   buildConfig,
   buildSessionConfig,
   connectionSupport,
+  withMihomoCustomRules,
   withSelectedOutbound,
   type RouteRule,
   type SessionPlan,
@@ -46,7 +47,7 @@ import { MihomoGroups } from "./MihomoGroups";
 import { EventLog } from "./EventLog";
 import { RulesEditor } from "./components/RulesEditor";
 import { UnlockTests } from "./components/UnlockTests";
-import { SettingsPage } from "./components/SettingsPage";
+import { SettingsPage, type TunServiceStatus } from "./components/SettingsPage";
 import { ImportModal } from "./components/ImportModal";
 import { useWorkspace } from "./useWorkspace";
 import {
@@ -183,6 +184,7 @@ function App() {
       ),
     [subscriptions, unavailableNodes],
   );
+  const ruleNodeNameMap = useMemo(() => new Map(nodes.map(n => [n.id, n.name])), [nodes]);
 
   const [subscriptionFilter, setSubscriptionFilter] = useState("");
   const [protocolFilter, setProtocolFilter] = useState("");
@@ -250,13 +252,15 @@ function App() {
   const [localTcp, setLocalTcp] = useState("尚未测试");
   const [localTcpBusy, setLocalTcpBusy] = useState(false);
   const [elevated, setElevated] = useState(false);
+  const [serviceStatus, setServiceStatus] = useState<TunServiceStatus | null>(null);
+  const [serviceBusy, setServiceBusy] = useState(false);
   const cancelTesting = useRef(false);
   const probeBatch = useRef<string>();
   const probeSessionId = useRef<string>();
   const autoConnectRan = useRef(false);
 
   const currentRulesKey = useMemo(() => JSON.stringify({ rules, ruleDefaultAction }), [rules, ruleDefaultAction]);
-  const rulesDirtyWhileRunning = running && !runningOriginal && appliedRulesKey !== "" && appliedRulesKey !== currentRulesKey;
+  const rulesDirtyWhileRunning = running && appliedRulesKey !== "" && appliedRulesKey !== currentRulesKey;
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -266,11 +270,56 @@ function App() {
     setLatencies(prev => ({ ...nodeLatencies, ...prev }));
   }, [nodeLatencies]);
 
+  async function refreshServiceStatus() {
+    if (!isTauri()) return;
+    try {
+      const next = await invoke<TunServiceStatus>("get_tun_service_status");
+      setServiceStatus(next);
+    } catch { /* ignore on unsupported platforms */ }
+  }
+
   useEffect(() => {
     if (!isTauri() || !work.ready) return;
     void invoke<boolean>("is_elevated").then(setElevated).catch(() => {});
+    void refreshServiceStatus();
     void invoke("set_close_action", { exitOnClose: closeAction === "exit" }).catch(() => {});
   }, [closeAction, work.ready]);
+
+  async function handleInstallService() {
+    if (!isTauri() || serviceBusy) return;
+    setServiceBusy(true);
+    setSettingsError("");
+    setConnectionError("");
+    try {
+      await invoke("install_tun_service");
+      if (running) clearSession();
+      await refreshServiceStatus();
+    } catch (e) {
+      const msg = typeof e === "string" ? e : e instanceof Error ? e.message : "安装后台服务失败";
+      setSettingsError(msg);
+      setConnectionError(msg);
+    } finally {
+      setServiceBusy(false);
+    }
+  }
+
+  async function handleUninstallService() {
+    if (!isTauri() || serviceBusy) return;
+    setServiceBusy(true);
+    setSettingsError("");
+    setConnectionError("");
+    try {
+      await invoke("uninstall_tun_service");
+      if (running) clearSession();
+      await refreshServiceStatus();
+    } catch (e) {
+      const msg = typeof e === "string" ? e : e instanceof Error ? e.message : "卸载后台服务失败";
+      setSettingsError(msg);
+      setConnectionError(msg);
+    } finally {
+      setServiceBusy(false);
+    }
+  }
 
   async function saveSettings(edit: (previous: Workspace) => Workspace) {
     setSettingsError("");
@@ -365,11 +414,12 @@ function App() {
 
   useEffect(() => {
     if (!isTauri() || !work.ready) return;
-    const summary = originalName
+    const base = originalName
       ? `${originalName} (Mihomo)`
       : current?.name ?? "未选择节点";
-    void invoke("update_tray_state", { running, summary, routingMode }).catch(() => {});
-  }, [current?.name, originalName, routingMode, running, work.ready]);
+    const summary = running && port ? `${base} · 127.0.0.1:${port}` : base;
+    void invoke("update_tray_state", { running, summary, routingMode, entryMode: mode }).catch(() => {});
+  }, [current?.name, mode, originalName, port, routingMode, running, work.ready]);
 
   const activeFilter = subscriptions.find(profile => profile.id === subscriptionFilter);
   function probe(node: NodeProfile) {
@@ -744,7 +794,7 @@ function App() {
           ? profile.parsed.mihomo.mode
           : "rule");
       await invoke("start_mihomo", {
-        config: profile.parsed.mihomo,
+        config: withMihomoCustomRules(profile.parsed.mihomo, rules, ruleNodeNameMap),
         port: localPort,
         mode,
         routingMode: originalMode,
@@ -756,6 +806,7 @@ function App() {
       });
       setRunningOriginal({ id: profile.id, name: profile.name, content: profile.content });
       setLiveRouting(originalMode);
+      setAppliedRulesKey(currentRulesKey);
       setPort(localPort);
       setRunning(true);
       setPage("概览");
@@ -978,11 +1029,79 @@ function App() {
     setBusy(true);
     setConnectionError("");
     try {
-      await invoke("reload_mihomo", { config: next.parsed.mihomo });
+      await invoke("reload_mihomo", {
+        config: withMihomoCustomRules(next.parsed.mihomo, rules, ruleNodeNameMap),
+      });
       setRunningOriginal({ id: next.id, name: next.name, content: next.content });
+      setAppliedRulesKey(currentRulesKey);
       resetDiagnostics();
     } catch (failure) {
       setConnectionError(typeof failure === "string" ? failure : "配置更新失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startActiveWithEntry(entryModeOverride?: EntryMode) {
+    const targetMode = entryModeOverride ?? mode;
+    const original = originalProfile?.parsed.mihomo;
+    if (!original && !preferred) throw new Error("请先导入并选择节点或原配置");
+    const localPort = proxyPort ?? (await invoke<number>("allocate_stable_port"));
+    if (original && originalProfile) {
+      const originalMode =
+        originalProfile.mihomoMode ??
+        (original.mode === "global" || original.mode === "direct" ? original.mode : "rule");
+      await invoke("start_mihomo", {
+        config: withMihomoCustomRules(original, rules, ruleNodeNameMap),
+        port: localPort,
+        mode: targetMode,
+        routingMode: originalMode,
+        autoReconnect,
+        selections: originalProfile.mihomoSelections,
+        allowLan,
+        bypass: systemProxyBypass,
+        tunIpv6,
+      });
+      setRunningOriginal({ id: originalProfile.id, name: originalProfile.name, content: originalProfile.content });
+      setLiveRouting(originalMode);
+      setAppliedRulesKey(currentRulesKey);
+    } else if (preferred) {
+      const next = await prepareSession(preferred, localPort);
+      await invoke("start_proxy", {
+        config: next.config,
+        mode: targetMode,
+        routingMode,
+        autoReconnect,
+        autoFailover,
+        fallbackGroups: fallbackGroups(next, subscriptions, starred),
+        allowLan,
+        bypass: systemProxyBypass,
+        tunIpv6,
+      });
+      session.current = next;
+      setRunningNode(preferred);
+      setLiveRouting(routingMode);
+      setAppliedRulesKey(currentRulesKey);
+    }
+    setPort(localPort);
+    setRunning(true);
+    void checkProxy(localPort, true);
+  }
+
+  async function switchEntryFromTray(nextEntry: EntryMode) {
+    if (busy || recovering || !work.ready || nextEntry === mode) return;
+    await saveSettings(state => ({ ...state, entryMode: nextEntry }));
+    if (!running) return;
+    setBusy(true);
+    setConnectionError("");
+    resetDiagnostics();
+    try {
+      await invoke("stop_proxy");
+      clearSession();
+      await startActiveWithEntry(nextEntry);
+    } catch (e) {
+      clearSession();
+      setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "切换接管模式失败");
     } finally {
       setBusy(false);
     }
@@ -999,37 +1118,7 @@ function App() {
         await invoke("stop_proxy");
         clearSession();
       } else {
-        const original = originalProfile?.parsed.mihomo;
-        if (!original && !preferred) throw new Error("请先导入并选择节点或原配置");
-        const localPort = proxyPort ?? (await invoke<number>("allocate_stable_port"));
-        if (original && originalProfile) {
-          const originalMode =
-            originalProfile.mihomoMode ??
-            (original.mode === "global" || original.mode === "direct" ? original.mode : "rule");
-          await invoke("start_mihomo", {
-            config: original,
-            port: localPort,
-            mode,
-            routingMode: originalMode,
-            autoReconnect,
-            selections: originalProfile.mihomoSelections,
-            allowLan,
-            bypass: systemProxyBypass,
-            tunIpv6,
-          });
-          setRunningOriginal({ id: originalProfile.id, name: originalProfile.name, content: originalProfile.content });
-          setLiveRouting(originalMode);
-        } else if (preferred) {
-          const next = await prepareSession(preferred, localPort);
-          await startProxy(next);
-          session.current = next;
-          setRunningNode(preferred);
-          setLiveRouting(routingMode);
-          setAppliedRulesKey(currentRulesKey);
-        }
-        setPort(localPort);
-        setRunning(true);
-        void checkProxy(localPort, true);
+        await startActiveWithEntry();
       }
     } catch (e) {
       setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "连接失败");
@@ -1067,6 +1156,8 @@ function App() {
   toggleProxyRef.current = toggleProxy;
   const changeRoutingRef = useRef(changeRouting);
   changeRoutingRef.current = changeRouting;
+  const switchEntryRef = useRef(switchEntryFromTray);
+  switchEntryRef.current = switchEntryFromTray;
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -1077,6 +1168,9 @@ function App() {
       else if (action === "mode:rule") void changeRoutingRef.current("rule");
       else if (action === "mode:global") void changeRoutingRef.current("global");
       else if (action === "mode:direct") void changeRoutingRef.current("direct");
+      else if (action === "entry:system") void switchEntryRef.current("system");
+      else if (action === "entry:tun") void switchEntryRef.current("tun");
+      else if (action === "entry:local") void switchEntryRef.current("local");
     }).then(fn => {
       unlisten = fn;
     });
@@ -1128,7 +1222,7 @@ function App() {
           <div className="brand-mark"><Cat size={18} /></div>
           <div>
             <strong>RelayDesk</strong>
-            <small>v1.1.0</small>
+            <small>v1.2.0</small>
           </div>
         </div>
         <nav>
@@ -1271,17 +1365,30 @@ function App() {
                       {busy ? "处理中…" : running ? "断开" : "连接"}
                     </button>
                   </div>
-                  {mode === "tun" && !running && !elevated && (
-                    <small className="muted">
-                      普通权限开 TUN 会弹窗授权
-                      <button
-                        type="button"
-                        className="link inline-action"
-                        onClick={() => void invoke("relaunch_elevated").catch(() => {})}
-                      >
-                        以管理员模式重启
-                      </button>
-                    </small>
+                  {mode === "tun" && !running && (
+                    serviceStatus?.running && serviceStatus.upToDate ? (
+                      <small className="muted">后台服务已就绪：开启 TUN 免 UAC 弹窗</small>
+                    ) : !elevated && (
+                      <small className="muted">
+                        TUN 需权限
+                        <button
+                          type="button"
+                          className="link inline-action"
+                          disabled={serviceBusy || busy}
+                          onClick={() => void handleInstallService()}
+                        >
+                          {serviceBusy ? "安装中…" : serviceStatus?.installed ? "更新后台服务" : "安装免 UAC 服务"}
+                        </button>
+                        {" · "}
+                        <button
+                          type="button"
+                          className="link inline-action"
+                          onClick={() => void invoke("relaunch_elevated").catch(() => {})}
+                        >
+                          管理员重启
+                        </button>
+                      </small>
+                    )
                   )}
                 </div>
               </section>
@@ -1289,9 +1396,14 @@ function App() {
               {connectionError && <div className="notice is-error" role="alert">{connectionError}</div>}
               {rulesDirtyWhileRunning && (
                 <div className="notice is-warn" role="status">
-                  <span>分流规则已修改，重新连接后生效。</span>
-                  <button type="button" className="mini-btn is-primary" disabled={busy} onClick={() => void reconnectNodeSession()}>
-                    立即重连应用
+                  <span>{runningOriginal ? "分流规则已修改，点击热重载即时生效（不断网）。" : "分流规则已修改，重新连接后生效。"}</span>
+                  <button
+                    type="button"
+                    className="mini-btn is-primary"
+                    disabled={busy || recovering}
+                    onClick={() => void (runningOriginal ? applyOriginalUpdate() : reconnectNodeSession())}
+                  >
+                    {runningOriginal ? "立即热重载生效" : "立即重连应用"}
                   </button>
                 </div>
               )}
@@ -1916,10 +2028,11 @@ function App() {
               targets={ruleTargets}
               defaultAction={ruleDefaultAction}
               dirtyWhileRunning={rulesDirtyWhileRunning}
-              running={running && !runningOriginal}
+              running={running}
+              isMihomo={!!runningOriginal || !!originalProfile}
               onDefaultAction={action => void saveSettings(state => ({ ...state, ruleDefaultAction: action }))}
               onChange={edit => void saveSettings(state => ({ ...state, rules: edit(state.rules) }))}
-              onApplyReconnect={() => void reconnectNodeSession()}
+              onApplyReconnect={() => void (runningOriginal ? applyOriginalUpdate() : reconnectNodeSession())}
             />
           )}
 
@@ -1974,6 +2087,10 @@ function App() {
               busy={busy}
               running={running}
               elevated={elevated}
+              serviceStatus={serviceStatus}
+              serviceBusy={serviceBusy}
+              onInstallService={() => void handleInstallService()}
+              onUninstallService={() => void handleUninstallService()}
               onSave={saveSettings}
             />
           )}

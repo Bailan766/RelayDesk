@@ -5,7 +5,7 @@
 ## 版本与交付
 
 - 仓库：`Bailan766/RelayDesk`，默认分支为 `main`。
-- 版本：`1.1.0`（[tauri.conf.json](../src-tauri/tauri.conf.json)、[package.json](../package.json)、[Cargo.toml](../src-tauri/Cargo.toml)）。
+- 版本：`1.2.0`（[tauri.conf.json](../src-tauri/tauri.conf.json)、[package.json](../package.json)、[Cargo.toml](../src-tauri/Cargo.toml)）。
 - 产物：Windows x64 安装版和便携版，由 [Windows 工作流](../.github/workflows/windows.yml) 构建；非带 `-` 后缀的 `v*` 标签自动发布为正式 Release。
 - 固定内核：sing-box `1.14.4` 和 Mihomo `1.19.34`。
 
@@ -24,7 +24,8 @@
 | [src/subscription.ts](../src/subscription.ts)、[src/outbound.ts](../src/outbound.ts) | 订阅解析、兼容字段映射与支持情况判定。 |
 | [src/workspace.ts](../src/workspace.ts)、[src/useWorkspace.ts](../src/useWorkspace.ts) | 多订阅持久化、延迟缓存、扩展桌面设置与自动刷新。 |
 | [src-tauri/src/main.rs](../src-tauri/src/main.rs) | Tauri 命令、增强托盘菜单、开机自启、提权重启与订阅下载。 |
-| [src-tauri/src/network.rs](../src-tauri/src/network.rs) | 网络工作进程、自适应 IPv6 TUN 启停、Allow LAN 与路由恢复。 |
+| [src-tauri/src/network.rs](../src-tauri/src/network.rs) | 网络工作进程、自适应 IPv6 TUN 启停、Allow LAN、服务桥接与路由恢复。 |
+| [src-tauri/src/service.rs](../src-tauri/src/service.rs) | Windows 常驻后台服务 `RelayDeskTunService`、命名管道与目录 ACL 隔离。 |
 | [src-tauri/src/supervisor.rs](../src-tauri/src/supervisor.rs) | 会话状态、内核恢复、连接控制、测速接口与自动换线。 |
 | [src-tauri/src/mihomo.rs](../src-tauri/src/mihomo.rs) | Mihomo 原配置准备、LAN 选项与策略恢复。 |
 | [src-tauri/src/system_proxy.rs](../src-tauri/src/system_proxy.rs) | Windows 系统代理与自定义 Bypass 列表设置和恢复。 |

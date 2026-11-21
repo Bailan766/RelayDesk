@@ -3,10 +3,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
-import { buildConfig } from './config';
+import { buildConfig, withMihomoCustomRules } from './config';
 import { parseSubscription } from './subscription';
 
 const core = process.env.SING_BOX;
+const mihomo = process.env.MIHOMO;
 const uuid = '00000000-0000-4000-8000-000000000000';
 describe.skipIf(!core)('real sing-box config validation', () => {
   const examples = [
@@ -34,6 +35,30 @@ describe.skipIf(!core)('real sing-box config validation', () => {
       ])));
       const result = spawnSync(core!, ['check', '-c', configPath], { encoding: 'utf8' });
       expect(result.status, result.stderr).toBe(0);
+    } finally { rmSync(folder, { recursive: true, force: true }); }
+  });
+});
+
+describe.skipIf(!mihomo)('real mihomo custom rule injection validation', () => {
+  it('accepts RelayDesk custom domain, CIDR and process rules prepended to Mihomo config', () => {
+    const folder = mkdtempSync(join(tmpdir(), 'relaydesk-mihomo-rules-'));
+    try {
+      const cfg = withMihomoCustomRules({
+        'mixed-port': 32124,
+        mode: 'rule',
+        proxies: [{ name: 'HK', type: 'socks5', server: '127.0.0.1', port: 18080 }],
+        'proxy-groups': [{ name: 'Proxy', type: 'select', proxies: ['HK', 'DIRECT'] }],
+        rules: ['MATCH,Proxy'],
+      }, [
+        { type: 'domain', value: 'example.com', action: 'direct' },
+        { type: 'domain_suffix', value: 'blocked.test', action: 'reject' },
+        { type: 'ip_cidr', value: '2001:db8::/32', action: 'direct' },
+        { type: 'process_name', value: 'Network Fixture.EXE', action: 'proxy' },
+      ]);
+      const configPath = join(folder, 'config.yaml');
+      writeFileSync(configPath, JSON.stringify(cfg));
+      const result = spawnSync(mihomo!, ['-t', '-d', folder, '-f', configPath], { encoding: 'utf8' });
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     } finally { rmSync(folder, { recursive: true, force: true }); }
   });
 });
