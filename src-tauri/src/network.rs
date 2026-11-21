@@ -828,7 +828,10 @@ fn capture_config(
         "dns":{"servers":[
             {"type":"udp","tag":"policy-dns","server":"127.0.0.1","server_port":target.dns_port},
             {"type":"local","tag":"system-dns","prefer_go":true}
-        ],"rules":[{"inbound":"system-dns-in","action":"route","server":"system-dns"}],"final":"policy-dns"}
+        ],"rules":[
+            {"inbound":"system-dns-in","action":"route","server":"system-dns"},
+            {"inbound":"tun","action":"route","server":"policy-dns","disable_cache":true}
+        ],"final":"policy-dns"}
     })
 }
 

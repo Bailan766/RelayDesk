@@ -2,7 +2,10 @@ use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
 
 const TARGET: &str = "198.18.117.33";
+const TARGET_V6: &str = "2001:db8:117::33";
 const UPDATED_TARGET: &str = "198.18.117.34";
+const POLICY_DNS_NAME: &str = "relaydesk.fixture.test";
+const OTHER_DNS_NAME: &str = "replace-first.fixture.test";
 const TUN_ADDRESS: &str = "172.28.254.1";
 
 fn port(listener: &TcpListener) -> u16 {
@@ -91,6 +94,41 @@ fn assert_http_through_tun(session: &Session, address: SocketAddr) {
     assert!(body.ends_with("bridge"));
 }
 
+fn resolve_fixture_ipv4(name: &str, id: u16) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(resolve_fixture_address::<4>(name, id, TARGET, 1))
+}
+
+fn resolve_fixture_address<const LEN: usize>(
+    name: &str,
+    id: u16,
+    target: &str,
+    record_type: u16,
+) -> [u8; LEN] {
+    let mut question = id.to_be_bytes().to_vec();
+    question.extend_from_slice(b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00");
+    for label in name.split('.') {
+        question.push(label.len() as u8);
+        question.extend_from_slice(label.as_bytes());
+    }
+    question.push(0);
+    question.extend_from_slice(&record_type.to_be_bytes());
+    question.extend_from_slice(b"\x00\x01");
+    let target: std::net::IpAddr = target.parse().unwrap();
+    let socket = UdpSocket::bind((if target.is_ipv4() { "0.0.0.0" } else { "::" }, 0)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket.connect((target, 53)).unwrap();
+    socket.send(&question).unwrap();
+    let mut reply = [0; 512];
+    let len = socket.recv(&mut reply).unwrap();
+    assert!(len >= question.len() + 12 + LEN);
+    assert_eq!(reply[..2], id.to_be_bytes());
+    assert_eq!(reply[3] & 0xf, 0);
+    assert_eq!(&reply[6..8], &[0, 1]);
+    reply[len - LEN..len].try_into().unwrap()
+}
+
 struct FixtureCore(Child);
 
 impl Drop for FixtureCore {
@@ -110,7 +148,15 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let http_port = port(&connect_proxy);
     let http = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(45);
-        for destination in [TARGET, TARGET, TARGET, UPDATED_TARGET] {
+        let v6 = format!("[{TARGET_V6}]");
+        for destination in [
+            TARGET,
+            TARGET,
+            TARGET,
+            v6.as_str(),
+            UPDATED_TARGET,
+            POLICY_DNS_NAME,
+        ] {
             let mut socket = loop {
                 match connect_proxy.accept() {
                     Ok((socket, _)) => break socket,
@@ -146,9 +192,11 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let echo_port = echo.local_addr().unwrap().port();
     let udp = thread::spawn(move || {
         let mut buf = [0; 64];
-        let (len, peer) = echo.recv_from(&mut buf).unwrap();
-        assert_eq!(&buf[..len], b"relayed udp");
-        echo.send_to(b"echo udp", peer).unwrap();
+        for _ in 0..2 {
+            let (len, peer) = echo.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..len], b"relayed udp");
+            echo.send_to(b"echo udp", peer).unwrap();
+        }
     });
     let ss_port = auxiliary_port(&[]).unwrap();
     let password = "bridge-fixture-only";
@@ -179,21 +227,39 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         .set_read_timeout(Some(Duration::from_secs(45)))
         .unwrap();
     let resolver_port = resolver.local_addr().unwrap().port();
-    let question = b"\x09relaydesk\x07fixture\x04test\x00\x00\x01\x00\x01";
+    let question = b"\x09relaydesk\x07fixture\x04test\x00";
     let dns = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(45);
         let mut query = [0; 512];
+        let mut answered = [false; 2];
         loop {
             let (len, peer) = resolver.recv_from(&mut query).unwrap();
-            if query[..len].get(12..12 + question.len()) == Some(question.as_slice()) {
+            let end = 12 + question.len();
+            if query[..len].get(12..end) == Some(question.as_slice()) && len >= end + 4 {
+                let (index, answer) = match &query[end..end + 4] {
+                    [0, 1, 0, 1] => (0, [192, 0, 2, 10].to_vec()),
+                    [0, 28, 0, 1] => (
+                        1,
+                        "2001:db8::99"
+                            .parse::<std::net::Ipv6Addr>()
+                            .unwrap()
+                            .octets()
+                            .to_vec(),
+                    ),
+                    _ => continue,
+                };
                 let mut reply = query[..2].to_vec();
                 reply.extend_from_slice(b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00");
-                reply.extend_from_slice(question);
-                reply.extend_from_slice(
-                    b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x00\x00\x04\xc0\x00\x02\x0a",
-                );
+                reply.extend_from_slice(&query[12..end + 4]);
+                reply.extend_from_slice(b"\xc0\x0c");
+                reply.extend_from_slice(&query[end..end + 4]);
+                reply.extend_from_slice(&[0, 0, 0, 0, 0, answer.len() as u8]);
+                reply.extend_from_slice(&answer);
                 resolver.send_to(&reply, peer).unwrap();
-                break;
+                answered[index] = true;
+                if answered == [true, true] {
+                    break;
+                }
             }
             assert!(
                 Instant::now() < deadline,
@@ -206,7 +272,8 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let mut settings = CoreSettings {
         core: Core::Mihomo,
         config: json!({
-            "dns":{"enable":true,"ipv6":false,"nameserver":["system"],
+            "ipv6":true,
+            "dns":{"enable":true,"ipv6":true,"nameserver":["system"],
                 "nameserver-policy":{"relaydesk.fixture.test":[format!("udp://127.0.0.1:{resolver_port}")]}},
             "proxies":[
                 {"name":"tcp-fixture","type":"http","server":"127.0.0.1","port":http_port},
@@ -214,7 +281,8 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
                  "password":password,"cipher":"aes-128-gcm","udp":true}
             ],
             "proxy-groups":[{"name":"Fixture","type":"select","proxies":["tcp-fixture","REJECT"]}],
-            "rules":[format!("DST-PORT,{echo_port},udp-fixture"), format!("IP-CIDR,{TARGET}/32,Fixture,no-resolve"), "MATCH,REJECT"]
+            "rules":[format!("DST-PORT,{echo_port},udp-fixture"), format!("IP-CIDR,{TARGET}/32,Fixture,no-resolve"),
+                format!("IP-CIDR6,{TARGET_V6}/128,Fixture,no-resolve"), "MATCH,REJECT"]
         }),
         selections: BTreeMap::new(),
     };
@@ -273,35 +341,46 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     assert!(session.controller.ready());
     assert_http_through_tun(&session, address);
 
-    let app_udp = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-    app_udp
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    app_udp.connect((TARGET, echo_port)).unwrap();
-    app_udp.send(b"relayed udp").unwrap();
-    let mut data = [0; 512];
-    let len = app_udp.recv(&mut data).unwrap();
-    assert_eq!(&data[..len], b"echo udp");
+    assert_http_through_tun(&session, format!("[{TARGET_V6}]:8089").parse().unwrap());
+    for (bind, target) in [("0.0.0.0", TARGET), ("::", TARGET_V6)] {
+        let app_udp = UdpSocket::bind((bind, 0)).unwrap();
+        app_udp
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        app_udp.connect((target, echo_port)).unwrap();
+        app_udp.send(b"relayed udp").unwrap();
+        let mut data = [0; 512];
+        let len = app_udp.recv(&mut data).unwrap();
+        assert_eq!(&data[..len], b"echo udp");
+    }
 
-    let app_dns = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
-    app_dns
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    app_dns.connect((TARGET, 53)).unwrap();
-    let mut dns_query = b"\x19\x29\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00".to_vec();
-    dns_query.extend_from_slice(question);
-    app_dns.send(&dns_query).unwrap();
-    let len = app_dns.recv(&mut data).unwrap();
-    assert_eq!(&data[..2], b"\x19\x29");
-    assert!(data[..len].ends_with(&[192, 0, 2, 10]));
+    assert_eq!(
+        resolve_fixture_ipv4(POLICY_DNS_NAME, 0x1929),
+        std::net::Ipv4Addr::new(192, 0, 2, 10)
+    );
+    assert_eq!(
+        std::net::Ipv6Addr::from(resolve_fixture_address::<16>(
+            POLICY_DNS_NAME,
+            0x1940,
+            TARGET_V6,
+            28
+        )),
+        "2001:db8::99".parse::<std::net::Ipv6Addr>().unwrap()
+    );
 
     settings.config["proxy-groups"] = json!([{
         "name":"Updated","type":"select","proxies":["REJECT","tcp-fixture"]
     }]);
     settings.config["rules"] = json!([
         format!("IP-CIDR,{UPDATED_TARGET}/32,Updated,no-resolve"),
+        format!("DOMAIN,{POLICY_DNS_NAME},Updated"),
         "MATCH,REJECT"
     ]);
+    settings.config["dns"]["enhanced-mode"] = "fake-ip".into();
+    settings.config["dns"]["fake-ip-filter-mode"] = "whitelist".into();
+    settings.config["dns"]["fake-ip-filter"] = json!([POLICY_DNS_NAME, OTHER_DNS_NAME]);
+    settings.config["dns"]["fake-ip-range"] = "198.19.55.0/24".into();
+    settings.config["dns"]["fake-ip-ttl"] = 120.into();
     settings
         .selections
         .insert("Updated".into(), "tcp-fixture".into());
@@ -325,6 +404,8 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
             .await
             .unwrap();
     });
+    let previous_fake_ip = resolve_fixture_ipv4(POLICY_DNS_NAME, 0x1930);
+    assert_eq!(&previous_fake_ip.octets()[..3], &[198, 19, 55]);
     stop_fixture_core(session.policy.as_ref().unwrap(), "mihomo.exe");
     wait_until(|| session.needs_policy_restart(), Duration::from_secs(3));
     assert!(session.running() && !session.ready());
@@ -345,6 +426,16 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
             .any(|group| group.name == "Updated" && group.selected == "tcp-fixture"));
     });
     assert_http_through_tun(&session, format!("{UPDATED_TARGET}:8089").parse().unwrap());
+    assert_eq!(
+        resolve_fixture_ipv4(OTHER_DNS_NAME, 0x1931),
+        previous_fake_ip
+    );
+    let new_fake_ip = resolve_fixture_ipv4(POLICY_DNS_NAME, 0x1932);
+    assert_ne!(
+        new_fake_ip, previous_fake_ip,
+        "TUN returned a stale fake address after Mihomo restarted"
+    );
+    assert_http_through_tun(&session, (new_fake_ip, 8089).into());
 
     http.join().unwrap();
     udp.join().unwrap();
