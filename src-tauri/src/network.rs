@@ -50,7 +50,7 @@ const TUN_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const MIHOMO_READY_TIMEOUT: Duration = Duration::from_secs(40);
 const MIHOMO_RESTART_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TUN_ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
-const TUN_ROUTE_RECOVERY_ATTEMPTS: u8 = 6;
+const TUN_ROUTE_RECOVERY_ATTEMPTS: u8 = 12;
 
 #[derive(Clone, Copy, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -776,14 +776,32 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         output_rules.insert(0, guard);
         rules = rest;
     }
+    let mut direct_domains = Vec::new();
+    let mut direct_suffixes = Vec::new();
     for rule in rules {
         validate_rule(rule, outbounds, endpoints)?;
+        if rule.get("outbound").and_then(Value::as_str) == Some("direct") {
+            if let Some(items) = rule.get("domain").and_then(Value::as_array) {
+                direct_domains.extend(items.iter().filter_map(Value::as_str).map(|s| json!(s)));
+            }
+            if let Some(items) = rule.get("domain_suffix").and_then(Value::as_array) {
+                direct_suffixes.extend(items.iter().filter_map(Value::as_str).map(|s| json!(s)));
+            }
+        }
         output_rules.push(rule.clone());
     }
     let route_final = match route.get("final").and_then(Value::as_str) {
         Some("direct") => "direct",
         _ => "proxy",
     };
+    let mut dns_rules = vec![json!({"clash_mode":"direct","action":"route","server":"bootstrap"})];
+    if !direct_domains.is_empty() {
+        dns_rules.push(json!({"domain": direct_domains, "action": "route", "server": "bootstrap"}));
+    }
+    if !direct_suffixes.is_empty() {
+        dns_rules.push(json!({"domain_suffix": direct_suffixes, "action": "route", "server": "bootstrap"}));
+    }
+    dns_rules.push(json!({"inbound":["tun","local"],"action":"route","server":"remote"}));
     Some(json!({
         "log": {"level":"warn"},
         "inbounds": [
@@ -795,7 +813,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         "route":{"rules":output_rules,"final":route_final,"auto_detect_interface":true,"default_domain_resolver":"bootstrap"},
         "dns":{
             "servers":[{"type":"local","tag":"bootstrap"},{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","detour":"proxy"}],
-            "rules":[{"clash_mode":"direct","action":"route","server":"bootstrap"},{"inbound":["tun","local"],"action":"route","server":"remote"}],
+            "rules": dns_rules,
             "final":"bootstrap"
         }
     }))
@@ -914,7 +932,7 @@ fn capture_config(
             {"type":"local","tag":"system-dns","prefer_go":true}
         ],"rules":[
             {"inbound":"system-dns-in","action":"route","server":"system-dns"},
-            {"inbound":"tun","action":"route","server":"policy-dns","disable_cache":true}
+            {"inbound":"tun","action":"route","server":"policy-dns"}
         ],"final":"policy-dns"}
     })
 }
@@ -1562,6 +1580,30 @@ fn stop_core(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn attach_stderr_logger(child: &mut Child, label: &'static str) -> Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>> {
+    use std::io::{BufRead, BufReader};
+    let stderr = child.stderr.take()?;
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(12)));
+    let sink = std::sync::Arc::clone(&tail);
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let clean = crate::telemetry::redact_log_payload(&line);
+            if clean.is_empty() {
+                continue;
+            }
+            crate::logs::append(label, "error", &clean);
+            if let Ok(mut lines) = sink.lock() {
+                if lines.len() >= 12 {
+                    lines.pop_front();
+                }
+                lines.push_back(clean);
+            }
+        }
+    });
+    Some(tail)
+}
+
 fn start_core(command: &mut Command, job: &Handle, config: &[u8]) -> Result<Child, String> {
     use std::io::Write;
     let mut child = command.spawn().map_err(|_| "无法启动代理内核")?;
@@ -1623,30 +1665,37 @@ fn supervise_core(
     interface: &str,
     tun_route: Option<MIB_IPFORWARD_ROW2>,
 ) -> bool {
-    let tun_routes = [
-        (AF_INET as u16, tun_route),
-        (
-            AF_INET6 as u16,
-            tun_route.and_then(|_| tun_default_route(interface, AF_INET6 as u16)),
-        ),
-    ];
-    let mut next_route_check = tun_route.map(|_| Instant::now() + TUN_ROUTE_CHECK_INTERVAL);
+    let ipv4_route = tun_route;
+    let ipv6_route = tun_route.and_then(|_| tun_default_route(interface, AF_INET6 as u16));
+    let mut next_route_check = ipv4_route.map(|_| Instant::now() + TUN_ROUTE_CHECK_INTERVAL);
     let mut failed_route_checks = 0;
     while !lifetime.ended(150) {
-        if !matches!(child.try_wait(), Ok(None)) {
+        if let Ok(Some(status)) = child.try_wait() {
+            crate::logs::append(
+                "worker",
+                "warn",
+                &format!("代理内核进程提前退出（状态码：{:?}）", status.code()),
+            );
             return true;
         }
         let now = Instant::now();
         if next_route_check.is_some_and(|check| now >= check) {
             next_route_check = Some(now + TUN_ROUTE_CHECK_INTERVAL);
-            let ready = tun_routes.map(|(family, route)| {
-                route.is_none_or(|saved| restore_tun_default_route(interface, family, &saved))
-            });
-            if ready.into_iter().all(|restored| restored) {
+            let v4_ready = ipv4_route
+                .is_none_or(|saved| restore_tun_default_route(interface, AF_INET as u16, &saved));
+            if let Some(saved_v6) = ipv6_route {
+                let _ = restore_tun_default_route(interface, AF_INET6 as u16, &saved_v6);
+            }
+            if v4_ready {
                 failed_route_checks = 0;
             } else {
                 failed_route_checks += 1;
                 if failed_route_checks >= TUN_ROUTE_RECOVERY_ATTEMPTS {
+                    crate::logs::append(
+                        "worker",
+                        "warn",
+                        "TUN IPv4 默认路由持续缺失 12 秒，触发内核重连恢复",
+                    );
                     return true;
                 }
             }
@@ -1824,7 +1873,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         command
     };
     let timeout = if core == Core::Mihomo {
@@ -1841,10 +1890,17 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     };
     let initial_deadline = Instant::now() + timeout;
     let mut check = start_core(&mut config_command(true), &job, &initial)?;
+    let check_stderr = attach_stderr_logger(&mut check, "core-check");
     loop {
         if let Some(status) = check.try_wait().map_err(|_| "无法完成内核检查")? {
             if !status.success() {
-                return Err("内核配置检查失败".into());
+                let detail = check_stderr
+                    .as_ref()
+                    .and_then(|lines| lines.lock().ok()?.back().cloned());
+                return Err(match detail {
+                    Some(msg) => format!("内核配置检查失败：{msg}"),
+                    None => "内核配置检查失败".into(),
+                });
             }
             break;
         }
@@ -1856,9 +1912,10 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let launch = |config: &[u8], deadline, interface: &str, recovery: Option<&TunControl>| {
         let mut child = start_core(&mut config_command(false), &job, config)?;
+        let core_stderr = attach_stderr_logger(&mut child, "core");
         let mut route = None;
         let mut ipv4_ready_at: Option<Instant> = None;
-        await_core(&mut child, &lifetime, deadline, recovery, || {
+        if let Err(err) = await_core(&mut child, &lifetime, deadline, recovery, || {
             if mode == "tun" {
                 if UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_err() {
                     return false;
@@ -1878,7 +1935,15 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             policy_dns.is_none_or(|dns| UdpSocket::bind(("127.0.0.1", dns)).is_err())
                 && TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
                 && (core == Core::Bridge || controller.ready())
-        })?;
+        }) {
+            let detail = core_stderr
+                .as_ref()
+                .and_then(|lines| lines.lock().ok()?.back().cloned());
+            return Err(match detail {
+                Some(msg) => format!("{err}：{msg}"),
+                None => err,
+            });
+        }
         Ok::<_, String>((child, route))
     };
     let (mut child, mut route) = launch(&initial, initial_deadline, &interface, None)?;
@@ -1993,6 +2058,7 @@ pub fn cli() -> Option<i32> {
         Some("--network-worker") => Some(match run_worker(&args[1..]) {
             Ok(()) => 0,
             Err(reason) => {
+                crate::logs::append("worker", "error", &reason);
                 eprintln!("{reason}");
                 1
             }

@@ -1,8 +1,8 @@
 use crate::telemetry::Controller;
 use std::time::{Duration, Instant};
 
-const CHECK_INTERVAL: Duration = Duration::from_secs(25);
-const CONFIRM_INTERVAL: Duration = Duration::from_secs(3);
+const CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const CONFIRM_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Reachability {

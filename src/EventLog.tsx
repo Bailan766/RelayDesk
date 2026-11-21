@@ -1,6 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useState } from "react";
-import { Pause, Play, Search, Trash2 } from "lucide-react";
+import { FolderOpen, Pause, Play, Search, Trash2 } from "lucide-react";
 
 type Event = {
   sequence: number;
@@ -89,6 +89,9 @@ export function EventLog() {
           {paused ? <><Play size={13} /> 继续</> : <><Pause size={13} /> 暂停</>}
         </button>
         <button className="mini-btn" type="button" disabled={!visible.length} onClick={() => void copy()}>复制</button>
+        <button className="mini-btn" type="button" disabled={!isTauri()} onClick={() => void invoke("open_log_folder").catch(() => setError("无法打开日志目录"))}>
+          <FolderOpen size={13} /> 日志目录
+        </button>
         <button className="mini-btn" type="button" disabled={!items.length || !isTauri()} onClick={() => void clear()}>
           <Trash2 size={13} /> 清空
         </button>
@@ -103,6 +106,6 @@ export function EventLog() {
         <span>{item.message}</span>
       </li>)}
     </ul> : <p className="empty">{isTauri() ? "没有符合条件的日志或网络事件" : "请在桌面端查看运行日志"}</p>}
-    <p className="rule-hint" style={{ marginTop: 10 }}>保留最近 160 条，查询参数与认证信息已脱敏。</p>
+    <p className="rule-hint" style={{ marginTop: 10 }}>保留最近 160 条实时事件，并持久化脱敏日志至本机 %LOCALAPPDATA%\RelayDesk\logs\relaydesk.log。</p>
   </section>;
 }

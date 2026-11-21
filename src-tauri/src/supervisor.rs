@@ -145,6 +145,8 @@ pub struct Event {
 
 impl Slot {
     fn record(&mut self, level: &'static str, message: impl Into<String>) {
+        let message = message.into();
+        crate::logs::append("supervisor", level, &message);
         const LIMIT: usize = 160;
         if self.events.len() == LIMIT {
             self.events.pop_front();
@@ -158,7 +160,7 @@ impl Slot {
             sequence: self.next_event,
             timestamp,
             level,
-            message: message.into(),
+            message,
         });
     }
 }
@@ -616,9 +618,29 @@ impl Supervisor {
         Ok(slot.events.iter().cloned().collect())
     }
 
+    pub fn load_persisted_events(&self) {
+        let Ok(mut slot) = self.slot.lock() else {
+            return;
+        };
+        if !slot.events.is_empty() {
+            return;
+        }
+        for (timestamp, level, message) in crate::logs::read_tail(80) {
+            slot.next_event += 1;
+            let seq = slot.next_event;
+            slot.events.push_back(Event {
+                sequence: seq,
+                timestamp,
+                level,
+                message,
+            });
+        }
+    }
+
     pub fn clear_events(&self) -> Result<(), String> {
         let mut slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
         slot.events.clear();
+        crate::logs::clear_disk_logs();
         Ok(())
     }
 
@@ -718,80 +740,115 @@ impl Supervisor {
     }
 
     fn tick_using(&self, launch: impl FnOnce(&Plan) -> Result<network::Session, String>) {
-        let Ok(mut slot) = self.slot.try_lock() else {
-            return;
-        };
-        let Some(active) = slot.active.as_mut() else {
-            return;
-        };
-        if active.session.running() {
-            if active.session.needs_policy_restart() {
-                // Policy changes hold this lock until the in-memory plan is committed.
-                if let Ok(_control) = self.control.try_lock() {
-                    if active
-                        .session
-                        .stage_policy_restart(&active.plan.settings, active.plan.routing_mode)
-                        .is_err()
-                    {
-                        active.session.configure_tun_recovery(false);
-                        slot.record(
-                            "warn",
-                            "无法保存本次 Mihomo 恢复所需的配置，正在退出 TUN 接管",
-                        );
+        let pending = {
+            let Ok(mut slot) = self.slot.try_lock() else {
+                return;
+            };
+            let Some(active) = slot.active.as_mut() else {
+                return;
+            };
+            if active.session.running() {
+                if active.session.needs_policy_restart() {
+                    // Policy changes hold this lock until the in-memory plan is committed.
+                    if let Ok(_control) = self.control.try_lock() {
+                        if active
+                            .session
+                            .stage_policy_restart(&active.plan.settings, active.plan.routing_mode)
+                            .is_err()
+                        {
+                            active.session.configure_tun_recovery(false);
+                            slot.record(
+                                "warn",
+                                "无法保存本次 Mihomo 恢复所需的配置，正在退出 TUN 接管",
+                            );
+                        }
                     }
+                    return;
+                }
+                let generation = active.session.generation();
+                if generation != active.generation {
+                    active.generation = generation;
+                    active.health.reset();
+                    slot.message = Some("TUN 已自动恢复");
+                    slot.record("info", "TUN 连接已恢复，当前节点和路由设置保持生效");
+                    return;
+                }
+                if active.since.elapsed() >= HEALTHY_INTERVAL {
+                    active.failures = 0;
                 }
                 return;
             }
-            let generation = active.session.generation();
-            if generation != active.generation {
-                active.generation = generation;
-                active.health.reset();
-                slot.message = Some("TUN 已自动恢复");
-                slot.record("info", "TUN 连接已恢复，当前节点和路由设置保持生效");
+            let Some(delay) = active.retry_delay() else {
+                let tun = active.plan.mode == "tun";
+                let exhausted = active.failures >= RETRY_DELAYS.len();
+                let taken = slot.active.take();
+                drop(slot);
+                if let Some(active) = taken {
+                    let _ = active.session.stop();
+                }
+                let message = if network::recover().is_err() {
+                    "内核已退出，暂未确认 Windows 网络设置已恢复"
+                } else if tun {
+                    "TUN 内核已退出，重新连接时需要管理员授权"
+                } else if exhausted {
+                    "自动恢复失败，已退出接管"
+                } else {
+                    "内核意外退出，已恢复网络设置"
+                };
+                if let Ok(mut slot) = self.slot.lock() {
+                    slot.message = Some(message);
+                    slot.record("warn", message);
+                }
+                return;
+            };
+            let retry_at = active
+                .retry_at
+                .get_or_insert_with(|| Instant::now() + delay);
+            if Instant::now() < *retry_at || self.closing.load(Ordering::Acquire) {
                 return;
             }
-            if active.since.elapsed() >= HEALTHY_INTERVAL {
-                active.failures = 0;
-            }
-            return;
-        }
-        let Some(delay) = active.retry_delay() else {
-            let tun = active.plan.mode == "tun";
-            let exhausted = active.failures >= RETRY_DELAYS.len();
-            if let Some(active) = slot.active.take() {
-                let _ = active.session.stop();
-            }
-            let message = if network::recover().is_err() {
-                "内核已退出，暂未确认 Windows 网络设置已恢复"
-            } else if tun {
-                "TUN 内核已退出，重新连接时需要管理员授权"
-            } else if exhausted {
-                "自动恢复失败，已退出接管"
-            } else {
-                "内核意外退出，已恢复网络设置"
-            };
-            slot.message = Some(message);
-            slot.record("warn", message);
-            return;
+            active.failures += 1;
+            active.retry_at = None;
+            (active.session.id.clone(), active.plan.clone())
         };
-        let retry_at = active
-            .retry_at
-            .get_or_insert_with(|| Instant::now() + delay);
-        if Instant::now() < *retry_at || self.closing.load(Ordering::Acquire) {
+
+        if self.closing.load(Ordering::Acquire) {
             return;
         }
-        active.failures += 1;
-        active.retry_at = None;
-        match launch(&active.plan) {
+        match launch(&pending.1) {
             Ok(session) => {
-                active.session = session;
-                active.generation = 0;
-                active.since = Instant::now();
-                active.health.reset();
-                slot.message = Some("代理已自动恢复");
-                slot.record("info", "检测到内核中断，代理已自动恢复");
+                let stale = {
+                    let Ok(mut slot) = self.slot.lock() else {
+                        let _ = session.stop();
+                        return;
+                    };
+                    if self.closing.load(Ordering::Acquire) {
+                        true
+                    } else if let Some(active) = slot
+                        .active
+                        .as_mut()
+                        .filter(|active| active.session.id == pending.0)
+                    {
+                        active.session = session;
+                        active.generation = 0;
+                        active.since = Instant::now();
+                        active.health.reset();
+                        slot.message = Some("代理已自动恢复");
+                        slot.record("info", "检测到内核中断，代理已自动恢复");
+                        false
+                    } else {
+                        true
+                    }
+                };
+                if stale {
+                    let _ = session.stop();
+                }
             }
-            Err(_) => slot.record("warn", "网络恢复尝试失败"),
+            Err(error) => {
+                if let Ok(mut slot) = self.slot.lock() {
+                    slot.record("warn", format!("网络恢复尝试失败：{error}"));
+                }
+            }
         }
     }
 

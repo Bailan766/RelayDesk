@@ -87,12 +87,28 @@ type ProxyStatus = {
   node_health?: keyof typeof nodeHealthLabels | null;
 };
 
-function fallbackGroups(plan: SessionPlan | undefined, subscriptions: Workspace["subscriptions"], favorites: Set<string>) {
+function fallbackGroups(
+  plan: SessionPlan | undefined,
+  subscriptions: Workspace["subscriptions"],
+  favorites: Set<string>,
+  latencies: Record<string, LatencyRecord> = {},
+) {
   if (!plan) return [];
   return subscriptions
     .map(profile =>
       [...profile.parsed.nodes]
-        .sort((first, second) => Number(favorites.has(second.id)) - Number(favorites.has(first.id)))
+        .filter(node => !isInfoNodeName(node.name))
+        .sort((first, second) => {
+          const starDiff = Number(favorites.has(second.id)) - Number(favorites.has(first.id));
+          if (starDiff !== 0) return starDiff;
+          const aMs = latencies[first.id]?.revision === nodeRevision(first)
+            ? latencies[first.id]?.milliseconds ?? Number.MAX_SAFE_INTEGER
+            : Number.MAX_SAFE_INTEGER;
+          const bMs = latencies[second.id]?.revision === nodeRevision(second)
+            ? latencies[second.id]?.milliseconds ?? Number.MAX_SAFE_INTEGER
+            : Number.MAX_SAFE_INTEGER;
+          return aMs - bMs;
+        })
         .flatMap(node => plan.loaded.get(node.id)?.tag ?? []),
     )
     .filter(group => group.length > 1);
@@ -407,7 +423,7 @@ function App() {
 
   useEffect(() => {
     if (!isTauri() || !running || runningOriginal || !work.ready) return;
-    void invoke("configure_failover", { enabled: autoFailover, fallbackGroups: fallbackGroups(session.current, subscriptions, starred) })
+    void invoke("configure_failover", { enabled: autoFailover, fallbackGroups: fallbackGroups(session.current, subscriptions, starred, latencies) })
       .catch(() => setSettingsError("无法更新当前会话的自动换线设置"));
   }, [autoFailover, running, runningOriginal, starred, subscriptions, work.ready]);
 
@@ -636,7 +652,7 @@ function App() {
       routingMode,
       autoReconnect,
       autoFailover,
-      fallbackGroups: fallbackGroups(plan, subscriptions, starred),
+      fallbackGroups: fallbackGroups(plan, subscriptions, starred, latencies),
       allowLan,
       bypass: systemProxyBypass,
       tunIpv6,
@@ -742,7 +758,7 @@ function App() {
         routingMode: work.workspace.routingMode,
         autoReconnect,
         autoFailover,
-        fallbackGroups: fallbackGroups(next, subscriptions, starred),
+        fallbackGroups: fallbackGroups(next, subscriptions, starred, latencies),
         allowLan,
         bypass: systemProxyBypass,
         tunIpv6,
@@ -1075,7 +1091,7 @@ function App() {
         routingMode,
         autoReconnect,
         autoFailover,
-        fallbackGroups: fallbackGroups(next, subscriptions, starred),
+        fallbackGroups: fallbackGroups(next, subscriptions, starred, latencies),
         allowLan,
         bypass: systemProxyBypass,
         tunIpv6,
@@ -1235,7 +1251,7 @@ function App() {
           <div className="brand-mark"><Cat size={18} /></div>
           <div>
             <strong>RelayDesk</strong>
-            <small>v1.2.1</small>
+            <small>v1.2.2</small>
           </div>
         </div>
         <nav>

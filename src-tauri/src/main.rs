@@ -10,6 +10,7 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 mod failover;
+mod logs;
 mod mihomo;
 mod network;
 mod probes;
@@ -281,6 +282,16 @@ fn proxy_events(state: tauri::State<'_, ProxyState>) -> Result<Vec<supervisor::E
 #[tauri::command]
 fn clear_proxy_events(state: tauri::State<'_, ProxyState>) -> Result<(), String> {
     state.clear_events()
+}
+
+#[tauri::command]
+fn open_log_folder() -> Result<(), String> {
+    let dir = logs::log_dir().ok_or("无法定位日志目录")?;
+    Command::new("explorer")
+        .arg(dir)
+        .spawn()
+        .map_err(|_| "无法打开日志目录")?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1067,6 +1078,7 @@ fn main() {
                 tray = tray.icon(icon.clone());
             }
             tray.build(app)?;
+            app.state::<ProxyState>().load_persisted_events();
             let handle = app.handle().clone();
             std::thread::spawn(move || ProxyState::run(handle));
             tauri::async_runtime::spawn(ProxyState::watch_core_logs(app.handle().clone()));
@@ -1100,6 +1112,7 @@ fn main() {
             proxy_status,
             proxy_events,
             clear_proxy_events,
+            open_log_folder,
             probe_loaded_node,
             probe_mihomo_group,
             close_proxy_connection,

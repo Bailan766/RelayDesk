@@ -121,6 +121,14 @@ pub fn prepare_with_lan(
     config.insert("allow-lan".into(), json!(allow_lan));
     config.insert("mode".into(), json!(mode.name()));
     config.insert("log-level".into(), json!("warning"));
+    if config.get("disable-keep-alive") != Some(&json!(true)) {
+        config.entry("keep-alive-idle").or_insert_with(|| json!(15));
+        config
+            .entry("keep-alive-interval")
+            .or_insert_with(|| json!(15));
+    }
+    config.entry("tcp-concurrent").or_insert_with(|| json!(true));
+    config.entry("unified-delay").or_insert_with(|| json!(true));
     Ok(Value::Object(config))
 }
 
