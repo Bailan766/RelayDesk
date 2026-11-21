@@ -43,6 +43,7 @@ export function SettingsPage({
   const [bypassDraft, setBypassDraft] = useState(workspace.systemProxyBypass);
   const [probeUrlDraft, setProbeUrlDraft] = useState(workspace.probeUrl);
   const [feedback, setFeedback] = useState("");
+  const [repoCopied, setRepoCopied] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -368,6 +369,45 @@ export function SettingsPage({
             恢复默认
           </button>
         </form>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head"><h2>关于与开源</h2></div>
+        <div className="setting-item">
+          <div className="setting-label">
+            <strong>作者</strong>
+            <small>Bailan233</small>
+          </div>
+          <span className="tag">MIT License</span>
+        </div>
+        <div className="setting-item">
+          <div className="setting-label">
+            <strong>开源地址</strong>
+            <small>https://github.com/Bailan766/RelayDesk</small>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="mini-btn"
+              onClick={() => {
+                void navigator.clipboard.writeText("https://github.com/Bailan766/RelayDesk").then(() => {
+                  setRepoCopied(true);
+                  window.setTimeout(() => setRepoCopied(false), 1600);
+                }).catch(() => {});
+              }}
+            >
+              {repoCopied ? "已复制地址" : "复制地址"}
+            </button>
+            <button
+              type="button"
+              className="mini-btn is-primary"
+              disabled={!isTauri()}
+              onClick={() => void invoke("open_project_repo").catch(() => setError("无法打开项目主页"))}
+            >
+              打开 GitHub
+            </button>
+          </div>
+        </div>
       </section>
     </div>
   );

@@ -1,6 +1,8 @@
 {
   "name": "relaydesk",
   "version": "1.2.2",
+  "author": "Bailan233",
+  "repository": "https://github.com/Bailan766/RelayDesk",
   "private": true,
   "type": "module",
   "scripts": {

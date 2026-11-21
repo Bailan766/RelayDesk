@@ -295,6 +295,15 @@ fn open_log_folder() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_project_repo() -> Result<(), String> {
+    Command::new("explorer")
+        .arg("https://github.com/Bailan766/RelayDesk")
+        .spawn()
+        .map_err(|_| "无法打开项目主页")?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn probe_loaded_node(
     tag: String,
     probe_url: Option<String>,
@@ -1113,6 +1122,7 @@ fn main() {
             proxy_events,
             clear_proxy_events,
             open_log_folder,
+            open_project_repo,
             probe_loaded_node,
             probe_mihomo_group,
             close_proxy_connection,
