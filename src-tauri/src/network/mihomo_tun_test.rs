@@ -22,6 +22,40 @@ fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) {
     );
 }
 
+fn stop_fixture_tun_core(session: &Session) {
+    use winapi::um::{
+        handleapi::INVALID_HANDLE_VALUE,
+        processthreadsapi::TerminateProcess,
+        tlhelp32::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+        winnt::PROCESS_TERMINATE,
+    };
+    let parent_id = unsafe { GetProcessId(session.worker.0) };
+    assert_ne!(parent_id, 0);
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    assert_ne!(snapshot, INVALID_HANDLE_VALUE);
+    let snapshot = Handle::new(snapshot).unwrap();
+    let mut row: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    row.dwSize = std::mem::size_of_val(&row) as u32;
+    let mut present = unsafe { Process32FirstW(snapshot.0, &mut row) };
+    while present != 0 {
+        if row.th32ParentProcessID == parent_id && row.szExeFile.starts_with(&wide("sing-box.exe"))
+        {
+            let child = Handle::new(unsafe {
+                OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, row.th32ProcessID)
+            })
+            .unwrap();
+            assert_ne!(unsafe { TerminateProcess(child.0, 1) }, 0);
+            assert!(child.signaled(5000));
+            return;
+        }
+        present = unsafe { Process32NextW(snapshot.0, &mut row) };
+    }
+    panic!("The authorized worker's sing-box child was not found");
+}
+
 fn read_headers(socket: &mut TcpStream) -> String {
     let mut reader = BufReader::new(socket);
     let mut first = String::new();
@@ -75,7 +109,7 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let http_port = port(&connect_proxy);
     let http = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(45);
-        for _ in 0..2 {
+        for _ in 0..3 {
             let mut socket = loop {
                 match connect_proxy.accept() {
                     Ok((socket, _)) => break socket,
@@ -184,7 +218,7 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
             }),
             selections: BTreeMap::new(),
         },
-        mixed, "tun", RoutingMode::Rule, &app,
+        mixed, "tun", RoutingMode::Rule, &app, true,
     ).unwrap();
     let (policy_dns, system_dns) = session.tun_dns.unwrap();
     assert!(session.running() && session.controller.ready());
@@ -222,6 +256,13 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         }
     }
     assert!(session.running());
+    assert_http_through_tun(&session, address);
+
+    stop_fixture_tun_core(&session);
+    wait_until(|| session.recovering_tun(), Duration::from_secs(3));
+    assert!(session.running() && !session.ready());
+    wait_until(|| session.ready(), Duration::from_secs(24));
+    assert!(session.controller.ready());
     assert_http_through_tun(&session, address);
 
     let app_udp = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
@@ -263,4 +304,67 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     assert!(tun_default_route(&adapter, AF_INET6 as u16).is_none());
     assert!(UdpSocket::bind(("127.0.0.1", policy_dns)).is_ok());
     assert!(UdpSocket::bind(("127.0.0.1", system_dns)).is_ok());
+}
+
+#[test]
+fn installed_node_tun_keeps_the_selected_node_and_mode_and_can_cancel_recovery() {
+    let Some(app) = env::var_os("RELAYDESK_INSTALLED_SMOKE_APP").map(PathBuf::from) else {
+        return;
+    };
+    let port = auxiliary_port(&[]).unwrap();
+    let mut config = json!({
+        "inbounds":[{"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port}],
+        "outbounds":[
+            {"type":"selector","tag":"proxy","outbounds":["node-0","node-1"],"default":"node-0","interrupt_exist_connections":false},
+            {"type":"vless","tag":"node-0","server":"127.0.0.1","server_port":9,"uuid":"00000000-0000-4000-8000-000000000000"},
+            {"type":"vless","tag":"node-1","server":"127.0.0.1","server_port":9,"uuid":"00000000-0000-4000-8000-000000000001"},
+            {"type":"direct","tag":"direct"}
+        ],
+        "route":{"rules":[],"final":"proxy"}
+    });
+    let session = Session::start_using(
+        CoreSettings::singbox(config.clone()),
+        port,
+        "tun",
+        RoutingMode::Rule,
+        &app,
+        true,
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        session.controller.switch("node-1").await.unwrap();
+        session.controller.routing_mode("direct").await.unwrap();
+    });
+    config["outbounds"][0]["default"] = json!("node-1");
+    session.remember_tun_route(RoutingMode::Direct, &config);
+    stop_fixture_tun_core(&session);
+    wait_until(|| session.recovering_tun(), Duration::from_secs(3));
+    wait_until(|| session.ready(), Duration::from_secs(24));
+    runtime.block_on(async {
+        let groups = session.controller.groups().await.unwrap();
+        assert!(groups
+            .iter()
+            .any(|group| group.name == "proxy" && group.selected == "node-1"));
+        assert!(session
+            .controller
+            .current_routing_mode()
+            .await
+            .unwrap()
+            .eq_ignore_ascii_case("direct"));
+    });
+    session.configure_tun_recovery(false);
+    stop_fixture_tun_core(&session);
+    assert!(
+        session.worker.signaled(6500),
+        "TUN recovered after recovery was disabled"
+    );
+    session.stop().or_else(|_| recover()).unwrap();
+    wait_until(
+        || UdpSocket::bind((TUN_ADDRESS, 0)).is_err(),
+        Duration::from_secs(4),
+    );
 }

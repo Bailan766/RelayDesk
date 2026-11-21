@@ -81,6 +81,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installed Mihomo profile test failed' }
           cargo test --manifest-path src-tauri/Cargo.toml network::mihomo_tun_test::installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun -- --exact --nocapture
           if ($LASTEXITCODE -ne 0) { throw 'Installed Mihomo TUN bridge test failed' }
+          cargo test --manifest-path src-tauri/Cargo.toml network::mihomo_tun_test::installed_node_tun_keeps_the_selected_node_and_mode_and_can_cancel_recovery -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { throw 'Installed TUN recovery test failed' }
           npm test -- src/wireguard-integration.test.ts
           if ($LASTEXITCODE -ne 0) { throw 'Installed WireGuard TUN test failed' }
           cargo test --manifest-path src-tauri/Cargo.toml supervisor::tests::installed_worker_recovers_and_explicit_stop_cancels_it -- --exact --nocapture

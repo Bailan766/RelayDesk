@@ -11,7 +11,7 @@ use std::{
 use std::{
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     os::windows::io::AsRawHandle,
-    process::{Child, Stdio},
+    process::{Child, Command, Stdio},
 };
 use winapi::{
     shared::{
@@ -39,6 +39,11 @@ use winapi::{
         },
     },
 };
+
+use tun_control::TunControl;
+
+#[path = "network/tun_control.rs"]
+mod tun_control;
 
 const APPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const TUN_READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -148,6 +153,9 @@ impl RoutingMode {
         }
     }
 }
+
+const TUN_RETRY_DELAYS_MS: [u32; 3] = [1500, 4000, 10000];
+const TUN_STABLE_TIME: Duration = Duration::from_secs(45);
 
 struct Handle(HANDLE);
 unsafe impl Send for Handle {}
@@ -720,6 +728,7 @@ pub struct Session {
     pub id: String,
     pub tun_dns: Option<(u16, u16)>,
     policy: Option<Box<Session>>,
+    tun_control: Option<TunControl>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -796,9 +805,10 @@ impl Session {
         port: u16,
         mode: &str,
         routing_mode: RoutingMode,
+        recover: bool,
     ) -> Result<Self, String> {
         let executable = env::current_exe().map_err(|_| "无法定位当前应用")?;
-        Self::start_using(settings, port, mode, routing_mode, &executable)
+        Self::start_using(settings, port, mode, routing_mode, &executable, recover)
     }
 
     pub(crate) fn start_using(
@@ -807,6 +817,7 @@ impl Session {
         mode: &str,
         routing_mode: RoutingMode,
         executable: &std::path::Path,
+        recover: bool,
     ) -> Result<Self, String> {
         if !matches!(mode, "local" | "system" | "tun") {
             return Err("代理入口模式无效".into());
@@ -832,6 +843,7 @@ impl Session {
                 routing_mode,
                 executable,
                 Some(dns_port),
+                false,
             )?;
             let policy_pid = unsafe { GetProcessId(policy.worker.0) };
             if policy_pid == 0 {
@@ -855,6 +867,7 @@ impl Session {
                 RoutingMode::Rule,
                 executable,
                 None,
+                recover,
             )?;
             capture.port = port;
             capture.controller = policy.controller.clone();
@@ -884,7 +897,15 @@ impl Session {
         if settings.core == Core::Mihomo {
             mihomo::prepare(&settings.config, port, routing_mode)?;
         }
-        Self::start_worker(settings, port, mode, routing_mode, executable, None)
+        Self::start_worker(
+            settings,
+            port,
+            mode,
+            routing_mode,
+            executable,
+            None,
+            recover,
+        )
     }
 
     fn start_worker(
@@ -894,11 +915,22 @@ impl Session {
         routing_mode: RoutingMode,
         executable: &std::path::Path,
         policy_dns: Option<u16>,
+        recover: bool,
     ) -> Result<Self, String> {
         let core = settings.core;
         ensure_port_available(port)?;
         let directory = runtime_dir()?;
         let token = uuid::Uuid::new_v4().simple().to_string();
+        let tun_control = if mode == "tun" {
+            Some(TunControl::create(
+                &token,
+                recover,
+                routing_mode,
+                &settings.config,
+            )?)
+        } else {
+            None
+        };
         let ready = Handle::new(unsafe {
             CreateEventW(
                 ptr::null_mut(),
@@ -958,6 +990,7 @@ impl Session {
             id: token,
             tun_dns: None,
             policy: None,
+            tun_control,
         };
         let deadline = Instant::now()
             + if core == Core::Mihomo {
@@ -987,6 +1020,28 @@ impl Session {
 
     pub fn running(&self) -> bool {
         !self.worker.signaled(0) && self.policy.as_ref().is_none_or(|policy| policy.running())
+    }
+
+    pub fn recovering_tun(&self) -> bool {
+        self.tun_control
+            .as_ref()
+            .is_some_and(TunControl::recovering)
+    }
+
+    pub fn ready(&self) -> bool {
+        self.running() && !self.recovering_tun()
+    }
+
+    pub fn configure_tun_recovery(&self, enabled: bool) {
+        if let Some(control) = &self.tun_control {
+            control.set_recovery(enabled);
+        }
+    }
+
+    pub fn remember_tun_route(&self, mode: RoutingMode, config: &Value) {
+        if let Some(control) = &self.tun_control {
+            control.set_routing(mode, config);
+        }
     }
 
     #[cfg(test)]
@@ -1110,6 +1165,100 @@ fn add_routing_modes(config: &mut Value, tun: bool) -> Option<()> {
     Some(())
 }
 
+struct WorkerLifetime<'a> {
+    stop: &'a Handle,
+    parent: &'a Handle,
+    policy: Option<&'a Handle>,
+}
+
+impl WorkerLifetime<'_> {
+    fn ended(&self, wait: u32) -> bool {
+        self.stop.signaled(wait)
+            || self.parent.signaled(0)
+            || self.policy.is_some_and(|policy| policy.signaled(0))
+    }
+}
+
+fn stop_core(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn start_core(command: &mut Command, job: &Handle, config: &[u8]) -> Result<Child, String> {
+    use std::io::Write;
+    let mut child = command.spawn().map_err(|_| "无法启动代理内核")?;
+    assign(&mut child, job)?;
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(config).is_ok());
+    if !written {
+        stop_core(&mut child);
+        return Err("内核拒绝代理配置".into());
+    }
+    Ok(child)
+}
+
+fn await_core(
+    child: &mut Child,
+    lifetime: &WorkerLifetime<'_>,
+    deadline: Instant,
+    mut is_ready: impl FnMut() -> bool,
+) -> Result<(), String> {
+    loop {
+        if lifetime.ended(0) || !matches!(child.try_wait(), Ok(None)) || Instant::now() >= deadline
+        {
+            stop_core(child);
+            return Err("本地代理入口未就绪".into());
+        }
+        if is_ready() {
+            return Ok(());
+        }
+        if lifetime.ended(70) {
+            stop_core(child);
+            return Err("本地代理入口已停止".into());
+        }
+    }
+}
+
+fn supervise_core(
+    child: &mut Child,
+    lifetime: &WorkerLifetime<'_>,
+    interface: &str,
+    tun_route: Option<MIB_IPFORWARD_ROW2>,
+) -> bool {
+    let tun_routes = [
+        (AF_INET as u16, tun_route),
+        (
+            AF_INET6 as u16,
+            tun_route.and_then(|_| tun_default_route(interface, AF_INET6 as u16)),
+        ),
+    ];
+    let mut next_route_check = tun_route.map(|_| Instant::now() + TUN_ROUTE_CHECK_INTERVAL);
+    let mut failed_route_checks = 0;
+    while !lifetime.ended(150) {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return true;
+        }
+        let now = Instant::now();
+        if next_route_check.is_some_and(|check| now >= check) {
+            next_route_check = Some(now + TUN_ROUTE_CHECK_INTERVAL);
+            let ready = tun_routes.map(|(family, route)| {
+                route.is_none_or(|saved| restore_tun_default_route(interface, family, &saved))
+            });
+            if ready.into_iter().all(|restored| restored) {
+                failed_route_checks = 0;
+            } else {
+                failed_route_checks += 1;
+                if failed_route_checks >= TUN_ROUTE_RECOVERY_ATTEMPTS {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn run_worker(args: &[String]) -> Result<(), String> {
     let [parent, token, port, mode] = args else {
         return Err("网络参数无效".into());
@@ -1163,7 +1312,12 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     {
         return Err("TUN 转发参数不符合入口类型".into());
     }
-    let interface = tun_interface(token);
+    let mut interface = tun_interface(token);
+    let control = if mode == "tun" {
+        TunControl::open(token).ok()
+    } else {
+        None
+    };
     let mut dependency = None;
     let home = if core == Core::Mihomo {
         if mode == "tun" {
@@ -1214,7 +1368,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         Core::Singbox | Core::Bridge => core_path()?,
         Core::Mihomo => crate::bundled_binary("mihomo.exe")?,
     };
-    let config = serde_json::to_vec(&config).map_err(|_| "内核配置无效")?;
+    let initial = serde_json::to_vec(&config).map_err(|_| "内核配置无效")?;
     let job = job()?;
     let config_command = |check: bool| {
         let mut command = core_command(&binary);
@@ -1237,28 +1391,20 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             .stderr(Stdio::null());
         command
     };
-    let deadline = Instant::now()
-        + if core == Core::Mihomo {
-            MIHOMO_READY_TIMEOUT
-        } else if mode == "tun" {
-            TUN_READY_TIMEOUT
-        } else {
-            Duration::from_secs(9)
-        };
-    let mut check = config_command(true)
-        .spawn()
-        .map_err(|_| "无法启动内核检查")?;
-    assign(&mut check, &job)?;
-    use std::io::Write;
-    if check
-        .stdin
-        .take()
-        .ok_or("无法打开内核配置管道")?
-        .write_all(&config)
-        .is_err()
-    {
-        return Err("内核配置检查失败".into());
-    }
+    let timeout = if core == Core::Mihomo {
+        MIHOMO_READY_TIMEOUT
+    } else if mode == "tun" {
+        TUN_READY_TIMEOUT
+    } else {
+        Duration::from_secs(9)
+    };
+    let lifetime = WorkerLifetime {
+        stop: &stop,
+        parent: &parent,
+        policy: dependency.as_ref(),
+    };
+    let initial_deadline = Instant::now() + timeout;
+    let mut check = start_core(&mut config_command(true), &job, &initial)?;
     loop {
         if let Some(status) = check.try_wait().map_err(|_| "无法完成内核检查")? {
             if !status.success() {
@@ -1266,60 +1412,34 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             }
             break;
         }
-        if stop.signaled(50)
-            || parent.signaled(0)
-            || dependency.as_ref().is_some_and(|policy| policy.signaled(0))
-            || Instant::now() >= deadline
-        {
-            let _ = check.kill();
-            let _ = check.wait();
+        if lifetime.ended(50) || Instant::now() >= initial_deadline {
+            stop_core(&mut check);
             return Err("内核配置检查已停止或超时".into());
         }
     }
-    let mut child = config_command(false)
-        .spawn()
-        .map_err(|_| "无法启动代理内核")?;
-    assign(&mut child, &job)?;
-    child
-        .stdin
-        .take()
-        .ok_or("无法打开内核配置管道")?
-        .write_all(&config)
-        .map_err(|_| "内核拒绝代理配置")?;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let tun_route = loop {
-        if stop.signaled(0)
-            || parent.signaled(0)
-            || dependency.as_ref().is_some_and(|policy| policy.signaled(0))
-            || child
-                .try_wait()
-                .map_err(|_| "无法读取内核进程状态")?
-                .is_some()
-            || Instant::now() >= deadline
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("本地代理入口未就绪".into());
-        }
-        let route = if mode == "tun"
-            && UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_ok()
-        {
-            tun_default_route(&interface, AF_INET as u16)
-        } else {
-            None
-        };
-        let dns_ready = policy_dns.is_none_or(|dns| UdpSocket::bind(("127.0.0.1", dns)).is_err());
-        if (mode != "tun" || route.is_some())
-            && dns_ready
-            && TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
-            && (core == Core::Bridge || controller.ready())
-        {
-            break route;
-        }
-        thread::sleep(Duration::from_millis(70));
+    let launch = |config: &[u8], deadline, interface: &str| {
+        let mut child = start_core(&mut config_command(false), &job, config)?;
+        let mut route = None;
+        await_core(&mut child, &lifetime, deadline, || {
+            if mode == "tun" {
+                if UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_err() {
+                    return false;
+                }
+                route = tun_default_route(interface, AF_INET as u16);
+                if route.is_none() {
+                    return false;
+                }
+            }
+            policy_dns.is_none_or(|dns| UdpSocket::bind(("127.0.0.1", dns)).is_err())
+                && TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
+                && (core == Core::Bridge || controller.ready())
+        })?;
+        Ok::<_, String>((child, route))
     };
+    let (mut child, mut route) = launch(&initial, initial_deadline, &interface)?;
     if core == Core::Mihomo && !selections.is_empty() {
-        let budget = deadline
+        let budget = initial_deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_secs(6));
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -1332,59 +1452,73 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             || parent.signaled(0)
             || child.try_wait().map_err(|_| "无法读取内核状态")?.is_some()
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_core(&mut child);
             return Err("Mihomo 在恢复策略选择时已停止".into());
         }
     }
     if mode == "system" {
         system_proxy::enable(&journal, port).map_err(|_| "无法设置系统代理")?;
     }
-    let tun_routes = [
-        (AF_INET as u16, tun_route),
-        (
-            AF_INET6 as u16,
-            tun_route.and_then(|_| tun_default_route(&interface, AF_INET6 as u16)),
-        ),
-    ];
-    let mut next_route_check = tun_route.map(|_| Instant::now() + TUN_ROUTE_CHECK_INTERVAL);
     unsafe {
         SetEvent(ready.0);
     }
-    let mut failed_route_checks = 0;
-    let mut route_failed = false;
-    while !stop.signaled(150)
-        && !parent.signaled(0)
-        && dependency.as_ref().is_none_or(|policy| !policy.signaled(0))
-        && matches!(child.try_wait(), Ok(None))
-    {
-        let now = Instant::now();
-        if next_route_check.is_some_and(|check| now >= check) {
-            next_route_check = Some(now + TUN_ROUTE_CHECK_INTERVAL);
-            let ready = tun_routes.map(|(family, route)| {
-                route.is_none_or(|saved| restore_tun_default_route(&interface, family, &saved))
-            });
-            if ready.into_iter().all(|restored| restored) {
-                failed_route_checks = 0;
-            } else {
-                failed_route_checks += 1;
-                if failed_route_checks >= TUN_ROUTE_RECOVERY_ATTEMPTS {
-                    route_failed = true;
-                    break;
-                }
+    let mut retries = 0;
+    let mut started = Instant::now();
+    let mut failed = false;
+    'session: loop {
+        let lost = supervise_core(&mut child, &lifetime, &interface, route);
+        if lost {
+            if let Some(control) = &control {
+                control.set_recovering(true);
             }
         }
+        stop_core(&mut child);
+        if !lost || lifetime.ended(0) {
+            break;
+        }
+        failed = mode == "tun";
+        let Some(control) = &control else {
+            break;
+        };
+        if started.elapsed() >= TUN_STABLE_TIME {
+            retries = 0;
+        }
+        while let Some(delay) = TUN_RETRY_DELAYS_MS.get(retries) {
+            if !control.enabled() || lifetime.ended(*delay) || !control.enabled() {
+                break 'session;
+            }
+            retries += 1;
+            interface = tun_interface(&uuid::Uuid::new_v4().simple().to_string());
+            let tun = config["inbounds"]
+                .as_array_mut()
+                .and_then(|inbounds| inbounds.iter_mut().find(|entry| entry["type"] == "tun"))
+                .ok_or("恢复 TUN 时找不到网卡设置")?;
+            tun["interface_name"] = json!(&interface);
+            if core == Core::Singbox {
+                control.restore_routing(&mut config);
+            }
+            let replacement = serde_json::to_vec(&config).map_err(|_| "恢复 TUN 配置失败")?;
+            if let Ok((next, replacement_route)) =
+                launch(&replacement, Instant::now() + timeout, &interface)
+            {
+                child = next;
+                route = replacement_route;
+                started = Instant::now();
+                control.set_recovering(false);
+                failed = false;
+                continue 'session;
+            }
+        }
+        break;
     }
     let restored = if mode == "policy" {
         Ok(())
     } else {
         system_proxy::recover(&journal)
     };
-    let _ = child.kill();
-    let _ = child.wait();
     restored.map_err(|_| "无法恢复系统代理")?;
-    if route_failed {
-        return Err("TUN 无法恢复 Windows 默认路由".into());
+    if failed && !lifetime.ended(0) {
+        return Err("TUN 会话中断".into());
     }
     Ok(())
 }

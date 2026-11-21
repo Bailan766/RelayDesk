@@ -39,6 +39,7 @@ impl Plan {
             self.port,
             &self.mode,
             self.routing_mode,
+            self.recover,
         )
     }
 
@@ -171,7 +172,7 @@ struct NodeCheck {
 impl NodeCheck {
     fn is_current(&self, active: &Running) -> bool {
         active.session.id == self.session
-            && active.session.running()
+            && active.session.ready()
             && active.plan.monitors_node()
             && active.health.revision == self.revision
     }
@@ -257,12 +258,20 @@ impl Supervisor {
             };
         };
         let phase = match &slot.active {
-            Some(active) if active.session.running() => "running",
+            Some(active) if active.session.ready() => "running",
             Some(_) => "recovering",
             None => "stopped",
         };
         let message = if phase == "recovering" {
-            Some("内核已退出，正在检查能否恢复")
+            if slot
+                .active
+                .as_ref()
+                .is_some_and(|active| active.session.recovering_tun())
+            {
+                Some("TUN 已中断，正在恢复本次连接")
+            } else {
+                Some("内核已退出，正在检查能否恢复")
+            }
         } else {
             slot.message
         };
@@ -285,7 +294,7 @@ impl Supervisor {
         Ok(slot
             .active
             .as_ref()
-            .filter(|active| active.session.running())
+            .filter(|active| active.session.ready())
             .map(|active| Link {
                 id: active.session.id.clone(),
                 port: active.session.port,
@@ -309,6 +318,9 @@ impl Supervisor {
                 .filter(|active| active.session.id == id)
             {
                 update(&mut active.plan);
+                active
+                    .session
+                    .remember_tun_route(active.plan.routing_mode, &active.plan.settings.config);
                 active.health.reset();
                 slot.message = notice;
                 slot.record("info", event);
@@ -379,7 +391,7 @@ impl Supervisor {
                 .active
                 .as_ref()
                 .filter(|active| {
-                    active.session.running() && active.plan.settings.core == network::Core::Mihomo
+                    active.session.ready() && active.plan.settings.core == network::Core::Mihomo
                 })
                 .ok_or("Mihomo 原配置模式未运行")?;
             (
@@ -463,7 +475,7 @@ impl Supervisor {
     fn node_check(&self) -> Option<NodeCheck> {
         let slot = self.slot.try_lock().ok()?;
         let active = slot.active.as_ref()?;
-        if !active.session.running()
+        if !active.session.ready()
             || !active.plan.monitors_node()
             || Instant::now() < active.health.next_check
         {
@@ -577,14 +589,14 @@ impl Supervisor {
                 state.slot.try_lock().ok().and_then(|slot| {
                     slot.active
                         .as_ref()
-                        .filter(|active| active.session.running())
+                        .filter(|active| active.session.ready())
                         .map(|active| active.session.id.clone())
                 })
             };
             let link = state.slot.try_lock().ok().and_then(|slot| {
                 slot.active
                     .as_ref()
-                    .filter(|active| active.session.running())
+                    .filter(|active| active.session.ready())
                     .map(|active| (active.session.id.clone(), active.session.controller.clone()))
             });
             if let Some((id, controller)) = link {
@@ -627,6 +639,7 @@ impl Supervisor {
         let mut slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
         if let Some(active) = slot.active.as_mut() {
             active.plan.recover = enabled;
+            active.session.configure_tun_recovery(enabled);
         }
         Ok(())
     }
@@ -772,6 +785,7 @@ mod tests {
                     &plan.mode,
                     plan.routing_mode,
                     &executable,
+                    plan.recover,
                 )
             })
             .unwrap();
@@ -893,6 +907,7 @@ mod tests {
                 &plan.mode,
                 plan.routing_mode,
                 &executable,
+                plan.recover,
             )
         };
         let plan = Plan {

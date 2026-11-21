@@ -894,7 +894,7 @@ function App() {
                   内核意外退出时自动恢复
                 </label>
               </div>
-              <p className="rule-hint">适用于系统代理和本地端口。TUN 重新连接时需要管理员授权。</p>
+              <p className="rule-hint">TUN 可在本次授权内恢复接管内核。手动重新连接仍需授权。</p>
               <div className="env-row">
                 <label>
                   <input type="checkbox" checked={autoFailover} disabled={!work.ready} onChange={event => {

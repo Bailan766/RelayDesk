@@ -206,23 +206,23 @@ impl Controller {
         if !response.status().is_success() {
             return Err("内核未接受路由模式".into());
         }
-        let status = self
-            .request(reqwest::Method::GET, "/configs")?
-            .send()
-            .await
-            .map_err(|_| "读取内核路由模式失败")?
-            .text()
-            .await
-            .map_err(|_| "读取内核路由模式失败")?;
-        let body: Value = serde_json::from_str(&status).map_err(|_| "内核路由模式响应无效")?;
-        if body["mode"]
-            .as_str()
-            .is_some_and(|active| active.eq_ignore_ascii_case(mode))
+        if self
+            .current_routing_mode()
+            .await?
+            .eq_ignore_ascii_case(mode)
         {
             Ok(())
         } else {
             Err("内核未切换路由模式".into())
         }
+    }
+
+    pub async fn current_routing_mode(&self) -> Result<String, String> {
+        let body: Value = self.read_json("/configs").await?;
+        body["mode"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "内核路由模式响应无效".into())
     }
 
     pub async fn snapshot(&self) -> Result<Snapshot, String> {
