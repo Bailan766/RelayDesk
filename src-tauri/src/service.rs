@@ -113,13 +113,16 @@ pub(crate) enum PipeEvent {
         id: String,
         port: u16,
         controller: crate::telemetry::Controller,
-        tun_dns: Option<(u16, u16)>,
+        tun_interface: Option<String>,
+        tun_ipv6: bool,
         allow_lan: bool,
     },
     State {
         running: bool,
         recovering: bool,
         generation: u32,
+        #[serde(default)]
+        tun_interface: Option<String>,
     },
     Error {
         message: String,
@@ -132,6 +135,7 @@ pub struct ServiceRuntimeState {
     pub running: AtomicBool,
     pub recovering: AtomicBool,
     pub generation: AtomicU32,
+    pub tun_interface: Mutex<Option<String>>,
 }
 
 pub struct ServiceSession {
@@ -140,11 +144,15 @@ pub struct ServiceSession {
     pub port: u16,
     pub controller: crate::telemetry::Controller,
     pub id: String,
-    pub tun_dns: Option<(u16, u16)>,
+    pub tun_ipv6: bool,
     pub allow_lan: bool,
 }
 
 impl ServiceSession {
+    pub fn active_tun_interface(&self) -> Option<String> {
+        self.state.tun_interface.lock().ok().and_then(|guard| guard.clone())
+    }
+
     pub fn send_command(&self, command: &PipeCommand) -> Result<(), String> {
         let mut line = serde_json::to_vec(command).map_err(|_| "服务指令编码失败")?;
         line.push(b'\n');
@@ -367,14 +375,15 @@ pub(crate) fn try_start_tun(
         Ok(event) => event,
         Err(_) => return Some(Err("后台服务返回无效响应".into())),
     };
-    let (id, ready_port, controller, tun_dns, allow_lan) = match event {
+    let (id, ready_port, controller, tun_interface, tun_ipv6, allow_lan) = match event {
         PipeEvent::Ready {
             id,
             port,
             controller,
-            tun_dns,
+            tun_interface,
+            tun_ipv6,
             allow_lan,
-        } => (id, port, controller, tun_dns, allow_lan),
+        } => (id, port, controller, tun_interface, tun_ipv6, allow_lan),
         PipeEvent::Error { message } => return Some(Err(message)),
         _ => return Some(Err("后台服务返回未预期的启动状态".into())),
     };
@@ -382,6 +391,7 @@ pub(crate) fn try_start_tun(
         running: AtomicBool::new(true),
         recovering: AtomicBool::new(false),
         generation: AtomicU32::new(0),
+        tun_interface: Mutex::new(tun_interface),
     });
     let state_reader = Arc::clone(&state);
     thread::spawn(move || {
@@ -416,10 +426,16 @@ pub(crate) fn try_start_tun(
                                     running,
                                     recovering,
                                     generation,
+                                    tun_interface,
                                 }) => {
                                     state_reader.running.store(running, Ordering::Release);
                                     state_reader.recovering.store(recovering, Ordering::Release);
                                     state_reader.generation.store(generation, Ordering::Release);
+                                    if let Some(iface) = tun_interface {
+                                        if let Ok(mut guard) = state_reader.tun_interface.lock() {
+                                            *guard = Some(iface);
+                                        }
+                                    }
                                     if !running {
                                         return;
                                     }
@@ -447,7 +463,7 @@ pub(crate) fn try_start_tun(
         port: ready_port,
         controller,
         id,
-        tun_dns,
+        tun_ipv6,
         allow_lan,
     }))
 }
@@ -529,7 +545,7 @@ pub fn install_current() -> Result<(), String> {
     fs::create_dir_all(&target_dir).map_err(|_| "无法创建后台服务目录")?;
     let exe_dest = target_dir.join("relaydesk-service.exe");
     fs::copy(&current_exe, &exe_dest).map_err(|_| "无法复制服务程序文件（请先停止使用服务的代理后重试）")?;
-    for required in ["sing-box.exe", "mihomo.exe"] {
+    for required in ["sing-box.exe", "mihomo.exe", "wintun.dll"] {
         let src = source_dir.join(required);
         if !src.is_file() {
             return Err(format!("应用目录缺少 {required}"));
@@ -856,7 +872,8 @@ fn handle_pipe_client(mut pipe: File) {
                     id: session.id.clone(),
                     port: session.port,
                     controller: session.controller.clone(),
-                    tun_dns: session.tun_dns,
+                    tun_interface: session.active_tun_interface(),
+                    tun_ipv6: session.tun_ipv6,
                     allow_lan: session.allow_lan,
                 },
             )
@@ -950,8 +967,8 @@ fn handle_pipe_client(mut pipe: File) {
                 if graceful_stop || !session.running() {
                     break;
                 }
-                if session.needs_policy_restart() {
-                    let _ = session.stage_policy_restart(&settings, routing_mode);
+                if session.needs_mihomo_restart() {
+                    let _ = session.stage_mihomo_restart(&settings, routing_mode);
                 }
                 let recovering = session.recovering_tun();
                 let generation = session.generation();
@@ -964,6 +981,7 @@ fn handle_pipe_client(mut pipe: File) {
                             running: true,
                             recovering,
                             generation,
+                            tun_interface: session.active_tun_interface(),
                         },
                     )
                     .is_err()
@@ -1088,6 +1106,7 @@ mod tests {
             running: true,
             recovering: true,
             generation: 2,
+            tun_interface: Some("RelayDesk-fixture".into()),
         };
         let encoded_evt = serde_json::to_string(&evt).unwrap();
         let decoded_evt: PipeEvent = serde_json::from_str(&encoded_evt).unwrap();
@@ -1096,7 +1115,8 @@ mod tests {
             PipeEvent::State {
                 running: true,
                 recovering: true,
-                generation: 2
+                generation: 2,
+                ..
             }
         ));
     }

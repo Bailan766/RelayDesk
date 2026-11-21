@@ -1,8 +1,21 @@
 import { useMemo, useState } from "react";
-import { evaluateRuleMatch, normalizeRuleValue, rulePresets, ruleTypes, type RouteRule, type RuleDefaultAction } from "../config";
+import {
+  evaluateRuleMatch,
+  normalizeRuleSetTag,
+  normalizeRuleValue,
+  remoteRuleSetPresets,
+  rulePresets,
+  ruleTypes,
+  validateRuleSet,
+  type RouteRule,
+  type RuleDefaultAction,
+  type RuleSetAction,
+  type RuleSetConfig,
+} from "../config";
 
 export function RulesEditor({
   rules,
+  ruleSets,
   targets,
   defaultAction,
   dirtyWhileRunning,
@@ -10,9 +23,11 @@ export function RulesEditor({
   isMihomo = false,
   onDefaultAction,
   onChange,
+  onChangeRuleSets,
   onApplyReconnect,
 }: {
   rules: RouteRule[];
+  ruleSets: RuleSetConfig[];
   targets: { id: string; label: string }[];
   defaultAction: RuleDefaultAction;
   dirtyWhileRunning: boolean;
@@ -20,6 +35,7 @@ export function RulesEditor({
   isMihomo?: boolean;
   onDefaultAction: (action: RuleDefaultAction) => void;
   onChange: (edit: (rules: RouteRule[]) => RouteRule[]) => void;
+  onChangeRuleSets: (edit: (sets: RuleSetConfig[]) => RuleSetConfig[]) => void;
   onApplyReconnect: () => void;
 }) {
   const [type, setType] = useState<RouteRule["type"]>("domain_suffix");
@@ -30,6 +46,12 @@ export function RulesEditor({
   const [validationError, setValidationError] = useState("");
   const [presetHint, setPresetHint] = useState("");
   const [probeInput, setProbeInput] = useState("");
+  const [customTag, setCustomTag] = useState("");
+  const [customLabel, setCustomLabel] = useState("");
+  const [customUrl, setCustomUrl] = useState("");
+  const [customFormat, setCustomFormat] = useState<"binary" | "source">("binary");
+  const [customAction, setCustomAction] = useState<RuleSetAction>("direct");
+  const [ruleSetError, setRuleSetError] = useState("");
 
   const matchResult = useMemo(() => {
     if (!probeInput.trim()) return undefined;
@@ -111,6 +133,7 @@ export function RulesEditor({
   }
 
   return (
+    <>
     <section className="panel">
       <div className="panel-head">
         <h2>分流规则 ({rules.length})</h2>
@@ -281,5 +304,178 @@ export function RulesEditor({
         <p className="empty">暂无自定义规则。可上方一键导入“绕过局域网与保留地址”或“常见国内站点直连”。</p>
       )}
     </section>
+
+    <section className="panel" style={{ marginTop: 14 }}>
+      <div className="panel-head">
+        <h2>远程规则集（节点模式 · sing-box rule_set）</h2>
+        <span className="muted" style={{ fontSize: 12 }}>在上方自定义规则之后匹配，由内核后台自动拉取更新（.srs）</span>
+      </div>
+      <div style={{ display: "grid", gap: 6, marginBottom: 12 }}>
+        {remoteRuleSetPresets.map(preset => {
+          const active = ruleSets.find(item => item.tag === preset.tag);
+          const enabled = active?.enabled ?? false;
+          const currentAction = active?.action ?? preset.action;
+          const currentDetour = active?.downloadDetour ?? preset.downloadDetour ?? "proxy";
+          return (
+            <div className="env-row" key={preset.tag}>
+              <label className="checkbox-inline" style={{ cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={enabled}
+                  onChange={e => {
+                    const checked = e.target.checked;
+                    onChangeRuleSets(prev => {
+                      const existing = prev.find(item => item.tag === preset.tag);
+                      if (existing) {
+                        return prev.map(item => (item.tag === preset.tag ? { ...item, enabled: checked } : item));
+                      }
+                      return [...prev, { ...preset, enabled: checked }];
+                    });
+                  }}
+                />
+                <span>
+                  <strong>{preset.label}</strong>
+                  <small className="muted" style={{ marginLeft: 8 }}>{preset.tag}.srs</small>
+                </span>
+              </label>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <select
+                  aria-label={`${preset.label} 动作`}
+                  value={currentAction}
+                  onChange={e => {
+                    const nextAction = e.target.value as RuleSetAction;
+                    onChangeRuleSets(prev => {
+                      const existing = prev.find(item => item.tag === preset.tag);
+                      if (existing) {
+                        return prev.map(item => (item.tag === preset.tag ? { ...item, action: nextAction } : item));
+                      }
+                      return [...prev, { ...preset, action: nextAction, enabled: false }];
+                    });
+                  }}
+                >
+                  <option value="direct">直连</option>
+                  <option value="proxy">代理</option>
+                  <option value="reject">拦截</option>
+                </select>
+                <select
+                  aria-label={`${preset.label} 下载通道`}
+                  value={currentDetour}
+                  onChange={e => {
+                    const detour = e.target.value as "proxy" | "direct";
+                    onChangeRuleSets(prev => {
+                      const existing = prev.find(item => item.tag === preset.tag);
+                      if (existing) {
+                        return prev.map(item => (item.tag === preset.tag ? { ...item, downloadDetour: detour } : item));
+                      }
+                      return [...prev, { ...preset, downloadDetour: detour, enabled: false }];
+                    });
+                  }}
+                >
+                  <option value="proxy">下载走代理</option>
+                  <option value="direct">下载直连</option>
+                </select>
+              </div>
+            </div>
+          );
+        })}
+        {ruleSets
+          .filter(item => !remoteRuleSetPresets.some(preset => preset.tag === item.tag))
+          .map(custom => (
+            <div className="env-row" key={custom.tag}>
+              <label className="checkbox-inline" style={{ cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={custom.enabled}
+                  onChange={e =>
+                    onChangeRuleSets(prev =>
+                      prev.map(item => (item.tag === custom.tag ? { ...item, enabled: e.target.checked } : item)),
+                    )
+                  }
+                />
+                <span>
+                  <strong>{custom.label}</strong>
+                  <small className="muted" style={{ marginLeft: 8 }}>{custom.url}</small>
+                </span>
+              </label>
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span className="tag">
+                  {custom.action === "direct" ? "直连" : custom.action === "reject" ? "拦截" : "代理"}
+                </span>
+                <button
+                  type="button"
+                  className="link"
+                  onClick={() => onChangeRuleSets(prev => prev.filter(item => item.tag !== custom.tag))}
+                >
+                  移除
+                </button>
+              </div>
+            </div>
+          ))}
+      </div>
+
+      <form
+        className="rule-form"
+        onSubmit={e => {
+          e.preventDefault();
+          setRuleSetError("");
+          try {
+            const candidate = validateRuleSet({
+              tag: normalizeRuleSetTag(customTag || customLabel),
+              label: customLabel || customTag,
+              url: customUrl,
+              format: customFormat,
+              action: customAction,
+              enabled: true,
+              downloadDetour: "proxy",
+              updateInterval: "24h",
+            });
+            if (ruleSets.some(item => item.tag === candidate.tag) || remoteRuleSetPresets.some(p => p.tag === candidate.tag)) {
+              throw new Error(`规则集标识「${candidate.tag}」已存在`);
+            }
+            onChangeRuleSets(prev => [...prev, candidate]);
+            setCustomTag("");
+            setCustomLabel("");
+            setCustomUrl("");
+          } catch (failure) {
+            setRuleSetError(failure instanceof Error ? failure.message : "远程规则集配置无效");
+          }
+        }}
+      >
+        <input
+          aria-label="自定义规则集标识"
+          placeholder="标识（如 geoip-us）"
+          value={customTag}
+          onChange={e => setCustomTag(e.target.value)}
+          style={{ maxWidth: 140 }}
+        />
+        <input
+          aria-label="自定义规则集名称"
+          placeholder="名称（可选）"
+          value={customLabel}
+          onChange={e => setCustomLabel(e.target.value)}
+          style={{ maxWidth: 140 }}
+        />
+        <input
+          aria-label="远程规则集 HTTPS URL"
+          placeholder="https://.../rule.srs"
+          value={customUrl}
+          onChange={e => setCustomUrl(e.target.value)}
+        />
+        <select aria-label="规则集格式" value={customFormat} onChange={e => setCustomFormat(e.target.value as "binary" | "source")}>
+          <option value="binary">SRS 二进制</option>
+          <option value="source">JSON 源码</option>
+        </select>
+        <select aria-label="自定义规则集动作" value={customAction} onChange={e => setCustomAction(e.target.value as RuleSetAction)}>
+          <option value="direct">直连</option>
+          <option value="proxy">代理</option>
+          <option value="reject">拦截</option>
+        </select>
+        <button type="button" className="mini-btn is-primary" disabled={!customUrl.trim() || (!customTag.trim() && !customLabel.trim())} onClick={e => e.currentTarget.form?.requestSubmit()}>
+          添加远程规则集
+        </button>
+      </form>
+      {ruleSetError && <p className="error" role="alert">{ruleSetError}</p>}
+    </section>
+    </>
   );
 }

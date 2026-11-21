@@ -1,12 +1,15 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { decryptBackup, encryptBackup, isEncryptedBackup } from "../backupCrypto";
 import {
+  defaultHotkeys,
   defaultProbeUrl,
   defaultSystemProxyBypass,
   deserializeWorkspace,
   serializeWorkspace,
   type CloseAction,
+  type GlobalHotkeys,
   type ThemeMode,
   type Workspace,
 } from "../workspace";
@@ -35,6 +38,42 @@ export type TunServiceStatus = {
   upToDate: boolean;
 };
 
+export type HotkeyErrors = {
+  toggleProxy?: string | null;
+  cycleRouting?: string | null;
+  showWindow?: string | null;
+};
+
+function recordHotkeyFromEvent(e: KeyboardEvent<HTMLInputElement>): string | null {
+  if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return null;
+  const mods: string[] = [];
+  if (e.ctrlKey) mods.push("Ctrl");
+  if (e.altKey) mods.push("Alt");
+  if (e.shiftKey) mods.push("Shift");
+  if (e.metaKey) mods.push("Win");
+  if (!mods.length) return null;
+
+  let key = "";
+  if (e.code.startsWith("Key") && e.code.length === 4) key = e.code.slice(3).toUpperCase();
+  else if (e.code.startsWith("Digit") && e.code.length === 6) key = e.code.slice(5);
+  else if (/^F([1-9]|1[0-2])$/.test(e.code)) key = e.code;
+  else if (e.code === "Space") key = "Space";
+  else if (e.code === "Tab") key = "Tab";
+  else if (e.code === "Insert") key = "Insert";
+  else if (e.code === "Delete") key = "Delete";
+  else if (e.code === "Home") key = "Home";
+  else if (e.code === "End") key = "End";
+  else if (e.code === "PageUp") key = "PageUp";
+  else if (e.code === "PageDown") key = "PageDown";
+  else if (e.code === "ArrowUp") key = "Up";
+  else if (e.code === "ArrowDown") key = "Down";
+  else if (e.code === "ArrowLeft") key = "Left";
+  else if (e.code === "ArrowRight") key = "Right";
+  else return null;
+
+  return `${mods.join("+")}+${key}`;
+}
+
 export function SettingsPage({
   workspace,
   ready,
@@ -43,6 +82,7 @@ export function SettingsPage({
   elevated,
   serviceStatus,
   serviceBusy,
+  hotkeyErrors,
   onInstallService,
   onUninstallService,
   onSave,
@@ -54,6 +94,7 @@ export function SettingsPage({
   elevated: boolean;
   serviceStatus: TunServiceStatus | null;
   serviceBusy: boolean;
+  hotkeyErrors?: HotkeyErrors;
   onInstallService: () => void;
   onUninstallService: () => void;
   onSave: (edit: (previous: Workspace) => Workspace) => Promise<void>;
@@ -68,8 +109,19 @@ export function SettingsPage({
   const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo>();
   const [updateInstalling, setUpdateInstalling] = useState(false);
   const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress>();
+  const [exportPassword, setExportPassword] = useState("");
+  const [pendingEncryptedImport, setPendingEncryptedImport] = useState<{ name: string; raw: string }>();
+  const [importPassword, setImportPassword] = useState("");
+  const [cryptoBusy, setCryptoBusy] = useState(false);
   const [error, setError] = useState("");
   const backupInputRef = useRef<HTMLInputElement>(null);
+
+  function saveHotkey(field: keyof GlobalHotkeys, value: string) {
+    void onSave(s => ({
+      ...s,
+      hotkeys: { ...(s.hotkeys ?? defaultHotkeys), [field]: value },
+    }));
+  }
 
   useEffect(() => {
     if (!isTauri() || !updateInstalling) return;
@@ -428,69 +480,222 @@ export function SettingsPage({
       </section>
 
       <section className="panel">
-        <div className="panel-head"><h2>备份与恢复</h2></div>
-        <div className="setting-item">
-          <div className="setting-label">
-            <strong>导出 / 导入工作区配置</strong>
-            <small>备份全部订阅、分流规则、收藏与界面偏好为 JSON 文件（含订阅链接，请妥善保管）</small>
-          </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <div className="panel-head">
+          <h2>全局快捷键（Windows）</h2>
+          <div style={{ display: "flex", gap: 6 }}>
             <button
               type="button"
               className="mini-btn"
-              disabled={!ready}
-              onClick={() => {
-                const json = serializeWorkspace(workspace);
-                const blob = new Blob([json], { type: "application/json;charset=utf-8" });
-                const url = URL.createObjectURL(blob);
-                const link = document.createElement("a");
-                link.href = url;
-                link.download = `relaydesk-backup-${new Date().toISOString().slice(0, 10)}.json`;
-                link.click();
-                URL.revokeObjectURL(url);
-                setError("");
-                setFeedback("已导出工作区配置备份");
-              }}
+              disabled={!ready || !isTauri()}
+              onClick={() =>
+                void onSave(s => ({
+                  ...s,
+                  hotkeys: {
+                    toggleProxy: "Ctrl+Alt+P",
+                    cycleRouting: "Ctrl+Alt+M",
+                    showWindow: "Ctrl+Alt+R",
+                  },
+                })).then(() => setFeedback("已应用推荐全局快捷键（Ctrl+Alt+P/M/R）"))
+              }
             >
-              导出备份 JSON
+              填入推荐组合
             </button>
-            <input
-              ref={backupInputRef}
-              type="file"
-              accept=".json,application/json"
-              hidden
-              onChange={async e => {
-                const file = e.target.files?.[0];
-                e.target.value = "";
-                if (!file) return;
-                try {
-                  const text = await file.text();
-                  const parsed = JSON.parse(text) as unknown;
-                  if (
-                    !parsed ||
-                    typeof parsed !== "object" ||
-                    Array.isArray(parsed) ||
-                    (!("subscriptions" in parsed) && !("rules" in parsed))
-                  ) {
-                    throw new Error("备份文件不是有效的 RelayDesk 工作区 JSON");
-                  }
-                  const restored = deserializeWorkspace(text);
-                  await onSave(() => restored);
-                  setError("");
-                  setFeedback(`已恢复备份（含 ${restored.subscriptions.length} 份订阅与 ${restored.rules.length} 条规则）`);
-                } catch (failure) {
-                  setError(failure instanceof Error ? failure.message : "导入备份失败，请确认文件格式");
-                }
-              }}
-            />
             <button
               type="button"
-              className="mini-btn is-primary"
-              disabled={!ready || busy || running}
-              onClick={() => backupInputRef.current?.click()}
+              className="mini-btn"
+              disabled={!ready || (!workspace.hotkeys.toggleProxy && !workspace.hotkeys.cycleRouting && !workspace.hotkeys.showWindow)}
+              onClick={() => void onSave(s => ({ ...s, hotkeys: { ...defaultHotkeys } }))}
             >
-              从备份恢复
+              全部清空
             </button>
+          </div>
+        </div>
+        {(
+          [
+            ["toggleProxy", "一键开关代理", "在后台或最小化时快速连接 / 断开当前代理", hotkeyErrors?.toggleProxy],
+            ["cycleRouting", "循环切换路由模式", "按「规则 → 全局 → 直连」循环切换", hotkeyErrors?.cycleRouting],
+            ["showWindow", "显示 / 唤起主窗口", "从系统托盘恢复并前置 RelayDesk 窗口", hotkeyErrors?.showWindow],
+          ] as const
+        ).map(([field, title, desc, fieldError]) => (
+          <div className="setting-item" key={field}>
+            <div className="setting-label">
+              <strong>{title}</strong>
+              <small>{desc}</small>
+              {fieldError && <small className="error">{fieldError}</small>}
+            </div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input
+                aria-label={title}
+                readOnly
+                style={{ width: 170, textAlign: "center", fontFamily: "ui-monospace, Consolas, monospace" }}
+                value={workspace.hotkeys[field] || ""}
+                placeholder="点击后按下组合键"
+                disabled={!ready || !isTauri()}
+                onKeyDown={e => {
+                  if (e.key === "Escape") {
+                    e.currentTarget.blur();
+                    return;
+                  }
+                  if ((e.key === "Backspace" || e.key === "Delete") && !e.ctrlKey && !e.altKey && !e.shiftKey) {
+                    e.preventDefault();
+                    saveHotkey(field, "");
+                    return;
+                  }
+                  const combo = recordHotkeyFromEvent(e);
+                  if (combo) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    saveHotkey(field, combo);
+                  }
+                }}
+              />
+              {workspace.hotkeys[field] && (
+                <button type="button" className="mini-btn" onClick={() => saveHotkey(field, "")}>清除</button>
+              )}
+            </div>
+          </div>
+        ))}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head"><h2>备份与恢复</h2></div>
+        <div className="setting-item" style={{ alignItems: "flex-start" }}>
+          <div className="setting-label">
+            <strong>导出 / 导入工作区配置</strong>
+            <small>支持可选 AES-256-GCM 密码加密备份；未输入密码则导出普通 JSON</small>
+          </div>
+          <div style={{ display: "grid", gap: 8, justifyItems: "end" }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <input
+                type="password"
+                aria-label="导出备份加密密码"
+                placeholder="可选加密密码（≥4位）"
+                value={exportPassword}
+                disabled={!ready || cryptoBusy}
+                style={{ width: 190 }}
+                onChange={e => setExportPassword(e.target.value)}
+              />
+              <button
+                type="button"
+                className="mini-btn"
+                disabled={!ready || cryptoBusy}
+                onClick={async () => {
+                  setError("");
+                  setCryptoBusy(true);
+                  try {
+                    const plain = serializeWorkspace(workspace);
+                    const useEncrypt = exportPassword.length > 0;
+                    const output = useEncrypt ? await encryptBackup(plain, exportPassword) : plain;
+                    const blob = new Blob([output], { type: "application/json;charset=utf-8" });
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement("a");
+                    link.href = url;
+                    const date = new Date().toISOString().slice(0, 10);
+                    link.download = useEncrypt ? `relaydesk-backup-${date}.enc.json` : `relaydesk-backup-${date}.json`;
+                    link.click();
+                    URL.revokeObjectURL(url);
+                    setFeedback(useEncrypt ? "已加密导出工作区备份（AES-256-GCM）" : "已导出明文工作区备份 JSON");
+                  } catch (failure) {
+                    setError(failure instanceof Error ? failure.message : "导出备份失败");
+                  } finally {
+                    setCryptoBusy(false);
+                  }
+                }}
+              >
+                {exportPassword.length > 0 ? "加密导出备份" : "导出备份 JSON"}
+              </button>
+              <input
+                ref={backupInputRef}
+                type="file"
+                accept=".json,application/json"
+                hidden
+                onChange={async e => {
+                  const file = e.target.files?.[0];
+                  e.target.value = "";
+                  if (!file) return;
+                  try {
+                    const text = await file.text();
+                    if (isEncryptedBackup(text)) {
+                      setPendingEncryptedImport({ name: file.name, raw: text });
+                      setImportPassword("");
+                      setError("");
+                      setFeedback(`检测到加密备份「${file.name}」，请输入密码解密后恢复`);
+                      return;
+                    }
+                    const parsed = JSON.parse(text) as unknown;
+                    if (
+                      !parsed ||
+                      typeof parsed !== "object" ||
+                      Array.isArray(parsed) ||
+                      (!("subscriptions" in parsed) && !("rules" in parsed))
+                    ) {
+                      throw new Error("备份文件不是有效的 RelayDesk 工作区 JSON");
+                    }
+                    const restored = deserializeWorkspace(text);
+                    await onSave(() => restored);
+                    setPendingEncryptedImport(undefined);
+                    setError("");
+                    setFeedback(`已恢复备份（含 ${restored.subscriptions.length} 份订阅与 ${restored.rules.length} 条规则）`);
+                  } catch (failure) {
+                    setError(failure instanceof Error ? failure.message : "导入备份失败，请确认文件格式");
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="mini-btn is-primary"
+                disabled={!ready || busy || running || cryptoBusy}
+                onClick={() => backupInputRef.current?.click()}
+              >
+                从备份恢复
+              </button>
+            </div>
+            {pendingEncryptedImport && (
+              <form
+                className="rule-form"
+                style={{ margin: 0 }}
+                onSubmit={async e => {
+                  e.preventDefault();
+                  setCryptoBusy(true);
+                  setError("");
+                  try {
+                    const plain = await decryptBackup(pendingEncryptedImport.raw, importPassword);
+                    const restored = deserializeWorkspace(plain);
+                    await onSave(() => restored);
+                    setPendingEncryptedImport(undefined);
+                    setImportPassword("");
+                    setFeedback(`已解密并恢复备份（含 ${restored.subscriptions.length} 份订阅与 ${restored.rules.length} 条规则）`);
+                  } catch (failure) {
+                    setError(failure instanceof Error ? failure.message : "解密备份失败");
+                  } finally {
+                    setCryptoBusy(false);
+                  }
+                }}
+              >
+                <input
+                  type="password"
+                  aria-label="解密备份密码"
+                  placeholder={`输入「${pendingEncryptedImport.name}」的解密密码`}
+                  value={importPassword}
+                  disabled={cryptoBusy}
+                  onChange={e => setImportPassword(e.target.value)}
+                />
+                <button type="submit" className="mini-btn is-primary" disabled={cryptoBusy || !importPassword}>
+                  解密并恢复
+                </button>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={cryptoBusy}
+                  onClick={() => {
+                    setPendingEncryptedImport(undefined);
+                    setImportPassword("");
+                  }}
+                >
+                  取消
+                </button>
+              </form>
+            )}
           </div>
         </div>
       </section>

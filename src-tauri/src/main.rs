@@ -10,9 +10,11 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 mod failover;
+mod hotkeys;
 mod logs;
 mod mihomo;
 mod network;
+mod netwatch;
 mod probes;
 mod service;
 mod storage;
@@ -200,6 +202,9 @@ async fn start_mihomo(
         return Err("本地端口无效".into());
     }
     bundled_binary("mihomo.exe")?;
+    if mode == "tun" {
+        bundled_binary("wintun.dll")?;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<ProxyState>().start(supervisor::Plan {
             settings: network::CoreSettings {
@@ -282,6 +287,320 @@ fn proxy_events(state: tauri::State<'_, ProxyState>) -> Result<Vec<supervisor::E
 #[tauri::command]
 fn clear_proxy_events(state: tauri::State<'_, ProxyState>) -> Result<(), String> {
     state.clear_events()
+}
+
+#[tauri::command]
+fn set_dns_capture(enabled: bool, state: tauri::State<'_, ProxyState>) {
+    state.set_dns_capture(enabled);
+}
+
+#[tauri::command]
+fn proxy_dns_queries(state: tauri::State<'_, ProxyState>) -> Vec<telemetry::DnsLogEntry> {
+    state.dns_queries()
+}
+
+#[tauri::command]
+fn clear_dns_queries(state: tauri::State<'_, ProxyState>) {
+    state.clear_dns_queries();
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DnsProbeBranch {
+    ok: bool,
+    answers: Vec<String>,
+    is_fake_ip: bool,
+    latency_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DnsProbeReport {
+    domain: String,
+    qtype: String,
+    topology_hint: String,
+    local_os: DnsProbeBranch,
+    core_internal: Option<DnsProbeBranch>,
+    remote_doh: DnsProbeBranch,
+}
+
+#[tauri::command]
+async fn probe_dns_resolution(
+    domain: String,
+    qtype: Option<String>,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<DnsProbeReport, String> {
+    let normalized = domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || normalized.contains("://")
+        || !normalized.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })
+    {
+        return Err("请输入有效的域名，例如 api.openai.com".into());
+    }
+    let record_type = if qtype
+        .as_deref()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("AAAA"))
+    {
+        "AAAA"
+    } else {
+        "A"
+    };
+    let expected_rr_type: u16 = if record_type == "AAAA" { 28 } else { 1 };
+
+    let ctx = state.active_dns_context();
+    let (active_port, controller, topology_hint) = match &ctx {
+        None => (
+            None,
+            None,
+            "代理未运行：本机直连系统 DNS；远程 DoH 对比直连 1.1.1.1".to_owned(),
+        ),
+        Some((network::Core::Singbox, mode, port, _)) if mode == "tun" => (
+            Some(*port),
+            None,
+            "节点模式 + TUN：UDP/53 经 TUN 劫持分流至本机 bootstrap / 远程 1.1.1.1 DoH".to_owned(),
+        ),
+        Some((network::Core::Singbox, _, port, _)) => (
+            Some(*port),
+            None,
+            "节点模式 + 系统/本地代理：浏览器等经代理域名由远端节点解析；本机系统探测走物理 DNS".to_owned(),
+        ),
+        Some((network::Core::Mihomo, mode, port, ctrl)) if mode == "tun" => (
+            Some(*port),
+            Some(ctrl.clone()),
+            "Mihomo 原生 TUN：UDP/53 劫持进入 Mihomo DNS（Fake-IP / 策略组上游解析）".to_owned(),
+        ),
+        Some((network::Core::Mihomo, _, port, ctrl)) => (
+            Some(*port),
+            Some(ctrl.clone()),
+            "Mihomo 系统/本地代理：可对照本机系统 DNS 与 Mihomo 内核 DNS（/dns/query）".to_owned(),
+        ),
+    };
+
+    let local_fut = async {
+        let started = std::time::Instant::now();
+        match tokio::time::timeout(
+            Duration::from_secs(4),
+            tokio::net::lookup_host((normalized.as_str(), 443)),
+        )
+        .await
+        {
+            Ok(Ok(addrs)) => {
+                let all: Vec<std::net::IpAddr> = addrs.map(|a| a.ip()).collect();
+                let matching: Vec<std::net::IpAddr> = all
+                    .iter()
+                    .copied()
+                    .filter(|ip| {
+                        if record_type == "AAAA" {
+                            ip.is_ipv6()
+                        } else {
+                            ip.is_ipv4()
+                        }
+                    })
+                    .collect();
+                let chosen = if matching.is_empty() { all } else { matching };
+                let is_fake_ip = chosen.iter().copied().any(telemetry::is_fake_ip_addr);
+                DnsProbeBranch {
+                    ok: !chosen.is_empty(),
+                    answers: chosen.into_iter().map(|ip| ip.to_string()).collect(),
+                    is_fake_ip,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    error: None,
+                }
+            }
+            Ok(Err(_)) => DnsProbeBranch {
+                ok: false,
+                answers: Vec::new(),
+                is_fake_ip: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                error: Some("系统 DNS 解析失败".into()),
+            },
+            Err(_) => DnsProbeBranch {
+                ok: false,
+                answers: Vec::new(),
+                is_fake_ip: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                error: Some("系统 DNS 解析超时".into()),
+            },
+        }
+    };
+
+    let core_fut = async {
+        let ctrl = controller?;
+        let started = std::time::Instant::now();
+        match ctrl.query_dns(&normalized, record_type).await {
+            Ok(val) => {
+                let answers: Vec<String> = val
+                    .get("Answer")
+                    .and_then(|v| v.as_array())
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|item| {
+                                item.get("data")
+                                    .and_then(|d| d.as_str())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let is_fake_ip = answers.iter().any(|item| {
+                    item.parse::<std::net::IpAddr>()
+                        .is_ok_and(telemetry::is_fake_ip_addr)
+                });
+                Some(DnsProbeBranch {
+                    ok: !answers.is_empty(),
+                    answers,
+                    is_fake_ip,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    error: None,
+                })
+            }
+            Err(err) => Some(DnsProbeBranch {
+                ok: false,
+                answers: Vec::new(),
+                is_fake_ip: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                error: Some(err),
+            }),
+        }
+    };
+
+    let doh_fut = async {
+        #[derive(serde::Deserialize)]
+        struct DohAnswer {
+            #[serde(rename = "type", default)]
+            rtype: u16,
+            #[serde(default)]
+            data: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct DohResponse {
+            #[serde(rename = "Answer", default)]
+            answers: Vec<DohAnswer>,
+        }
+        let started = std::time::Instant::now();
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(6));
+        let client_res = if let Some(port) = active_port {
+            match reqwest::Proxy::all(format!("http://127.0.0.1:{port}")) {
+                Ok(proxy) => builder.no_proxy().proxy(proxy).build(),
+                Err(e) => Err(e),
+            }
+        } else {
+            builder.build()
+        };
+        let client = match client_res {
+            Ok(c) => c,
+            Err(_) => {
+                return DnsProbeBranch {
+                    ok: false,
+                    answers: Vec::new(),
+                    is_fake_ip: false,
+                    latency_ms: 0,
+                    error: Some("无法创建 DoH HTTP 客户端".into()),
+                }
+            }
+        };
+        let resp = match client
+            .get("https://1.1.1.1/dns-query")
+            .query(&[("name", normalized.as_str()), ("type", record_type)])
+            .header("Accept", "application/dns-json")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                return DnsProbeBranch {
+                    ok: false,
+                    answers: Vec::new(),
+                    is_fake_ip: false,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    error: Some("远程 DoH 请求失败或超时".into()),
+                }
+            }
+        };
+        if !resp.status().is_success() {
+            return DnsProbeBranch {
+                ok: false,
+                answers: Vec::new(),
+                is_fake_ip: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                error: Some(format!("远程 DoH 返回 HTTP {}", resp.status().as_u16())),
+            };
+        }
+        let Ok(bytes) = resp.bytes().await else {
+            return DnsProbeBranch {
+                ok: false,
+                answers: Vec::new(),
+                is_fake_ip: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                error: Some("读取远程 DoH 响应失败".into()),
+            };
+        };
+        match serde_json::from_slice::<DohResponse>(&bytes) {
+            Ok(parsed) => {
+                let exact: Vec<String> = parsed
+                    .answers
+                    .iter()
+                    .filter(|a| a.rtype == expected_rr_type && !a.data.trim().is_empty())
+                    .map(|a| a.data.trim().to_owned())
+                    .collect();
+                let answers = if exact.is_empty() {
+                    parsed
+                        .answers
+                        .into_iter()
+                        .map(|a| a.data.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                } else {
+                    exact
+                };
+                DnsProbeBranch {
+                    ok: !answers.is_empty(),
+                    answers,
+                    is_fake_ip: false,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    error: None,
+                }
+            }
+            Err(_) => DnsProbeBranch {
+                ok: false,
+                answers: Vec::new(),
+                is_fake_ip: false,
+                latency_ms: started.elapsed().as_millis() as u64,
+                error: Some("远程 DoH 响应解析失败".into()),
+            },
+        }
+    };
+
+    let (local_os, core_internal, remote_doh) = tokio::join!(local_fut, core_fut, doh_fut);
+    Ok(DnsProbeReport {
+        domain: normalized,
+        qtype: record_type.to_owned(),
+        topology_hint,
+        local_os,
+        core_internal,
+        remote_doh,
+    })
+}
+
+#[tauri::command]
+fn set_global_hotkeys(
+    config: hotkeys::HotkeyConfig,
+    manager: tauri::State<'_, hotkeys::HotkeyManager>,
+) -> Result<hotkeys::HotkeyApplyResult, String> {
+    manager.apply(config)
 }
 
 #[tauri::command]
@@ -1527,9 +1846,14 @@ fn main() {
             }
             tray.build(app)?;
             app.state::<ProxyState>().load_persisted_events();
+            let hk_manager = hotkeys::HotkeyManager::start(app.handle().clone())
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            app.manage(hk_manager);
+            netwatch::start(app.handle().clone());
             let handle = app.handle().clone();
             std::thread::spawn(move || ProxyState::run(handle));
             tauri::async_runtime::spawn(ProxyState::watch_core_logs(app.handle().clone()));
+            tauri::async_runtime::spawn(ProxyState::watch_dns_logs(app.handle().clone()));
             tauri::async_runtime::spawn(ProxyState::watch_nodes(app.handle().clone()));
             Ok(())
         })
@@ -1560,6 +1884,11 @@ fn main() {
             proxy_status,
             proxy_events,
             clear_proxy_events,
+            set_dns_capture,
+            proxy_dns_queries,
+            clear_dns_queries,
+            probe_dns_resolution,
+            set_global_hotkeys,
             open_log_folder,
             open_project_repo,
             check_system_proxy_active,
@@ -1606,6 +1935,9 @@ fn main() {
         .expect("failed to build RelayDesk");
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
+            if let Some(hk) = handle.try_state::<hotkeys::HotkeyManager>() {
+                hk.shutdown();
+            }
             let state = handle.state::<ProxyState>();
             let _ = state.shutdown();
         }

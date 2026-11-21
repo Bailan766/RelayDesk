@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { buildConfig, buildSessionConfig, evaluateRuleMatch, normalizeRuleValue, rulePresets, withMihomoCustomRules } from './config';
+import {
+  buildConfig, buildSessionConfig, evaluateRuleMatch, normalizeRuleValue,
+  remoteRuleSetPresets, rulePresets, validateRuleSet, withMihomoCustomRules,
+} from './config';
 import { aggregateConnectionsByProcess } from './telemetry';
 import { parseSubscription } from './subscription';
 
@@ -99,6 +102,57 @@ describe('sing-box configuration', () => {
       'PROCESS-NAME,antigravity.exe,HK-01',
       'MATCH,Proxy',
     ]);
+  });
+
+  it('compiles enabled remote rule_set entries after manual rules and omits route.rule_set when empty', () => {
+    const node = parseSubscription('vless://id@host.test:443#Test').nodes[0];
+    const withoutSets = buildConfig(node, 12345, []) as any;
+    expect(withoutSets.route.rule_set).toBeUndefined();
+
+    const sets = remoteRuleSetPresets.map(item =>
+      item.tag === 'geosite-cn' || item.tag === 'geosite-category-ads-all'
+        ? { ...item, enabled: true }
+        : item,
+    );
+    const built = buildConfig(
+      node,
+      12345,
+      [{ type: 'domain', value: 'manual.example.com', action: 'direct' }],
+      'proxy',
+      sets,
+    ) as any;
+    expect(built.route.rule_set).toEqual([
+      {
+        tag: 'geosite-cn',
+        type: 'remote',
+        format: 'binary',
+        url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs',
+        download_detour: 'proxy',
+        update_interval: '24h',
+      },
+      {
+        tag: 'geosite-category-ads-all',
+        type: 'remote',
+        format: 'binary',
+        url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs',
+        download_detour: 'proxy',
+        update_interval: '24h',
+      },
+    ]);
+    expect(built.route.rules).toEqual([
+      { domain: ['manual.example.com'], outbound: 'direct' },
+      { rule_set: ['geosite-cn'], outbound: 'direct' },
+      { rule_set: ['geosite-category-ads-all'], action: 'reject' },
+    ]);
+
+    expect(() => validateRuleSet({
+      tag: 'bad-http',
+      label: 'HTTP',
+      url: 'http://example.com/rules.srs',
+      format: 'binary',
+      action: 'direct',
+      enabled: true,
+    })).toThrow('HTTPS');
   });
 });
 

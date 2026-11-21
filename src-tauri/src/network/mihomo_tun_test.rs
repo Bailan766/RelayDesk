@@ -152,7 +152,6 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         for destination in [
             TARGET,
             TARGET,
-            TARGET,
             v6.as_str(),
             UPDATED_TARGET,
             POLICY_DNS_NAME,
@@ -295,12 +294,11 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         true,
     )
     .unwrap();
-    let (policy_dns, system_dns) = session.tun_dns.unwrap();
     assert!(session.running() && session.controller.ready());
     assert!(UdpSocket::bind((TUN_ADDRESS, 0)).is_ok());
     let target_address: std::net::Ipv4Addr = TARGET.parse().unwrap();
     let address = SocketAddr::from((target_address, 8089));
-    let adapter = tun_interface(&session.id);
+    let adapter = session.active_tun_interface().unwrap();
     let mut best = 0;
     let result = unsafe {
         winapi::um::iphlpapi::GetBestInterface(
@@ -331,14 +329,6 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         }
     }
     assert!(session.running());
-    assert_http_through_tun(&session, address);
-
-    stop_fixture_core(&session, "sing-box.exe");
-    wait_until(|| session.recovering_tun(), Duration::from_secs(3));
-    assert!(session.running() && !session.ready());
-    wait_until(|| session.ready(), Duration::from_secs(24));
-    assert_eq!(session.generation(), 1);
-    assert!(session.controller.ready());
     assert_http_through_tun(&session, address);
 
     assert_http_through_tun(&session, format!("[{TARGET_V6}]:8089").parse().unwrap());
@@ -384,12 +374,13 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     settings
         .selections
         .insert("Updated".into(), "tcp-fixture".into());
-    let updated = mihomo::prepare_tun_policy(
+    let updated = mihomo::prepare_native_tun_with_lan(
         &settings.config,
         mixed,
         RoutingMode::Rule,
-        policy_dns,
-        Some(system_dns),
+        &adapter,
+        true,
+        false,
     )
     .unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -406,19 +397,19 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     });
     let previous_fake_ip = resolve_fixture_ipv4(POLICY_DNS_NAME, 0x1930);
     assert_eq!(&previous_fake_ip.octets()[..3], &[198, 19, 55]);
-    stop_fixture_core(session.policy.as_ref().unwrap(), "mihomo.exe");
-    wait_until(|| session.needs_policy_restart(), Duration::from_secs(3));
+
+    stop_fixture_core(&session, "mihomo.exe");
+    wait_until(|| session.needs_mihomo_restart(), Duration::from_secs(3));
     assert!(session.running() && !session.ready());
-    assert!(
-        UdpSocket::bind((TUN_ADDRESS, 0)).is_ok(),
-        "TUN stopped while the policy core was down"
-    );
     session
-        .stage_policy_restart(&settings, RoutingMode::Rule)
+        .stage_mihomo_restart(&settings, RoutingMode::Rule)
         .unwrap();
-    assert!(!session.needs_policy_restart());
+    assert!(!session.needs_mihomo_restart());
     wait_until(|| session.ready(), Duration::from_secs(24));
-    assert_eq!(session.generation(), 2);
+    assert_eq!(session.generation(), 1);
+    assert!(session.controller.ready());
+    let recovered_adapter = session.active_tun_interface().unwrap();
+    assert_ne!(recovered_adapter, adapter);
     runtime.block_on(async {
         let groups = session.controller.groups().await.unwrap();
         assert!(groups
@@ -441,11 +432,6 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     udp.join().unwrap();
     dns.join().unwrap();
 
-    session.policy.as_ref().unwrap().kill_fixture_worker();
-    assert!(
-        session.worker.signaled(5500),
-        "TUN worker stayed up after losing its policy process"
-    );
     session.stop().or_else(|_| recover()).unwrap();
     wait_until(
         || UdpSocket::bind((TUN_ADDRESS, 0)).is_err(),
@@ -453,8 +439,8 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     );
     assert!(tun_default_route(&adapter, AF_INET as u16).is_none());
     assert!(tun_default_route(&adapter, AF_INET6 as u16).is_none());
-    assert!(UdpSocket::bind(("127.0.0.1", policy_dns)).is_ok());
-    assert!(UdpSocket::bind(("127.0.0.1", system_dns)).is_ok());
+    assert!(tun_default_route(&recovered_adapter, AF_INET as u16).is_none());
+    assert!(tun_default_route(&recovered_adapter, AF_INET6 as u16).is_none());
 }
 
 #[test]

@@ -27,7 +27,7 @@ use winapi::{
     um::{
         handleapi::CloseHandle,
         jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject},
-        processthreadsapi::{GetProcessId, OpenProcess},
+        processthreadsapi::OpenProcess,
         shellapi::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
         synchapi::{
             CreateEventW, CreateMutexW, OpenEventW, ReleaseMutex, SetEvent, WaitForSingleObject,
@@ -39,6 +39,8 @@ use winapi::{
         },
     },
 };
+#[cfg(test)]
+use winapi::um::processthreadsapi::GetProcessId;
 
 use tun_control::TunControl;
 
@@ -48,7 +50,6 @@ mod tun_control;
 const APPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const TUN_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const MIHOMO_READY_TIMEOUT: Duration = Duration::from_secs(40);
-const MIHOMO_RESTART_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TUN_ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const TUN_ROUTE_RECOVERY_ATTEMPTS: u8 = 12;
 
@@ -58,7 +59,6 @@ pub enum Core {
     #[default]
     Singbox,
     Mihomo,
-    Bridge,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -282,10 +282,6 @@ impl NetworkLock {
         Self::named("Local\\RelayDesk.Network")
     }
 
-    fn policy() -> Result<Self, String> {
-        Self::named("Local\\RelayDesk.TunPolicy")
-    }
-
     fn named(name: &str) -> Result<Self, String> {
         let name = wide(name);
         let handle = Handle::new(unsafe { CreateMutexW(ptr::null_mut(), FALSE, name.as_ptr()) })?;
@@ -307,19 +303,17 @@ impl Drop for NetworkLock {
 pub fn recover() -> Result<(), String> {
     let _lock = NetworkLock::acquire()?;
     let directory = runtime_dir()?;
-    if let Ok(_policy) = NetworkLock::policy() {
-        for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
-            let filename = entry.file_name();
-            if filename
-                .to_str()
-                .and_then(|name| name.strip_prefix("mihomo-"))
-                .is_some_and(|token| {
-                    token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-                && entry.file_type().is_ok_and(|kind| kind.is_dir())
-            {
-                let _ = fs::remove_dir_all(entry.path());
-            }
+    for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+        let filename = entry.file_name();
+        if filename
+            .to_str()
+            .and_then(|name| name.strip_prefix("mihomo-"))
+            .is_some_and(|token| {
+                token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            let _ = fs::remove_dir_all(entry.path());
         }
     }
     system_proxy::recover(&directory.join("proxy.json"))
@@ -688,8 +682,71 @@ fn validate_outbounds(outbounds: &[Value], endpoints: &[Value]) -> Option<()> {
     Some(())
 }
 
-fn validate_rule(rule: &Value, outbounds: &[Value], endpoints: &[Value]) -> Option<()> {
-    const MATCHES: [&str; 4] = ["domain", "domain_suffix", "ip_cidr", "process_path_regex"];
+fn validate_rule_set(entry: &Value) -> Option<String> {
+    let fields = checked_object(
+        entry,
+        &[
+            "tag",
+            "type",
+            "format",
+            "url",
+            "download_detour",
+            "update_interval",
+        ],
+    )?;
+    let tag = fields.get("tag")?.as_str()?;
+    if tag.is_empty()
+        || tag.len() > 64
+        || !tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'!'))
+    {
+        return None;
+    }
+    if fields.get("type")?.as_str()? != "remote" {
+        return None;
+    }
+    if !matches!(fields.get("format")?.as_str()?, "binary" | "source") {
+        return None;
+    }
+    let raw_url = fields.get("url")?.as_str()?;
+    if raw_url.len() > 512 {
+        return None;
+    }
+    let parsed = url::Url::parse(raw_url).ok()?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return None;
+    }
+    if let Some(detour) = fields.get("download_detour") {
+        if !matches!(detour.as_str()?, "proxy" | "direct") {
+            return None;
+        }
+    }
+    if let Some(interval) = fields.get("update_interval") {
+        let interval = interval.as_str()?;
+        if interval.is_empty()
+            || interval.len() > 16
+            || !interval.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+    }
+    Some(tag.to_owned())
+}
+
+fn validate_rule(
+    rule: &Value,
+    outbounds: &[Value],
+    endpoints: &[Value],
+    rule_set_tags: &std::collections::HashSet<String>,
+) -> Option<()> {
+    const MATCHES: [&str; 5] = [
+        "domain",
+        "domain_suffix",
+        "ip_cidr",
+        "process_path_regex",
+        "rule_set",
+    ];
     let fields = checked_object(
         rule,
         &[
@@ -697,6 +754,7 @@ fn validate_rule(rule: &Value, outbounds: &[Value], endpoints: &[Value]) -> Opti
             "domain_suffix",
             "ip_cidr",
             "process_path_regex",
+            "rule_set",
             "outbound",
             "action",
         ],
@@ -716,6 +774,7 @@ fn validate_rule(rule: &Value, outbounds: &[Value], endpoints: &[Value]) -> Opti
             };
             match key {
                 "ip_cidr" => valid_cidr(text),
+                "rule_set" => rule_set_tags.contains(text),
                 "process_path_regex" => {
                     text.len() <= 512 && text.starts_with("(?i)(?:^|[") && text.ends_with('$')
                 }
@@ -756,12 +815,28 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         root.get("route")?,
         &[
             "rules",
+            "rule_set",
             "final",
             "auto_detect_interface",
             "default_domain_resolver",
             "find_process",
         ],
     )?;
+    let mut validated_rule_sets = Vec::new();
+    let mut rule_set_tags = std::collections::HashSet::new();
+    if let Some(raw_sets) = route.get("rule_set") {
+        let list = raw_sets.as_array()?;
+        if list.len() > 64 {
+            return None;
+        }
+        for entry in list {
+            let tag = validate_rule_set(entry)?;
+            if !rule_set_tags.insert(tag) {
+                return None;
+            }
+            validated_rule_sets.push(entry.clone());
+        }
+    }
     let mut rules = route.get("rules")?.as_array()?.as_slice();
     let mut output_rules = vec![
         json!({"action":"sniff"}),
@@ -780,7 +855,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
     let mut direct_domains = Vec::new();
     let mut direct_suffixes = Vec::new();
     for rule in rules {
-        validate_rule(rule, outbounds, endpoints)?;
+        validate_rule(rule, outbounds, endpoints, &rule_set_tags)?;
         if rule.get("outbound").and_then(Value::as_str) == Some("direct") {
             if let Some(items) = rule.get("domain").and_then(Value::as_array) {
                 direct_domains.extend(items.iter().filter_map(Value::as_str).map(|s| json!(s)));
@@ -803,6 +878,16 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         dns_rules.push(json!({"domain_suffix": direct_suffixes, "action": "route", "server": "bootstrap"}));
     }
     dns_rules.push(json!({"inbound":["tun","local"],"action":"route","server":"remote"}));
+    let mut route_out = serde_json::Map::from_iter([
+        ("rules".into(), json!(output_rules)),
+        ("final".into(), json!(route_final)),
+        ("auto_detect_interface".into(), json!(true)),
+        ("find_process".into(), json!(true)),
+        ("default_domain_resolver".into(), json!("bootstrap")),
+    ]);
+    if !validated_rule_sets.is_empty() {
+        route_out.insert("rule_set".into(), Value::Array(validated_rule_sets));
+    }
     Some(json!({
         "log": {"level":"warn"},
         "inbounds": [
@@ -811,7 +896,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         ],
         "outbounds": outbounds,
         "endpoints": endpoints,
-        "route":{"rules":output_rules,"final":route_final,"auto_detect_interface":true,"find_process":true,"default_domain_resolver":"bootstrap"},
+        "route": Value::Object(route_out),
         "dns":{
             "servers":[{"type":"local","tag":"bootstrap"},{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","detour":"proxy"}],
             "rules": dns_rules,
@@ -826,11 +911,12 @@ pub struct Session {
     pub port: u16,
     pub controller: crate::telemetry::Controller,
     pub id: String,
-    pub tun_dns: Option<(u16, u16)>,
+    pub core: Core,
+    pub tun_interface: Option<String>,
+    pub tun_ipv6: bool,
     pub allow_lan: bool,
-    policy: Option<Box<Session>>,
     tun_control: Option<TunControl>,
-    staged_policy_recovery: Option<u32>,
+    staged_mihomo_recovery: Option<u32>,
     service: Option<crate::service::ServiceSession>,
 }
 
@@ -841,28 +927,21 @@ struct WorkerInput {
     controller: crate::telemetry::Controller,
     #[serde(default)]
     routing_mode: RoutingMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    policy_dns: Option<u16>,
     #[serde(default)]
     options: SessionOptions,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct CaptureTarget {
-    mixed_port: u16,
-    dns_port: u16,
-    system_dns: u16,
-    policy_pid: u32,
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
-struct PolicyRestart {
+struct MihomoRestart {
     config: Value,
     selections: BTreeMap<String, String>,
+    routing_mode: RoutingMode,
 }
 
-fn request_policy_restart(home: &std::path::Path, restart: &PolicyRestart) -> Result<(), String> {
+fn request_mihomo_restart(
+    home: &std::path::Path,
+    restart: &MihomoRestart,
+) -> Result<(), String> {
     let data = serde_json::to_vec(restart).map_err(|_| "无法保存 Mihomo 恢复状态")?;
     let protected = crate::storage::transform(&data, true)?;
     let temporary = home.join(format!("restart-{}.tmp", uuid::Uuid::new_v4().simple()));
@@ -871,15 +950,15 @@ fn request_policy_restart(home: &std::path::Path, restart: &PolicyRestart) -> Re
     fs::rename(&temporary, home.join("restart.bin")).map_err(|_| "无法提交 Mihomo 恢复状态".into())
 }
 
-fn receive_policy_restart(
+fn try_receive_mihomo_restart(
     home: &std::path::Path,
     lifetime: &WorkerLifetime<'_>,
     control: &TunControl,
-) -> Result<Option<PolicyRestart>, String> {
+) -> Result<Option<MihomoRestart>, String> {
     let path = home.join("restart.bin");
     let _cleanup = crate::TemporaryConfig(path.clone());
-    let deadline = Instant::now() + MIHOMO_RESTART_REQUEST_TIMEOUT;
-    while control.enabled() && !lifetime.ended(60) && Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_millis(700);
+    loop {
         match fs::read(&path) {
             Ok(protected) => {
                 let data = crate::storage::transform(&protected, false)?;
@@ -890,52 +969,11 @@ fn receive_policy_restart(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err("无法读取 Mihomo 恢复状态".into()),
         }
+        if !control.enabled() || lifetime.ended(50) || Instant::now() >= deadline {
+            break;
+        }
     }
     Ok(None)
-}
-
-fn capture_config(
-    target: &CaptureTarget,
-    port: u16,
-    interface: &str,
-    program: &std::path::Path,
-) -> Value {
-    let path = program.to_string_lossy();
-    let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
-    let mut expression = String::from("(?i)^");
-    for character in path.chars() {
-        if r"\.^$|?*+()[]{}".contains(character) {
-            expression.push('\\');
-        }
-        expression.push(character);
-    }
-    expression.push('$');
-    json!({
-        "log":{"level":"warn"},
-        "inbounds":[
-            {"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port},
-            {"type":"direct","tag":"system-dns-in","listen":"127.0.0.1","listen_port":target.system_dns},
-            {"type":"tun","tag":"tun","interface_name":interface,"address":["172.28.254.1/30","fdfe:dcba:9876::1/126"],
-             "auto_route":true,"strict_route":true,"stack":"mixed"}
-        ],
-        "outbounds":[
-            {"type":"socks","tag":"policy","server":"127.0.0.1","server_port":target.mixed_port,"version":"5"},
-            {"type":"direct","tag":"physical"}
-        ],
-        "route":{"auto_detect_interface":true,"default_domain_resolver":"system-dns","final":"policy","rules":[
-            {"inbound":"system-dns-in","action":"hijack-dns"},
-            {"process_path_regex":[expression],"outbound":"physical"},
-            {"action":"sniff"},
-            {"protocol":"dns","action":"hijack-dns"}
-        ]},
-        "dns":{"servers":[
-            {"type":"udp","tag":"policy-dns","server":"127.0.0.1","server_port":target.dns_port},
-            {"type":"local","tag":"system-dns","prefer_go":true}
-        ],"rules":[
-            {"inbound":"system-dns-in","action":"route","server":"system-dns"},
-            {"inbound":"tun","action":"route","server":"policy-dns","disable_cache":true}
-        ],"final":"policy-dns"}
-    })
 }
 
 const MIHOMO_GEODATA_FILES: &[&str] = &[
@@ -944,6 +982,7 @@ const MIHOMO_GEODATA_FILES: &[&str] = &[
     "geoip.dat",
     "geosite.dat",
     "ASN.mmdb",
+    "wintun.dll",
 ];
 
 fn mihomo_cache_dir() -> Option<PathBuf> {
@@ -964,13 +1003,15 @@ fn seed_mihomo_geodata(home: &std::path::Path) {
         if dst.exists() {
             continue;
         }
-        if let Some(src) = cache
-            .as_ref()
-            .map(|dir| dir.join(name))
-            .filter(|path| path.is_file())
-        {
-            let _ = fs::copy(src, &dst);
-            continue;
+        if *name != "wintun.dll" {
+            if let Some(src) = cache
+                .as_ref()
+                .map(|dir| dir.join(name))
+                .filter(|path| path.is_file())
+            {
+                let _ = fs::copy(src, &dst);
+                continue;
+            }
         }
         if let Some(src) = exe_dir
             .as_ref()
@@ -987,6 +1028,9 @@ fn save_mihomo_geodata(home: &std::path::Path) {
         return;
     };
     for name in MIHOMO_GEODATA_FILES {
+        if *name == "wintun.dll" {
+            continue;
+        }
         let src = home.join(name);
         let dst = cache.join(name);
         if let Ok(meta) = fs::metadata(&src) {
@@ -1042,11 +1086,12 @@ impl Session {
                     port: service.port,
                     controller: service.controller.clone(),
                     id: service.id.clone(),
-                    tun_dns: service.tun_dns,
+                    core: settings.core,
+                    tun_interface: service.active_tun_interface(),
+                    tun_ipv6: service.tun_ipv6,
                     allow_lan: service.allow_lan,
-                    policy: None,
                     tun_control: None,
-                    staged_policy_recovery: None,
+                    staged_mihomo_recovery: None,
                     service: Some(service),
                 });
             }
@@ -1094,90 +1139,19 @@ impl Session {
         if !matches!(mode, "local" | "system" | "tun") {
             return Err("代理入口模式无效".into());
         }
-        if settings.core == Core::Mihomo && mode == "tun" {
-            let dns_port = auxiliary_port(&[port])?;
-            let system_dns = auxiliary_port(&[port, dns_port])?;
-            let local_port = auxiliary_port(&[port, dns_port, system_dns])?;
-            let initial = mihomo::prepare_tun_policy_with_lan(
-                &settings.config,
-                port,
-                routing_mode,
-                dns_port,
-                None,
-                options.allow_lan,
-            )?;
-            let attached = mihomo::prepare_tun_policy_with_lan(
-                &settings.config,
-                port,
-                routing_mode,
-                dns_port,
-                Some(system_dns),
-                options.allow_lan,
-            )?;
-            let selections = settings.selections.clone();
-            let policy = Self::start_worker(
-                settings,
-                port,
-                "policy",
-                routing_mode,
-                executable,
-                Some(dns_port),
-                recover,
-                options.clone(),
-            )?;
-            let policy_pid = unsafe { GetProcessId(policy.worker.0) };
-            if policy_pid == 0 {
-                return Err("无法监视 Mihomo 网络进程".into());
-            }
-            let target = CaptureTarget {
-                mixed_port: port,
-                dns_port,
-                system_dns,
-                policy_pid,
-            };
-            let settings = CoreSettings {
-                core: Core::Bridge,
-                config: serde_json::to_value(target).map_err(|_| "TUN 转发设置无效")?,
-                selections: BTreeMap::new(),
-            };
-            let mut capture = Self::start_worker(
-                settings,
-                local_port,
-                "tun",
-                RoutingMode::Rule,
-                executable,
-                None,
-                recover,
-                options.clone(),
-            )?;
-            capture.port = port;
-            capture.controller = policy.controller.clone();
-            capture.tun_dns = Some((dns_port, system_dns));
-            capture.allow_lan = options.allow_lan;
-            capture.policy = Some(Box::new(policy));
-            // Provider startup uses the ordinary system resolver until the TUN is attached.
-            if initial != attached {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|_| "无法配置 TUN 的系统 DNS")?;
-                runtime.block_on(async {
-                    if !capture.controller.reload_mihomo(attached).await? {
-                        return Err("Mihomo 未启用 TUN 的系统 DNS".to_string());
-                    }
-                    mihomo::restore_selections(
-                        &capture.controller,
-                        selections,
-                        Duration::from_secs(6),
-                    )
-                    .await;
-                    Ok(())
-                })?;
-            }
-            return Ok(capture);
-        }
         if settings.core == Core::Mihomo {
-            mihomo::prepare_with_lan(&settings.config, port, routing_mode, options.allow_lan)?;
+            if mode == "tun" {
+                mihomo::prepare_native_tun_with_lan(
+                    &settings.config,
+                    port,
+                    routing_mode,
+                    "RelayDesk-Check",
+                    options.tun_ipv6,
+                    options.allow_lan,
+                )?;
+            } else {
+                mihomo::prepare_with_lan(&settings.config, port, routing_mode, options.allow_lan)?;
+            }
         }
         Self::start_worker(
             settings,
@@ -1185,7 +1159,6 @@ impl Session {
             mode,
             routing_mode,
             executable,
-            None,
             recover,
             options,
         )
@@ -1197,7 +1170,6 @@ impl Session {
         mode: &str,
         routing_mode: RoutingMode,
         executable: &std::path::Path,
-        policy_dns: Option<u16>,
         recover: bool,
         options: SessionOptions,
     ) -> Result<Self, String> {
@@ -1205,13 +1177,13 @@ impl Session {
         ensure_port_available(port)?;
         let directory = runtime_dir()?;
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let tun_control = if matches!(mode, "tun" | "policy") {
-            Some(TunControl::create(
-                &token,
-                recover,
-                routing_mode,
-                &settings.config,
-            )?)
+        let initial_interface = (mode == "tun").then(|| tun_interface(&token));
+        let tun_control = if mode == "tun" {
+            let control = TunControl::create(&token, recover, routing_mode, &settings.config)?;
+            if let Some(name) = &initial_interface {
+                control.set_interface(name);
+            }
+            Some(control)
         } else {
             None
         };
@@ -1235,11 +1207,11 @@ impl Session {
         let _cleanup = crate::TemporaryConfig(path.clone());
         let controller = crate::telemetry::Controller::new(port)?;
         let allow_lan = options.allow_lan;
+        let tun_ipv6 = options.tun_ipv6;
         let input = WorkerInput {
             settings,
             controller: controller.clone(),
             routing_mode,
-            policy_dns,
             options,
         };
         fs::write(
@@ -1278,11 +1250,12 @@ impl Session {
             port,
             controller,
             id: token,
-            tun_dns: None,
+            core,
+            tun_interface: initial_interface,
+            tun_ipv6,
             allow_lan,
-            policy: None,
             tun_control,
-            staged_policy_recovery: None,
+            staged_mihomo_recovery: None,
             service: None,
         };
         let deadline = Instant::now()
@@ -1315,11 +1288,21 @@ impl Session {
         self.service.is_some()
     }
 
+    pub fn active_tun_interface(&self) -> Option<String> {
+        if let Some(svc) = &self.service {
+            return svc.active_tun_interface();
+        }
+        self.tun_control
+            .as_ref()
+            .and_then(TunControl::interface)
+            .or_else(|| self.tun_interface.clone())
+    }
+
     pub fn running(&self) -> bool {
         if let Some(svc) = &self.service {
             return svc.state.running.load(std::sync::atomic::Ordering::Acquire);
         }
-        !self.worker.signaled(0) && self.policy.as_ref().is_none_or(|policy| policy.running())
+        !self.worker.signaled(0)
     }
 
     pub fn recovering_tun(&self) -> bool {
@@ -1332,10 +1315,6 @@ impl Session {
         self.tun_control
             .as_ref()
             .is_some_and(TunControl::recovering)
-            || self
-                .policy
-                .as_ref()
-                .is_some_and(|policy| policy.recovering_tun())
     }
 
     pub fn ready(&self) -> bool {
@@ -1352,7 +1331,6 @@ impl Session {
         self.tun_control
             .as_ref()
             .map_or(0, TunControl::generation)
-            .wrapping_add(self.policy.as_ref().map_or(0, |policy| policy.generation()))
     }
 
     pub fn configure_tun_recovery(&self, enabled: bool) {
@@ -1363,54 +1341,36 @@ impl Session {
         if let Some(control) = &self.tun_control {
             control.set_recovery(enabled);
         }
-        if let Some(policy) = &self.policy {
-            policy.configure_tun_recovery(enabled);
-        }
     }
 
-    pub fn needs_policy_restart(&self) -> bool {
-        if self.service.is_some() {
+    pub fn needs_mihomo_restart(&self) -> bool {
+        if self.service.is_some() || self.core != Core::Mihomo {
             return false;
         }
-        self.policy
-            .as_ref()
-            .and_then(|policy| policy.tun_control.as_ref())
-            .is_some_and(|control| {
-                control.enabled()
-                    && control.recovering()
-                    && self.staged_policy_recovery != Some(control.generation())
-            })
+        self.tun_control.as_ref().is_some_and(|control| {
+            control.enabled()
+                && control.recovering()
+                && self.staged_mihomo_recovery != Some(control.generation())
+        })
     }
 
-    pub fn stage_policy_restart(
+    pub fn stage_mihomo_restart(
         &mut self,
         settings: &CoreSettings,
         mode: RoutingMode,
     ) -> Result<(), String> {
-        if self.service.is_some() {
+        if self.service.is_some() || !self.needs_mihomo_restart() {
             return Ok(());
         }
-        let Some((policy, (dns, system_dns))) = self.policy.as_ref().zip(self.tun_dns) else {
-            return Ok(());
-        };
-        if !self.needs_policy_restart() {
-            return Ok(());
-        }
-        let generation = policy.generation();
-        let request = PolicyRestart {
-            config: mihomo::prepare_tun_policy_with_lan(
-                &settings.config,
-                self.port,
-                mode,
-                dns,
-                Some(system_dns),
-                self.allow_lan,
-            )?,
+        let generation = self.generation();
+        let request = MihomoRestart {
+            config: settings.config.clone(),
             selections: settings.selections.clone(),
+            routing_mode: mode,
         };
-        let home = runtime_dir()?.join(format!("mihomo-{}", policy.id));
-        request_policy_restart(&home, &request)?;
-        self.staged_policy_recovery = Some(generation);
+        let home = runtime_dir()?.join(format!("mihomo-{}", self.id));
+        request_mihomo_restart(&home, &request)?;
+        self.staged_mihomo_recovery = Some(generation);
         Ok(())
     }
 
@@ -1447,13 +1407,7 @@ impl Session {
         if let Some(svc) = self.service.take() {
             return svc.stop();
         }
-        let capture = self.stop_worker();
-        let policy = self
-            .policy
-            .take()
-            .map(|policy| policy.stop_worker())
-            .unwrap_or(Ok(()));
-        capture.and(policy)
+        self.stop_worker()
     }
 
     fn stop_worker(&self) -> Result<(), String> {
@@ -1474,6 +1428,7 @@ impl Session {
     }
 }
 
+#[cfg(test)]
 fn auxiliary_port(excluded: &[u16]) -> Result<u16, String> {
     for _ in 0..16 {
         let port = TcpListener::bind(("127.0.0.1", 0))
@@ -1565,14 +1520,11 @@ fn add_routing_modes(config: &mut Value, tun: bool) -> Option<()> {
 struct WorkerLifetime<'a> {
     stop: &'a Handle,
     parent: &'a Handle,
-    policy: Option<&'a Handle>,
 }
 
 impl WorkerLifetime<'_> {
     fn ended(&self, wait: u32) -> bool {
-        self.stop.signaled(wait)
-            || self.parent.signaled(0)
-            || self.policy.is_some_and(|policy| policy.signaled(0))
+        self.stop.signaled(wait) || self.parent.signaled(0)
     }
 }
 
@@ -1737,7 +1689,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     if token.len() != 32
         || !token.bytes().all(|b| b.is_ascii_hexdigit())
         || port < 1024
-        || !matches!(mode.as_str(), "local" | "system" | "tun" | "policy")
+        || !matches!(mode.as_str(), "local" | "system" | "tun")
     {
         return Err("网络参数无效".into());
     }
@@ -1751,16 +1703,10 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             event_name(token, "ready").as_ptr(),
         )
     })?;
-    let _lock = if mode == "policy" {
-        NetworkLock::policy()?
-    } else {
-        NetworkLock::acquire()?
-    };
+    let _lock = NetworkLock::acquire()?;
     let directory = runtime_dir()?;
     let journal = directory.join("proxy.json");
-    if mode != "policy" {
-        system_proxy::recover(&journal).map_err(|_| "恢复系统代理失败")?;
-    }
+    system_proxy::recover(&journal).map_err(|_| "恢复系统代理失败")?;
     ensure_port_available(port)?;
     let input = directory.join(format!("{token}.json"));
     let config = fs::read(input).map_err(|_| "无法读取内核配置")?;
@@ -1773,69 +1719,46 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             },
         controller,
         routing_mode,
-        policy_dns,
         options,
     } = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
     let allow_lan = options.allow_lan;
     let tun_ipv6 = options.tun_ipv6;
     let bypass = options.bypass;
-    if (mode == "policy" && (core != Core::Mihomo || policy_dns.is_none()))
-        || (mode != "policy" && policy_dns.is_some())
-        || (core == Core::Bridge && mode != "tun")
-    {
-        return Err("TUN 转发参数不符合入口类型".into());
-    }
     let mut interface = tun_interface(token);
-    let control = if matches!(mode.as_str(), "tun" | "policy") {
-        TunControl::open(token).ok()
+    let control = if mode == "tun" {
+        let ctrl = TunControl::open(token).ok();
+        if let Some(c) = &ctrl {
+            c.set_interface(&interface);
+        }
+        ctrl
     } else {
         None
     };
-    let mut dependency = None;
+    let mut raw_mihomo_profile = if core == Core::Mihomo {
+        Some(config.clone())
+    } else {
+        None
+    };
+    let mut mihomo_selections = selections;
     let home = if core == Core::Mihomo {
         if mode == "tun" {
-            return Err("Mihomo 原配置不能由 TUN 提权进程加载".into());
-        }
-        config = if let Some(dns) = policy_dns {
-            if dns < 1024 || dns == port {
-                return Err("Mihomo DNS 端口无效".into());
-            }
-            ensure_port_available(dns)?;
-            mihomo::prepare_tun_policy_with_lan(&config, port, routing_mode, dns, None, allow_lan)?
+            crate::bundled_binary("wintun.dll")?;
+            config = mihomo::prepare_native_tun_with_lan(
+                &config,
+                port,
+                routing_mode,
+                &interface,
+                tun_ipv6,
+                allow_lan,
+            )?;
         } else {
-            mihomo::prepare_with_lan(&config, port, routing_mode, allow_lan)?
-        };
+            config = mihomo::prepare_with_lan(&config, port, routing_mode, allow_lan)?;
+        }
         controller.configure_mihomo(&mut config);
         let path = directory.join(format!("mihomo-{token}"));
         fs::create_dir(&path).map_err(|_| "无法创建 Mihomo 工作目录")?;
         seed_mihomo_geodata(&path);
         Some(MihomoHome(path))
-    } else if core == Core::Bridge {
-        let target: CaptureTarget =
-            serde_json::from_value(config).map_err(|_| "TUN 转发目标无效")?;
-        let ports = [target.mixed_port, target.dns_port, target.system_dns];
-        if ports.iter().any(|entry| *entry < 1024 || *entry == port)
-            || target.mixed_port == target.dns_port
-            || [target.mixed_port, target.dns_port].contains(&target.system_dns)
-            || target.policy_pid == 0
-            || target.policy_pid == std::process::id()
-            || target.policy_pid == parent_id
-        {
-            return Err("TUN 转发端口或进程无效".into());
-        }
-        dependency = Some(Handle::new(unsafe {
-            OpenProcess(SYNCHRONIZE, FALSE, target.policy_pid)
-        })?);
-        ensure_port_available(target.system_dns)?;
-        let program = crate::bundled_binary("mihomo.exe")?;
-        config = capture_config(&target, port, &interface, &program);
-        if !tun_ipv6 {
-            config["inbounds"][1]["address"] = json!(["172.28.254.1/30"]);
-        }
-        if allow_lan {
-            config["inbounds"][0]["listen"] = json!("0.0.0.0");
-        }
-        None
     } else {
         if mode == "tun" {
             config = tun_config(&config, port, &interface).ok_or("TUN 配置无效")?;
@@ -1851,7 +1774,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         None
     };
     let binary = match core {
-        Core::Singbox | Core::Bridge => core_path()?,
+        Core::Singbox => core_path()?,
         Core::Mihomo => crate::bundled_binary("mihomo.exe")?,
     };
     let initial = serde_json::to_vec(&config).map_err(|_| "内核配置无效")?;
@@ -1868,6 +1791,9 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                 .args(["-f", "-"])
                 .env_remove("SAFE_PATHS")
                 .env_remove("SKIP_SAFE_PATH_CHECK");
+            if mode == "tun" && tun_ipv6 {
+                command.env("SKIP_SYSTEM_IPV6_CHECK", "1");
+            }
         } else {
             command.args([if check { "check" } else { "run" }, "-c", "stdin"]);
         }
@@ -1887,7 +1813,6 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let lifetime = WorkerLifetime {
         stop: &stop,
         parent: &parent,
-        policy: dependency.as_ref(),
     };
     let initial_deadline = Instant::now() + timeout;
     let mut check = start_core(&mut config_command(true), &job, &initial)?;
@@ -1933,9 +1858,8 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                     }
                 }
             }
-            policy_dns.is_none_or(|dns| UdpSocket::bind(("127.0.0.1", dns)).is_err())
-                && TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
-                && (core == Core::Bridge || controller.ready())
+            TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
+                && controller.ready()
         }) {
             let detail = core_stderr
                 .as_ref()
@@ -1949,7 +1873,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     };
     let (mut child, mut route) = launch(&initial, initial_deadline, &interface, None)?;
     if core == Core::Mihomo {
-        restore_policy_choices(&controller, &selections, initial_deadline);
+        restore_policy_choices(&controller, &mihomo_selections, initial_deadline);
         if lifetime.ended(0) || !matches!(child.try_wait(), Ok(None)) {
             stop_core(&mut child);
             return Err("Mihomo 在恢复策略选择时已停止".into());
@@ -1979,49 +1903,58 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         if !lost || lifetime.ended(0) {
             break;
         }
-        failed = matches!(mode.as_str(), "tun" | "policy");
+        failed = mode == "tun";
         let Some(control) = &control else {
             break;
         };
         if started.elapsed() >= TUN_STABLE_TIME {
             retries = 0;
         }
-        let policy_restart = if mode == "policy" && retries < TUN_RETRY_DELAYS_MS.len() {
-            let home = home.as_ref().ok_or("Mihomo 恢复目录不可用")?;
-            let Some(mut restart) = receive_policy_restart(&home.0, &lifetime, control)? else {
-                break;
-            };
-            controller.configure_mihomo(&mut restart.config);
-            Some(restart)
-        } else {
-            None
-        };
         while let Some(delay) = TUN_RETRY_DELAYS_MS.get(retries) {
             if !wait_tun_retry(&lifetime, control, *delay) {
                 break 'session;
             }
             retries += 1;
-            let replacement = if let Some(policy) = &policy_restart {
-                &policy.config
+            interface = tun_interface(&uuid::Uuid::new_v4().simple().to_string());
+            control.set_interface(&interface);
+            if core == Core::Mihomo {
+                let mut next_routing = control.routing_mode();
+                if let Some(home) = &home {
+                    if let Ok(Some(restart)) =
+                        try_receive_mihomo_restart(&home.0, &lifetime, control)
+                    {
+                        raw_mihomo_profile = Some(restart.config);
+                        mihomo_selections = restart.selections;
+                        next_routing = restart.routing_mode;
+                    }
+                }
+                let raw = raw_mihomo_profile
+                    .as_ref()
+                    .ok_or("恢复 Mihomo TUN 时缺少原始配置")?;
+                config = mihomo::prepare_native_tun_with_lan(
+                    raw,
+                    port,
+                    next_routing,
+                    &interface,
+                    tun_ipv6,
+                    allow_lan,
+                )?;
+                controller.configure_mihomo(&mut config);
             } else {
-                interface = tun_interface(&uuid::Uuid::new_v4().simple().to_string());
                 let tun = config["inbounds"]
                     .as_array_mut()
                     .and_then(|inbounds| inbounds.iter_mut().find(|entry| entry["type"] == "tun"))
                     .ok_or("恢复 TUN 时找不到网卡设置")?;
                 tun["interface_name"] = json!(&interface);
-                if core == Core::Singbox {
-                    control.restore_routing(&mut config);
-                }
-                &config
-            };
-            let replacement = serde_json::to_vec(replacement).map_err(|_| "恢复 TUN 配置失败")?;
+                control.restore_routing(&mut config);
+            }
+            let replacement = serde_json::to_vec(&config).map_err(|_| "恢复 TUN 配置失败")?;
             let deadline = Instant::now() + timeout;
             if let Ok((mut next, replacement_route)) =
                 launch(&replacement, deadline, &interface, Some(control))
             {
-                if let Some(policy) = &policy_restart {
-                    restore_policy_choices(&controller, &policy.selections, deadline);
+                if core == Core::Mihomo {
+                    restore_policy_choices(&controller, &mihomo_selections, deadline);
                     if !matches!(next.try_wait(), Ok(None)) {
                         stop_core(&mut next);
                         continue;
@@ -2041,12 +1974,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         }
         break;
     }
-    let restored = if mode == "policy" {
-        Ok(())
-    } else {
-        system_proxy::recover(&journal)
-    };
-    restored.map_err(|_| "无法恢复系统代理")?;
+    system_proxy::recover(&journal).map_err(|_| "无法恢复系统代理")?;
     if failed && !lifetime.ended(0) {
         return Err("TUN 会话中断".into());
     }
@@ -2124,26 +2052,56 @@ mod tests {
     #[test]
     fn elevated_rules_accept_only_present_outbounds_and_valid_networks() {
         let outbounds = vec![json!({"tag":"direct"}), json!({"tag":"node-1"})];
+        let tags = std::collections::HashSet::from([String::from("geosite-cn")]);
         let rule = json!({"ip_cidr":["2001:db8::/32","192.0.2.0/24"],"outbound":"node-1"});
-        assert!(validate_rule(&rule, &outbounds, &[]).is_some());
+        assert!(validate_rule(&rule, &outbounds, &[], &tags).is_some());
+        assert!(validate_rule(
+            &json!({"rule_set":["geosite-cn"],"outbound":"direct"}),
+            &outbounds,
+            &[],
+            &tags
+        )
+        .is_some());
+        assert!(validate_rule(
+            &json!({"rule_set":["unknown-set"],"outbound":"direct"}),
+            &outbounds,
+            &[],
+            &tags
+        )
+        .is_none());
         assert!(validate_rule(
             &json!({"ip_cidr":["2001:db8::/129"],"outbound":"node-1"}),
             &outbounds,
-            &[]
+            &[],
+            &tags
         )
         .is_none());
         assert!(validate_rule(
             &json!({"domain":["example.org"],"outbound":"absent"}),
             &outbounds,
-            &[]
+            &[],
+            &tags
         )
         .is_none());
         assert!(validate_rule(
             &json!({"ip_cidr":["127.0.0.1/32"],"domain":["example.org"],"action":"reject"}),
             &outbounds,
-            &[]
+            &[],
+            &tags
         )
         .is_none());
+
+        let valid_rs_cfg = json!({
+            "outbounds": [{"type":"vless","tag":"proxy","server":"example.com","server_port":443,"uuid":"00000000-0000-4000-8000-000000000000"},{"type":"direct","tag":"direct"}],
+            "route": {
+                "rules": [{"rule_set": ["geosite-geolocation-!cn"], "outbound": "proxy"}],
+                "rule_set": [{"tag": "geosite-geolocation-!cn", "type": "remote", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs", "download_detour": "proxy", "update_interval": "24h"}]
+            }
+        });
+        assert!(tun_config(&valid_rs_cfg, 17771, "FixtureRs").is_some());
+        let mut insecure_rs_cfg = valid_rs_cfg;
+        insecure_rs_cfg["route"]["rule_set"][0]["url"] = json!("http://example.com/bad.srs");
+        assert!(tun_config(&insecure_rs_cfg, 17771, "FixtureRs").is_none());
     }
 
     #[test]

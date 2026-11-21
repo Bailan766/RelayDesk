@@ -56,6 +56,14 @@ jobs:
           Invoke-WebRequest 'https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb.sha256sum' -OutFile (Join-Path $geoDir 'geoip.metadb.sha256sum')
           $expectedMeta = ((Get-Content (Join-Path $geoDir 'geoip.metadb.sha256sum') -Raw).Trim() -split '\s+')[0].ToUpperInvariant()
           if ((Get-FileHash (Join-Path $geoDir 'geoip.metadb') -Algorithm SHA256).Hash -ne $expectedMeta) { throw 'geoip.metadb checksum mismatch' }
+      - name: Download and verify Wintun
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'wintun.zip'
+          $dir = Join-Path $env:RUNNER_TEMP 'wintun'
+          Invoke-WebRequest 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51') { throw 'Wintun checksum mismatch' }
+          Expand-Archive $archive -DestinationPath $dir
       - run: npm test
       - run: npm run build
       - name: Prepare installer resources
@@ -66,6 +74,8 @@ jobs:
           Copy-Item (Join-Path $env:RUNNER_TEMP 'sing-box/sing-box-1.14.4-windows-amd64/LICENSE') build-resources/THIRD-PARTY-SING-BOX-LICENSE.txt
           Copy-Item (Join-Path $env:RUNNER_TEMP 'mihomo/mihomo-windows-amd64-v1.exe') build-resources/mihomo.exe
           Copy-Item (Join-Path $env:RUNNER_TEMP 'mihomo/LICENSE') build-resources/THIRD-PARTY-MIHOMO-LICENSE.txt
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'wintun/wintun/bin/amd64/wintun.dll') build-resources/wintun.dll
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'wintun/wintun/LICENSE.txt') build-resources/THIRD-PARTY-WINTUN-LICENSE.txt
           Copy-Item (Join-Path $env:RUNNER_TEMP 'geodata/Country.mmdb') build-resources/Country.mmdb
           Copy-Item (Join-Path $env:RUNNER_TEMP 'geodata/geoip.metadb') build-resources/geoip.metadb
       - name: Test Windows data protection
@@ -76,7 +86,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path release | Out-Null
           Copy-Item src-tauri/target/release/relaydesk.exe release/
-          Copy-Item build-resources/sing-box.exe, build-resources/mihomo.exe, build-resources/Country.mmdb, build-resources/geoip.metadb, build-resources/THIRD-PARTY-SING-BOX-LICENSE.txt, build-resources/THIRD-PARTY-MIHOMO-LICENSE.txt -Destination release/
+          Copy-Item build-resources/sing-box.exe, build-resources/mihomo.exe, build-resources/wintun.dll, build-resources/Country.mmdb, build-resources/geoip.metadb, build-resources/THIRD-PARTY-SING-BOX-LICENSE.txt, build-resources/THIRD-PARTY-MIHOMO-LICENSE.txt, build-resources/THIRD-PARTY-WINTUN-LICENSE.txt -Destination release/
           Copy-Item LICENSE release/RELAYDESK-LICENSE.txt
           Copy-Item THIRD_PARTY_NOTICES.md release/
           Compress-Archive -Path release/* -DestinationPath relaydesk-windows-x64-portable.zip
@@ -87,7 +97,7 @@ jobs:
           $install = Join-Path $env:RUNNER_TEMP 'RelayDeskSmoke'
           $setup = Start-Process -FilePath (Resolve-Path relaydesk-windows-x64-setup.exe) -ArgumentList '/S', "/D=$install" -Wait -PassThru
           if ($setup.ExitCode -ne 0) { throw "Installer failed: $($setup.ExitCode)" }
-          foreach ($name in @('relaydesk.exe', 'sing-box.exe', 'mihomo.exe', 'Country.mmdb', 'geoip.metadb', 'THIRD-PARTY-SING-BOX-LICENSE.txt', 'THIRD-PARTY-MIHOMO-LICENSE.txt')) {
+          foreach ($name in @('relaydesk.exe', 'sing-box.exe', 'mihomo.exe', 'wintun.dll', 'Country.mmdb', 'geoip.metadb', 'THIRD-PARTY-SING-BOX-LICENSE.txt', 'THIRD-PARTY-MIHOMO-LICENSE.txt', 'THIRD-PARTY-WINTUN-LICENSE.txt')) {
             if (-not (Test-Path (Join-Path $install $name))) { throw "Missing installed file: $name" }
           }
           & .github/scripts/test-windows-network.ps1 -App (Join-Path $install 'relaydesk.exe')

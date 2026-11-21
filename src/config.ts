@@ -5,6 +5,111 @@ import { normalizeIpCidr } from './ip';
 export type RuleType = 'domain' | 'domain_suffix' | 'ip_cidr' | 'process_name';
 export type RouteRule = { type: RuleType; value: string; action: 'direct' | 'proxy' | 'reject'; target?: string };
 export type RuleDefaultAction = 'proxy' | 'direct';
+export type RuleSetAction = 'direct' | 'proxy' | 'reject';
+export type RuleSetConfig = {
+  tag: string;
+  label: string;
+  url: string;
+  format: 'binary' | 'source';
+  action: RuleSetAction;
+  enabled: boolean;
+  downloadDetour?: 'proxy' | 'direct';
+  updateInterval?: string;
+};
+
+export const remoteRuleSetPresets: RuleSetConfig[] = [
+  {
+    tag: 'geosite-cn',
+    label: '大陆域名直连 (geosite-cn)',
+    url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs',
+    format: 'binary',
+    action: 'direct',
+    enabled: false,
+    downloadDetour: 'proxy',
+    updateInterval: '24h',
+  },
+  {
+    tag: 'geoip-cn',
+    label: '大陆 IP 直连 (geoip-cn)',
+    url: 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs',
+    format: 'binary',
+    action: 'direct',
+    enabled: false,
+    downloadDetour: 'proxy',
+    updateInterval: '24h',
+  },
+  {
+    tag: 'geosite-geolocation-!cn',
+    label: '海外非大陆域名代理 (geosite-!cn)',
+    url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs',
+    format: 'binary',
+    action: 'proxy',
+    enabled: false,
+    downloadDetour: 'proxy',
+    updateInterval: '24h',
+  },
+  {
+    tag: 'geosite-category-ads-all',
+    label: '常见广告域名拦截 (ads-all)',
+    url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs',
+    format: 'binary',
+    action: 'reject',
+    enabled: false,
+    downloadDetour: 'proxy',
+    updateInterval: '24h',
+  },
+  {
+    tag: 'geosite-openai',
+    label: 'OpenAI 服务规则集 (geosite-openai)',
+    url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs',
+    format: 'binary',
+    action: 'proxy',
+    enabled: false,
+    downloadDetour: 'proxy',
+    updateInterval: '24h',
+  },
+];
+
+export function normalizeRuleSetTag(raw: string): string {
+  return raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_!-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+}
+
+export function validateRuleSet(item: RuleSetConfig): RuleSetConfig {
+  const tag = normalizeRuleSetTag(item.tag);
+  if (!tag || !/^[a-z0-9][a-z0-9_!-]{0,63}$/.test(tag)) {
+    throw new Error('规则集标识无效，请使用小写字母、数字或连字符');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(item.url.trim());
+  } catch {
+    throw new Error(`规则集「${tag}」的 URL 无效`);
+  }
+  if (parsed.protocol !== 'https:' || !parsed.hostname) {
+    throw new Error(`规则集「${tag}」仅支持 HTTPS 远程地址`);
+  }
+  const format = item.format === 'source' ? 'source' : 'binary';
+  const action: RuleSetAction = item.action === 'reject' || item.action === 'proxy' ? item.action : 'direct';
+  const downloadDetour = item.downloadDetour === 'direct' ? 'direct' : 'proxy';
+  const updateInterval = item.updateInterval && /^[0-9]+[smhd]$/.test(item.updateInterval.trim())
+    ? item.updateInterval.trim()
+    : '24h';
+  return {
+    tag,
+    label: (item.label || tag).trim().slice(0, 80),
+    url: parsed.href,
+    format,
+    action,
+    enabled: Boolean(item.enabled),
+    downloadDetour,
+    updateInterval,
+  };
+}
 export const ruleTypes: { value: RuleType; label: string; example: string }[] = [
   { value: 'domain', label: '域名', example: 'example.com' },
   { value: 'domain_suffix', label: '域名后缀', example: 'example.com' },
@@ -97,8 +202,9 @@ function compileConfig(
   rules: RouteRule[],
   loaded: LoadedOutbounds,
   ruleDefaultAction: RuleDefaultAction = 'proxy',
+  ruleSets: RuleSetConfig[] = [],
 ) {
-  const compiledRules = rules.map(rule => {
+  const compiledRules: Fields[] = rules.map(rule => {
     const value = normalizeRuleValue(rule.type, rule.value);
     const match = rule.type === 'process_name'
       ? { process_path_regex: [`(?i)(?:^|[\\\\/])${value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`] }
@@ -106,6 +212,29 @@ function compileConfig(
     const outbound = rule.action === 'proxy' && rule.target ? loaded.get(rule.target)?.tag : rule.action;
     return !outbound || outbound === 'reject' ? { ...match, action: 'reject' } : { ...match, outbound };
   });
+
+  const enabledSets: RuleSetConfig[] = [];
+  const seenTags = new Set<string>();
+  for (const item of ruleSets) {
+    if (!item.enabled) continue;
+    const validated = validateRuleSet(item);
+    if (seenTags.has(validated.tag)) continue;
+    seenTags.add(validated.tag);
+    enabledSets.push(validated);
+  }
+  const compiledRuleSetDefinitions = enabledSets.map(rs => ({
+    tag: rs.tag,
+    type: 'remote',
+    format: rs.format,
+    url: rs.url,
+    download_detour: rs.downloadDetour ?? 'proxy',
+    update_interval: rs.updateInterval ?? '24h',
+  }));
+  const compiledRuleSetMatches: Fields[] = enabledSets.map(rs => ({
+    rule_set: [rs.tag],
+    ...(rs.action === 'reject' ? { action: 'reject' } : { outbound: rs.action }),
+  }));
+
   const endpoints = outbounds.filter(outbound => outbound.type === 'wireguard');
   const wireguard = endpoints.length > 0;
   return {
@@ -119,8 +248,9 @@ function compileConfig(
     ...(wireguard ? { endpoints, dns: { servers: [{ type: 'local', tag: 'bootstrap' }], final: 'bootstrap' } } : {}),
     route: {
       rules: wireguard
-        ? [{ inbound: endpoints.map(endpoint => endpoint.tag), action: 'reject' }, ...compiledRules]
-        : compiledRules,
+        ? [{ inbound: endpoints.map(endpoint => endpoint.tag), action: 'reject' }, ...compiledRules, ...compiledRuleSetMatches]
+        : [...compiledRules, ...compiledRuleSetMatches],
+      ...(compiledRuleSetDefinitions.length > 0 ? { rule_set: compiledRuleSetDefinitions } : {}),
       final: ruleDefaultAction, auto_detect_interface: true, find_process: true,
       ...(wireguard ? { default_domain_resolver: 'bootstrap' } : {}),
     },
@@ -132,9 +262,10 @@ export function buildConfig(
   port: number,
   rules: RouteRule[] = [],
   ruleDefaultAction: RuleDefaultAction = 'proxy',
+  ruleSets: RuleSetConfig[] = [],
 ) {
-  if (node.protocol === 'wireguard') return buildSessionConfig(node, [], port, rules, ruleDefaultAction).config;
-  return compileConfig([compileOutbound(node, 'proxy')], port, rules, new Map([[node.id, { tag: 'proxy' }]]), ruleDefaultAction);
+  if (node.protocol === 'wireguard') return buildSessionConfig(node, [], port, rules, ruleDefaultAction, ruleSets).config;
+  return compileConfig([compileOutbound(node, 'proxy')], port, rules, new Map([[node.id, { tag: 'proxy' }]]), ruleDefaultAction, ruleSets);
 }
 
 export type SessionPlan = {
@@ -148,6 +279,7 @@ export function buildSessionConfig(
   port: number,
   rules: RouteRule[],
   ruleDefaultAction: RuleDefaultAction = 'proxy',
+  ruleSets: RuleSetConfig[] = [],
 ): SessionPlan {
   const outbounds = [compileOutbound(selected, 'node-0')];
   const loaded = new Map([[selected.id, { tag: 'node-0', revision: nodeRevision(selected), node: selected }]]);
@@ -166,7 +298,7 @@ export function buildSessionConfig(
     config: compileConfig([{
       type: 'selector', tag: 'proxy', outbounds: outbounds.map(outbound => outbound.tag),
       default: 'node-0', interrupt_exist_connections: false,
-    }, ...outbounds], port, rules, loaded, ruleDefaultAction),
+    }, ...outbounds], port, rules, loaded, ruleDefaultAction, ruleSets),
     loaded,
   };
 }

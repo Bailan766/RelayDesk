@@ -143,6 +143,52 @@ describe("encrypted workspace data", () => {
     expect(updated.nodeLatencies[reordered.parsed.nodes[1].id]).toEqual(configured.nodeLatencies[firstId]);
   });
 
+  it("persists remote ruleSets, mihomoOverride, and hotkeys across serialization and subscription refresh", () => {
+    const clashYaml = [
+      "proxies:",
+      "  - { name: HK, type: trojan, server: hk.example.com, port: 443, password: secret }",
+      "proxy-groups:",
+      "  - { name: Proxy, type: select, proxies: [HK] }",
+      "rules:",
+      "  - MATCH,Proxy",
+    ].join("\n");
+    const sub = receiveSubscription(clashYaml, source, null);
+    const configured = {
+      ...replaceSubscription(emptyWorkspace, sub),
+      ruleSets: [{
+        tag: "geosite-cn",
+        label: "CN",
+        url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+        format: "binary" as const,
+        action: "direct" as const,
+        enabled: true,
+      }],
+      mihomoOverride: {
+        enabled: true,
+        dnsEnabled: "enable" as const,
+        enhancedMode: "fake-ip" as const,
+        nameservers: ["https://223.5.5.5/dns-query"],
+        fallback: [],
+        fakeIpFilter: ["*.internal"],
+        extraRules: ["DOMAIN,custom.test,DIRECT"],
+        extraYaml: "",
+      },
+      hotkeys: {
+        toggleProxy: "Ctrl+Alt+P",
+        cycleRouting: "Ctrl+Alt+M",
+        showWindow: "Ctrl+Alt+R",
+      },
+    };
+    const restored = deserializeWorkspace(serializeWorkspace(configured));
+    expect(restored.ruleSets).toMatchObject([{ tag: "geosite-cn", enabled: true }]);
+    expect(restored.mihomoOverride).toEqual(configured.mihomoOverride);
+    expect(restored.hotkeys).toEqual(configured.hotkeys);
+
+    const refreshed = receiveSubscription(clashYaml + "\n# refreshed", source, null, sub);
+    const afterRefresh = replaceSubscription(restored, refreshed);
+    expect(afterRefresh.mihomoOverride).toEqual(configured.mihomoOverride);
+  });
+
   it("preserves the legacy selected index when an earlier subscription line is a transport variant", () => {
     const legacy = deserializeWorkspace(JSON.stringify({ source, selected: 1,
       content: [primary, primary.replace("security=tls", "security=tls&type=ws"), backup].join("\n") }));

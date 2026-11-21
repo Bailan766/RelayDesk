@@ -16,4 +16,9 @@ The Windows build also bundles GeoIP databases (`Country.mmdb` and `geoip.metadb
 
 - Project: https://github.com/MetaCubeX/meta-rules-dat
 
+The Windows build also bundles the signed Wintun 0.14.1 driver library (`wintun.dll`) by WireGuard LLC for native Mihomo TUN support.
+
+- Project: https://www.wintun.net/
+- License: Included as `THIRD-PARTY-WINTUN-LICENSE.txt`.
+
 RelayDesk's own source code is licensed under the MIT license. Both proxy cores run as separate programs under their respective licenses.

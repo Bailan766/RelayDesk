@@ -1,13 +1,13 @@
 use crate::{
     failover::{self, Health, Reachability},
     network,
-    telemetry::Controller,
+    telemetry::{self, Controller, DnsLogEntry},
 };
 use serde_json::Value;
 use std::{
     collections::{HashSet, VecDeque},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
     },
     thread,
@@ -170,6 +170,9 @@ pub struct Supervisor {
     slot: Mutex<Slot>,
     closing: AtomicBool,
     control: tokio::sync::Mutex<()>,
+    dns_capture_active: AtomicBool,
+    dns_seq: AtomicU64,
+    dns_entries: Mutex<VecDeque<DnsLogEntry>>,
 }
 
 #[derive(serde::Serialize)]
@@ -328,6 +331,106 @@ impl Supervisor {
             }))
     }
 
+    pub fn active_dns_context(&self) -> Option<(network::Core, String, u16, Controller)> {
+        let slot = self.slot.lock().ok()?;
+        let active = slot.active.as_ref().filter(|active| active.session.ready())?;
+        Some((
+            active.plan.settings.core,
+            active.plan.mode.clone(),
+            active.session.port,
+            active.session.controller.clone(),
+        ))
+    }
+
+    pub fn session_uptime(&self) -> Option<Duration> {
+        let slot = self.slot.try_lock().ok()?;
+        slot.active.as_ref().map(|active| active.since.elapsed())
+    }
+
+    pub fn on_network_change(&self, reason: &str) {
+        let Ok(mut slot) = self.slot.lock() else {
+            return;
+        };
+        let label = match reason {
+            "system-resumed" => "系统已从睡眠/休眠唤醒，正在加速刷新链路状态",
+            "interface-changed" => "检测到系统网络接口变化（如切换 Wi-Fi），正在重新检查连接",
+            _ => "检测到网络环境变更",
+        };
+        slot.record("info", label);
+        if let Some(active) = slot.active.as_mut() {
+            if active.plan.monitors_node() {
+                active.health.next_check = Instant::now() + Duration::from_secs(2);
+            }
+        }
+    }
+
+    pub fn set_dns_capture(&self, enabled: bool) {
+        self.dns_capture_active.store(enabled, Ordering::Release);
+    }
+
+    pub fn dns_queries(&self) -> Vec<DnsLogEntry> {
+        self.dns_entries
+            .lock()
+            .map(|entries| entries.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn clear_dns_queries(&self) {
+        if let Ok(mut entries) = self.dns_entries.lock() {
+            entries.clear();
+        }
+    }
+
+    pub async fn watch_dns_logs(app: tauri::AppHandle) {
+        use tauri::Manager;
+        let state = app.state::<Self>();
+        while !state.closing.load(Ordering::Acquire) {
+            if !state.dns_capture_active.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+            let current = || {
+                state.slot.try_lock().ok().and_then(|slot| {
+                    slot.active
+                        .as_ref()
+                        .filter(|active| active.session.ready())
+                        .map(|active| active.session.id.clone())
+                })
+            };
+            let link = state.slot.try_lock().ok().and_then(|slot| {
+                slot.active
+                    .as_ref()
+                    .filter(|active| active.session.ready())
+                    .map(|active| (active.session.id.clone(), active.session.controller.clone()))
+            });
+            if let Some((id, controller)) = link {
+                controller
+                    .stream_debug_logs(
+                        || {
+                            !state.closing.load(Ordering::Acquire)
+                                && state.dns_capture_active.load(Ordering::Acquire)
+                                && current().is_some_and(|cur| cur == id)
+                        },
+                        |_, payload| {
+                            let Some(mut parsed) = telemetry::parse_dns_log_line(&payload) else {
+                                return;
+                            };
+                            parsed.id = state.dns_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                            if let Ok(mut entries) = state.dns_entries.lock() {
+                                const MAX_DNS_LOG_ENTRIES: usize = 200;
+                                if entries.len() >= MAX_DNS_LOG_ENTRIES {
+                                    entries.pop_front();
+                                }
+                                entries.push_back(parsed);
+                            }
+                        },
+                    )
+                    .await;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    }
+
     fn update_plan(
         &self,
         id: &str,
@@ -415,7 +518,7 @@ impl Supervisor {
 
     pub async fn reload_mihomo(&self, config: Value) -> Result<(), String> {
         let _guard = self.control.lock().await;
-        let (id, controller, old, port, dns, allow_lan, mode, selections) = {
+        let (id, controller, old, port, tun_iface, tun_ipv6, allow_lan, mode, selections) = {
             let slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
             let active = slot
                 .active
@@ -429,19 +532,20 @@ impl Supervisor {
                 active.session.controller.clone(),
                 active.plan.settings.config.clone(),
                 active.plan.port,
-                active.session.tun_dns,
+                active.session.active_tun_interface(),
+                active.session.tun_ipv6,
                 active.session.allow_lan,
                 active.plan.routing_mode,
                 active.plan.settings.selections.clone(),
             )
         };
-        let prepare = |profile: &Value| match dns {
-            Some((dns, system_dns)) => crate::mihomo::prepare_tun_policy_with_lan(
+        let prepare = |profile: &Value| match tun_iface.as_deref() {
+            Some(interface) => crate::mihomo::prepare_native_tun_with_lan(
                 profile,
                 port,
                 mode,
-                dns,
-                Some(system_dns),
+                interface,
+                tun_ipv6,
                 allow_lan,
             ),
             None => crate::mihomo::prepare_with_lan(profile, port, mode, allow_lan),
@@ -748,12 +852,12 @@ impl Supervisor {
                 return;
             };
             if active.session.running() {
-                if active.session.needs_policy_restart() {
+                if active.session.needs_mihomo_restart() {
                     // Policy changes hold this lock until the in-memory plan is committed.
                     if let Ok(_control) = self.control.try_lock() {
                         if active
                             .session
-                            .stage_policy_restart(&active.plan.settings, active.plan.routing_mode)
+                            .stage_mihomo_restart(&active.plan.settings, active.plan.routing_mode)
                             .is_err()
                         {
                             active.session.configure_tun_recovery(false);

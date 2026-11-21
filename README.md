@@ -1,6 +1,6 @@
 # RelayDesk
 
-RelayDesk 是一款 Windows 代理客户端，提供节点管理、订阅更新、系统代理、TUN（含免 UAC 后台服务）和本地代理端口，当前正式版本为 `v1.4.0`。
+RelayDesk 是一款 Windows 代理客户端，提供节点管理、订阅更新、系统代理、TUN（含免 UAC 后台服务）和本地代理端口，当前正式版本为 `v1.5.0`。
 
 - **作者**：Bailan233
 - **开源地址**：https://github.com/Bailan766/RelayDesk
@@ -23,10 +23,10 @@ RelayDesk 是一款 Windows 代理客户端，提供节点管理、订阅更新�
 ## 主要功能
 
 - **多订阅与兼容性**：支持 HTTPS 与本机/局域网 HTTP 订阅（可选允许外部 HTTP）、自定义请求线路与 User-Agent、独立自动更新周期，订阅用量与到期展示。
-- **节点模式（sing-box）**：支持 VLESS、VMess、Trojan、Shadowsocks、Hysteria2、TUIC v5 与 WireGuard，提供节点筛选、持久化测速、Clash API 快速测速与分流规则编辑。
-- **Mihomo 原配置**：保留原配置策略组、远程或内联提供者、规则与 DNS，支持可搜索折叠策略组面板与组内测速、热重载应用更新。
-- **运行观测与测试**：实时流量图、活跃连接搜索/排序/断开与一键加规则、脱敏实时日志、网站连通性批量测试、Cloudflare 下载测速、出口 IP 归属地与服务解锁检测。
-- **桌面与系统集成**：浅色/深色/跟随系统主题、Windows 开机自启、启动后自动连接、托盘状态与模式快捷切换、Allow LAN、系统代理绕过列表编辑、可选以管理员身份重启以简化 TUN 授权。
+- **节点模式（sing-box）**：支持 VLESS、VMess、Trojan、Shadowsocks、Hysteria2、TUIC v5 与 WireGuard，提供节点筛选、持久化测速、Clash API 快速测速、分流规则命中演练与远程 `rule_set` 规则集。
+- **Mihomo 原配置**：支持单核原生 Wintun TUN，保留并持久化覆写自定义 DNS / 附加规则 / YAML 深度合并字段、折叠策略组面板与组内测速、热重载应用更新。
+- **运行观测与测试**：实时流量图、活跃连接（明细/按进程聚合）搜索排序与一键加规则、DNS 查询对比与实时抓包观测面板、脱敏实时日志、网站连通性批量测试、Cloudflare 下载测速、出口 IP 归属地与服务解锁检测。
+- **桌面与系统集成**：浅色/深色/跟随系统主题、Windows 开机自启、全局快捷键、网卡变更与休眠唤醒原生监听（`NotifyIpInterfaceChange` / `WM_POWERBROADCAST`）、加密配置备份（PBKDF2 + AES-256-GCM）、SHA-256 校验应用内静默升级。
 
 ## 开发与测试
 

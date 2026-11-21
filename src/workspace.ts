@@ -1,10 +1,21 @@
-import { connectionSupport, rulePresets, ruleTypes, type RouteRule, type RuleDefaultAction } from "./config";
+import {
+  connectionSupport,
+  rulePresets,
+  ruleTypes,
+  validateRuleSet,
+  type RouteRule,
+  type RuleDefaultAction,
+  type RuleSetConfig,
+} from "./config";
+import { defaultMihomoOverride, sanitizeMihomoOverride, type MihomoOverride } from "./mihomoOverride";
 import { nodeRevision, parseSubscription, type ImportResult, type NodeProfile } from "./subscription";
 
 export type EntryMode = "system" | "tun" | "local";
 export type RoutingMode = "rule" | "global" | "direct";
 export type ThemeMode = "system" | "light" | "dark";
 export type CloseAction = "tray" | "exit";
+export type GlobalHotkeys = { toggleProxy: string; cycleRouting: string; showWindow: string };
+export const defaultHotkeys: GlobalHotkeys = { toggleProxy: "", cycleRouting: "", showWindow: "" };
 export type LatencyRecord = { revision: string; label: string; milliseconds?: number; testedAt?: number };
 export type Usage = { upload?: number; download?: number; total?: number; expire?: number };
 export type SubscriptionDownload = { content: string; usage: Usage | null };
@@ -35,6 +46,9 @@ export type Workspace = {
   selected?: string;
   mihomoProfile?: string;
   rules: RouteRule[];
+  ruleSets: RuleSetConfig[];
+  mihomoOverride: MihomoOverride;
+  hotkeys: GlobalHotkeys;
   entryMode: EntryMode;
   routingMode: RoutingMode;
   refreshHours: number;
@@ -61,6 +75,9 @@ export const defaultRules: RouteRule[] = [
 export const emptyWorkspace: Workspace = {
   subscriptions: [],
   rules: defaultRules,
+  ruleSets: [],
+  mihomoOverride: defaultMihomoOverride(),
+  hotkeys: { ...defaultHotkeys },
   entryMode: "system",
   routingMode: "rule",
   refreshHours: 0,
@@ -313,6 +330,9 @@ export function deserializeWorkspace(raw: string): Workspace {
     selected: preferredNode(subscriptions, typeof saved.selected === "string" ? recoverId(saved.selected) : undefined),
     mihomoProfile: subscriptions.find(profile => profile.id === saved.mihomoProfile && profile.parsed.mihomo)?.id,
     rules: (saved.rules as RouteRule[]).map(rule => rule.target ? { ...rule, target: recoverId(rule.target) } : rule),
+    ruleSets: sanitizeRuleSets(saved.ruleSets),
+    mihomoOverride: sanitizeMihomoOverride(saved.mihomoOverride),
+    hotkeys: sanitizeHotkeys(saved.hotkeys),
     entryMode: saved.entryMode === "local" || saved.entryMode === "tun" ? saved.entryMode : "system",
     routingMode: saved.routingMode === "direct" || saved.routingMode === "global" ? saved.routingMode : "rule",
     refreshHours: parseRefreshHours(saved.refreshHours) ?? 0,
@@ -333,6 +353,34 @@ export function deserializeWorkspace(raw: string): Workspace {
     tunIpv6: saved.tunIpv6 !== false,
     ruleDefaultAction: saved.ruleDefaultAction === "direct" ? "direct" : "proxy",
     nodeLatencies: validLatencies(saved.nodeLatencies, known, recoverId),
+  };
+}
+
+function sanitizeRuleSets(raw: unknown): RuleSetConfig[] {
+  if (!Array.isArray(raw)) return [];
+  const out: RuleSetConfig[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    try {
+      const valid = validateRuleSet(item as RuleSetConfig);
+      if (seen.has(valid.tag)) continue;
+      seen.add(valid.tag);
+      out.push(valid);
+      if (out.length >= 64) break;
+    } catch { /* ignore malformed rule set entry */ }
+  }
+  return out;
+}
+
+function sanitizeHotkeys(raw: unknown): GlobalHotkeys {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { ...defaultHotkeys };
+  const record = raw as Record<string, unknown>;
+  const clean = (value: unknown) => (typeof value === "string" && value.length <= 48 ? value.trim() : "");
+  return {
+    toggleProxy: clean(record.toggleProxy),
+    cycleRouting: clean(record.cycleRouting),
+    showWindow: clean(record.showWindow),
   };
 }
 

@@ -326,27 +326,46 @@ impl Controller {
         self.read_json("/connections").await
     }
 
-    async fn read_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, String> {
-        let mut response = self
-            .request(reqwest::Method::GET, path)?
+    pub async fn query_dns(&self, name: &str, qtype: &str) -> Result<Value, String> {
+        let response = self
+            .request(reqwest::Method::GET, "/dns/query")?
+            .query(&[("name", name), ("type", qtype)])
+            .timeout(Duration::from_secs(4))
             .send()
             .await
-            .map_err(|_| "内核监控暂时不可用")?
-            .error_for_status()
-            .map_err(|_| "内核监控返回异常")?;
-        const LIMIT: usize = 8 * 1024 * 1024;
-        let mut data = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| "读取内核监控失败")? {
-            if data.len() + chunk.len() > LIMIT {
-                return Err("内核监控响应过大".into());
-            }
-            data.extend_from_slice(&chunk);
+            .map_err(|_| "内核 DNS 查询请求失败")?;
+        if !response.status().is_success() {
+            return Err(format!("内核不支持实时 DNS 查询（HTTP {}）", response.status().as_u16()));
         }
-        serde_json::from_slice(&data).map_err(|_| "内核监控数据格式无效".into())
+        let bytes = response.bytes().await.map_err(|_| "读取内核 DNS 响应失败")?;
+        serde_json::from_slice(&bytes).map_err(|_| "内核 DNS 响应格式无效".into())
     }
 
     pub async fn stream_logs(
         &self,
+        still_current: impl Fn() -> bool,
+        mut receive: impl FnMut(&'static str, String),
+    ) {
+        self.stream_logs_at_level("info", still_current, |level, payload| {
+            let clean = redact_log_payload(&payload);
+            if !clean.is_empty() {
+                receive(level, clean);
+            }
+        })
+        .await;
+    }
+
+    pub async fn stream_debug_logs(
+        &self,
+        still_current: impl Fn() -> bool,
+        receive: impl FnMut(&'static str, String),
+    ) {
+        self.stream_logs_at_level("debug", still_current, receive).await;
+    }
+
+    async fn stream_logs_at_level(
+        &self,
+        level_param: &str,
         still_current: impl Fn() -> bool,
         mut receive: impl FnMut(&'static str, String),
     ) {
@@ -360,7 +379,7 @@ impl Controller {
             return;
         };
         let request = client
-            .get(format!("http://127.0.0.1:{}/logs?level=info", self.port))
+            .get(format!("http://127.0.0.1:{}/logs?level={level_param}", self.port))
             .bearer_auth(self.secret.to_string());
         let Ok(Ok(mut response)) =
             tokio::time::timeout(Duration::from_secs(45), request.send()).await
@@ -378,7 +397,7 @@ impl Controller {
                         return;
                     }
                     pending.extend_from_slice(&chunk);
-                    log_lines(&mut pending, &mut receive);
+                    log_lines(&mut pending, &mut receive, level_param == "debug");
                 }
                 Ok(_) => return,
                 Err(_) => continue,
@@ -448,7 +467,165 @@ pub(crate) fn redact_log_payload(raw: &str) -> String {
     truncated
 }
 
-fn log_lines(buffer: &mut Vec<u8>, receive: &mut impl FnMut(&'static str, String)) {
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsLogEntry {
+    pub id: u64,
+    pub timestamp: u64,
+    pub domain: String,
+    pub qtype: String,
+    pub source: String,
+    pub server: String,
+    pub answer: String,
+    pub raw: String,
+}
+
+pub fn is_fake_ip_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            octets[0] == 198 && matches!(octets[1], 18 | 19)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            (segs[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+fn clean_domain_token(token: &str) -> Option<String> {
+    let trimmed = token
+        .trim_matches(|c: char| matches!(c, '[' | ']' | '(' | ')' | ',' | ';' | '"' | '\''))
+        .trim_end_matches('.');
+    if trimmed.is_empty()
+        || trimmed.len() > 253
+        || !trimmed.contains('.')
+        || trimmed.contains("://")
+        || trimmed.parse::<std::net::IpAddr>().is_ok()
+    {
+        return None;
+    }
+    if trimmed.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    }) {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+pub fn parse_dns_log_line(raw: &str) -> Option<DnsLogEntry> {
+    let clean = redact_log_payload(raw);
+    if clean.is_empty() {
+        return None;
+    }
+    let lower = clean.to_ascii_lowercase();
+    let is_dns = clean.contains("[DNS]")
+        || lower.contains("dns:")
+        || lower.contains("fake-ip")
+        || lower.contains("fakeip")
+        || lower.contains("dns-query");
+    if !is_dns {
+        return None;
+    }
+
+    let qtype = if clean.split_whitespace().any(|tok| tok.trim_matches(|c: char| !c.is_ascii_alphanumeric()) == "AAAA") {
+        "AAAA"
+    } else if clean.split_whitespace().any(|tok| tok.trim_matches(|c: char| !c.is_ascii_alphanumeric()) == "A") {
+        "A"
+    } else if clean.split_whitespace().any(|tok| tok.trim_matches(|c: char| !c.is_ascii_alphanumeric()) == "HTTPS") {
+        "HTTPS"
+    } else {
+        ""
+    };
+
+    let answer = if let (Some(start), Some(end)) = (clean.rfind('['), clean.rfind(']')) {
+        if end > start + 1 && !clean[start + 1..end].eq_ignore_ascii_case("DNS") {
+            clean[start + 1..end].trim().to_owned()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let answer_has_fake_ip = answer
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter_map(|tok| tok.trim().parse::<std::net::IpAddr>().ok())
+        .any(is_fake_ip_addr);
+
+    let source = if answer_has_fake_ip || lower.contains("fake-ip") || lower.contains("fakeip") {
+        "fake-ip"
+    } else if lower.contains("cached") || lower.contains("cache") {
+        "cache"
+    } else if lower.contains("bootstrap")
+        || lower.contains("local")
+        || lower.contains("system")
+        || lower.contains("114.114.114.114")
+        || lower.contains("223.5.5.5")
+    {
+        "local-bootstrap"
+    } else if lower.contains("https://")
+        || lower.contains("tls://")
+        || lower.contains("quic://")
+        || lower.contains("remote")
+        || lower.contains("1.1.1.1")
+        || lower.contains("8.8.8.8")
+    {
+        "remote-doh"
+    } else {
+        "other"
+    };
+
+    let mut server = String::new();
+    let mut domain = String::new();
+    for tok in clean.split_whitespace() {
+        let stripped = tok.trim_matches(|c: char| matches!(c, '(' | ')' | ',' | ';'));
+        if server.is_empty()
+            && (stripped.starts_with("https://")
+                || stripped.starts_with("tls://")
+                || stripped.starts_with("udp://")
+                || stripped.starts_with("tcp://")
+                || stripped == "bootstrap"
+                || stripped == "remote"
+                || stripped == "system")
+        {
+            server = stripped.to_owned();
+            continue;
+        }
+        if domain.is_empty() {
+            if let Some(candidate) = clean_domain_token(stripped) {
+                domain = candidate;
+            }
+        }
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    Some(DnsLogEntry {
+        id: 0,
+        timestamp,
+        domain,
+        qtype: qtype.to_owned(),
+        source: source.to_owned(),
+        server,
+        answer,
+        raw: clean,
+    })
+}
+
+fn log_lines(
+    buffer: &mut Vec<u8>,
+    receive: &mut impl FnMut(&'static str, String),
+    include_debug: bool,
+) {
     let Some(end) = buffer.iter().rposition(|byte| *byte == b'\n') else {
         return;
     };
@@ -464,32 +641,38 @@ fn log_lines(buffer: &mut Vec<u8>, receive: &mut impl FnMut(&'static str, String
             "error" | "fatal" | "panic" => "error",
             "warning" | "warn" => "warn",
             "info" => "info",
+            "debug" if include_debug => "debug",
             _ => continue,
         };
-        let message = redact_log_payload(&entry.payload);
-        if !message.is_empty() {
-            receive(level, message);
+        if !entry.payload.is_empty() {
+            receive(level, entry.payload);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn parses_split_records_and_redacts_sensitive_urls() {
         let mut buffer =
             b"{\"type\":\"error\",\"payload\":\"TLS handshake for https://user:secret@sub.example/path?token=abc".to_vec();
         let mut events = Vec::new();
-        super::log_lines(&mut buffer, &mut |level, message| {
-            events.push((level, message))
-        });
+        super::log_lines(
+            &mut buffer,
+            &mut |level, message| events.push((level, redact_log_payload(&message))),
+            false,
+        );
         assert!(events.is_empty());
         buffer.extend_from_slice(
             b"\"}\n{\"type\":\"warn\",\"payload\":\"lookup private.example\"}\n",
         );
-        super::log_lines(&mut buffer, &mut |level, message| {
-            events.push((level, message))
-        });
+        super::log_lines(
+            &mut buffer,
+            &mut |level, message| events.push((level, redact_log_payload(&message))),
+            false,
+        );
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0, "error");
         assert!(events[0].1.contains("sub.example"));
@@ -497,6 +680,33 @@ mod tests {
         assert!(!events[0].1.contains("token=abc"));
         assert_eq!(events[1], ("warn", "lookup private.example".to_owned()));
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn parses_dns_log_lines_and_classifies_fake_ip_doh_and_bootstrap() {
+        assert!(is_fake_ip_addr("198.18.0.5".parse().unwrap()));
+        assert!(!is_fake_ip_addr("1.1.1.1".parse().unwrap()));
+
+        let fake = parse_dns_log_line("[DNS] api.openai.com --> [198.18.0.12] A").unwrap();
+        assert_eq!(fake.domain, "api.openai.com");
+        assert_eq!(fake.source, "fake-ip");
+        assert_eq!(fake.qtype, "A");
+        assert_eq!(fake.answer, "198.18.0.12");
+
+        let doh =
+            parse_dns_log_line("[123 1ms] dns: exchanged AAAA example.org from https://1.1.1.1/dns-query [2606:2800:220:1::]")
+                .unwrap();
+        assert_eq!(doh.domain, "example.org");
+        assert_eq!(doh.source, "remote-doh");
+        assert_eq!(doh.qtype, "AAAA");
+
+        let local =
+            parse_dns_log_line("[99 0ms] dns: lookup baidu.com on bootstrap [220.181.38.148]")
+                .unwrap();
+        assert_eq!(local.source, "local-bootstrap");
+        assert_eq!(local.domain, "baidu.com");
+
+        assert!(parse_dns_log_line("inbound/mixed connection to example.com:443").is_none());
     }
 }
 

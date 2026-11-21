@@ -20,6 +20,8 @@ struct TunControlValues {
     recover: AtomicU32,
     routing: AtomicU32,
     phase: AtomicU32,
+    interface_len: AtomicU32,
+    interface_words: [AtomicU32; 8],
 }
 
 pub(super) struct TunControl {
@@ -133,6 +135,40 @@ impl TunControl {
                 config["outbounds"][0]["default"] = json!(tag);
             }
         }
+    }
+
+    pub(super) fn routing_mode(&self) -> RoutingMode {
+        match self.values().routing.load(Ordering::Acquire) >> 16 {
+            1 => RoutingMode::Global,
+            2 => RoutingMode::Direct,
+            _ => RoutingMode::Rule,
+        }
+    }
+
+    pub(super) fn set_interface(&self, name: &str) {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(32);
+        // Publish length=0 before updating words so concurrent readers never see half-written names.
+        self.values().interface_len.store(0, Ordering::Release);
+        let mut padded = [0u8; 32];
+        padded[..len].copy_from_slice(&bytes[..len]);
+        for (slot, chunk) in self.values().interface_words.iter().zip(padded.chunks_exact(4)) {
+            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            slot.store(word, Ordering::Relaxed);
+        }
+        self.values().interface_len.store(len as u32, Ordering::Release);
+    }
+
+    pub(super) fn interface(&self) -> Option<String> {
+        let len = self.values().interface_len.load(Ordering::Acquire) as usize;
+        if len == 0 || len > 32 {
+            return None;
+        }
+        let mut buf = [0u8; 32];
+        for (slot, chunk) in self.values().interface_words.iter().zip(buf.chunks_exact_mut(4)) {
+            chunk.copy_from_slice(&slot.load(Ordering::Relaxed).to_le_bytes());
+        }
+        std::str::from_utf8(&buf[..len]).ok().map(str::to_owned)
     }
 
     pub(super) fn begin_recovery(&self) {

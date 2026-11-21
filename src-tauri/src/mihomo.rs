@@ -135,22 +135,12 @@ pub fn prepare_with_lan(
     Ok(Value::Object(config))
 }
 
-pub fn prepare_tun_policy(
+pub fn prepare_native_tun_with_lan(
     config: &Value,
     port: u16,
     mode: RoutingMode,
-    dns_port: u16,
-    system_dns: Option<u16>,
-) -> Result<Value, String> {
-    prepare_tun_policy_with_lan(config, port, mode, dns_port, system_dns, false)
-}
-
-pub fn prepare_tun_policy_with_lan(
-    config: &Value,
-    port: u16,
-    mode: RoutingMode,
-    dns_port: u16,
-    system_dns: Option<u16>,
+    interface: &str,
+    tun_ipv6: bool,
     allow_lan: bool,
 ) -> Result<Value, String> {
     let mut prepared = prepare_with_lan(config, port, mode, allow_lan)?;
@@ -163,46 +153,40 @@ pub fn prepare_tun_policy_with_lan(
     if dns.get("enable") != Some(&json!(true)) {
         dns = Map::from_iter([
             ("nameserver".into(), json!(["system"])),
+            ("enhanced-mode".into(), json!("fake-ip")),
+            ("fake-ip-range".into(), json!("198.18.0.1/16")),
             ("use-hosts".into(), json!(true)),
         ]);
     }
     dns.insert("enable".into(), json!(true));
-    dns.insert("listen".into(), json!(format!("127.0.0.1:{dns_port}")));
-    if let Some(port) = system_dns {
-        let local = format!("udp://127.0.0.1:{port}#DIRECT");
-        for key in [
-            "nameserver",
-            "fallback",
-            "default-nameserver",
-            "proxy-server-nameserver",
-            "direct-nameserver",
-            "nameserver-policy",
-            "proxy-server-nameserver-policy",
-        ] {
-            if let Some(value) = dns.get_mut(key) {
-                use_physical_system_dns(value, &local);
-            }
+    dns.remove("listen");
+    if tun_ipv6 {
+        dns.entry("ipv6").or_insert_with(|| json!(true));
+        if prepared.get("ipv6").is_none() {
+            prepared["ipv6"] = json!(true);
         }
     }
     prepared["dns"] = Value::Object(dns);
-    Ok(prepared)
-}
 
-fn use_physical_system_dns(value: &mut Value, local: &str) {
-    match value {
-        Value::String(server)
-            if matches!(server.as_str(), "system" | "system://" | "dhcp://system") =>
-        {
-            *server = local.to_owned();
-        }
-        Value::Array(values) => values
-            .iter_mut()
-            .for_each(|value| use_physical_system_dns(value, local)),
-        Value::Object(values) => values
-            .values_mut()
-            .for_each(|value| use_physical_system_dns(value, local)),
-        _ => {}
+    let mut tun = Map::from_iter([
+        ("enable".into(), json!(true)),
+        ("device".into(), json!(interface)),
+        ("stack".into(), json!("mixed")),
+        ("auto-route".into(), json!(true)),
+        ("strict-route".into(), json!(true)),
+        ("auto-detect-interface".into(), json!(true)),
+        ("dns-hijack".into(), json!(["any:53", "tcp://any:53"])),
+        ("inet4-address".into(), json!(["172.28.254.1/30"])),
+        (
+            "route-exclude-address".into(),
+            json!(["127.0.0.0/8", "::1/128"]),
+        ),
+    ]);
+    if tun_ipv6 {
+        tun.insert("inet6-address".into(), json!(["fdfe:dcba:9876::1/126"]));
     }
+    prepared["tun"] = Value::Object(tun);
+    Ok(prepared)
 }
 
 pub async fn restore_selections(
@@ -239,43 +223,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tun_uses_the_profile_dns_or_the_system_resolver_on_a_private_port() {
+    fn native_tun_uses_profile_dns_or_fakeip_default_and_sets_single_core_wintun_block() {
         let configured = json!({
             "rules":["MATCH,DIRECT"],
             "dns":{"enable":true,"listen":"0.0.0.0:53","nameserver":["https://dns.example/query"],
                    "enhanced-mode":"fake-ip"}
         });
-        let dns = prepare_tun_policy(&configured, 17070, RoutingMode::Rule, 17071, Some(17072))
-            .unwrap()["dns"]
-            .clone();
-        assert_eq!(dns["listen"], "127.0.0.1:17071");
-        assert_eq!(dns["nameserver"], configured["dns"]["nameserver"]);
-        assert_eq!(dns["enhanced-mode"], "fake-ip");
+        let prepared = prepare_native_tun_with_lan(
+            &configured,
+            17070,
+            RoutingMode::Rule,
+            "RelayDesk-test1234",
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(prepared["dns"]["enable"], true);
+        assert!(prepared["dns"].get("listen").is_none());
+        assert_eq!(prepared["dns"]["nameserver"], configured["dns"]["nameserver"]);
+        assert_eq!(prepared["dns"]["enhanced-mode"], "fake-ip");
+        assert_eq!(prepared["tun"]["enable"], true);
+        assert_eq!(prepared["tun"]["device"], "RelayDesk-test1234");
+        assert_eq!(prepared["tun"]["stack"], "mixed");
+        assert_eq!(prepared["tun"]["inet4-address"], json!(["172.28.254.1/30"]));
+        assert_eq!(prepared["tun"]["inet6-address"], json!(["fdfe:dcba:9876::1/126"]));
 
         for config in [
             json!({"rules":["MATCH,DIRECT"]}),
             json!({"rules":["MATCH,DIRECT"],"dns":{"enable":false,"nameserver":["127.0.0.2"]}}),
         ] {
-            let prepared =
-                prepare_tun_policy(&config, 17070, RoutingMode::Rule, 17071, None).unwrap();
-            let dns = &prepared["dns"];
-            assert_eq!(dns["enable"], true);
-            assert_eq!(dns["listen"], "127.0.0.1:17071");
-            assert_eq!(dns["nameserver"], json!(["system"]));
+            let prepared = prepare_native_tun_with_lan(
+                &config,
+                17070,
+                RoutingMode::Rule,
+                "RelayDesk-def",
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(prepared["allow-lan"], true);
+            assert!(prepared["tun"].get("inet6-address").is_none());
+            assert_eq!(prepared["dns"]["enable"], true);
+            assert_eq!(prepared["dns"]["enhanced-mode"], "fake-ip");
+            assert_eq!(prepared["dns"]["nameserver"], json!(["system"]));
         }
-
-        let mut explicit = configured;
-        explicit["dns"]["nameserver-policy"] =
-            json!({"fixture.test":["system://","dhcp://system"]});
-        let prepared =
-            prepare_tun_policy(&explicit, 17070, RoutingMode::Rule, 17071, Some(17072)).unwrap();
-        assert_eq!(
-            prepared["dns"]["nameserver-policy"]["fixture.test"],
-            json!([
-                "udp://127.0.0.1:17072#DIRECT",
-                "udp://127.0.0.1:17072#DIRECT"
-            ])
-        );
     }
 
     #[test]
