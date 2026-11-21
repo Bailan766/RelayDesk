@@ -77,7 +77,7 @@ pub struct ServiceStatusInfo {
     pub up_to_date: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(crate) enum PipeCommand {
     Status,
@@ -102,7 +102,7 @@ pub(crate) enum PipeCommand {
     Stop,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum PipeEvent {
     Status {
@@ -892,7 +892,6 @@ fn handle_pipe_client(mut pipe: File) {
                     let mut buf = vec![0u8; (avail as usize).min(65536)];
                     match reader_pipe.read(&mut buf) {
                         Ok(0) | Err(_) => {
-                            avail = 0;
                             graceful_stop = true;
                             break;
                         }
