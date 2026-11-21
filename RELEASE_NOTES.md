@@ -1,4 +1,6 @@
-# RelayDesk 0.1.19 Preview
+# RelayDesk 0.1.20 Preview
+
+- Windows TUN 在 IPv4 和 IPv6 默认路由均已建立后才报告连接就绪，让后续路由恢复监控覆盖双栈。
 
 - Mihomo 原配置开启 Windows TUN 后，策略内核意外退出时会尝试用当前配置、路由模式和策略组选择恢复连接。接管进程继续运行。经 TUN 发出的新 DNS 查询会交给恢复后的 Mihomo，避免 TUN 转发层重复返回旧 Fake-IP。
 

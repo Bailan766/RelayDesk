@@ -1565,7 +1565,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                     return false;
                 }
                 route = tun_default_route(interface, AF_INET as u16);
-                if route.is_none() {
+                if route.is_none() || tun_default_route(interface, AF_INET6 as u16).is_none() {
                     return false;
                 }
             }

@@ -23,6 +23,7 @@
 | A04/A09 TUN 接管内核退出 | `v0.1.18-preview.2` 强制结束已安装应用的接管内核，验证同一授权进程恢复 Mihomo TUN 的实际 TCP 流量。节点模式恢复上次所选节点和路由模式，重试期间关闭自动恢复会停止接管。模拟界面验证恢复中仍可点击停止。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44849122906) | 授权进程自身退出、Mihomo 策略进程退出后重连、恢复期间阻断直连、Windows 服务及真实休眠唤醒。 |
 | A04/A09 Mihomo 策略内核退出 | `v0.1.19-preview.1` 强制结束 Mihomo 策略内核。接管网卡持续存在，恢复后原策略组选择生效，更新后的规则转发了到新目标的 TCP 请求。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44851096170) | 策略守护进程退出、应用自身保留 Fake-IP 地址时的恢复。 |
 | A05 双栈和 Fake-IP | Windows 实机及 `v0.1.19-preview.2` 安装验收均通过 IPv6 HTTP、Shadowsocks UDP 回显和 AAAA 查询。关闭 TUN 转发层的 DNS 缓存后，重启 Mihomo 后的查询会返回替换内核提供的 Fake-IP，同一域名的新 HTTP 请求恢复。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44852078767) | 应用和 Windows 自身仍缓存的 Fake-IP、IPv6 真实上游和切网。 |
+| A04 一次授权服务原型 | 独立的 Windows 本机测试原型使用受限用户令牌连接临时服务，以指定地址的临时 TUN 路由转发实际 TCP 流量。测试验证了未登记身份和异常命令遭拒，客户端断开及服务进程被终止后测试网卡和路由被清除。原型测试中发现网卡地址可先于路由出现，调整为检查实际最佳路由后才通知就绪。 | 原型尚未集成进客户端或安装器。仍需覆盖真实的第二用户、会话隔离、安装升级卸载、进程启动竞态、休眠切网与正式产品的端到端测试。 |
 
 ## 优先解决的用户风险
 

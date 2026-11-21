@@ -122,6 +122,13 @@ function Test-NetworkSession([string]$Mode, [bool]$SimulateCrash) {
         if ($Mode -eq 'tun' -and -not (Get-NetIPAddress -InterfaceAlias $tunAlias -IPAddress '172.28.254.1' -ErrorAction SilentlyContinue)) {
             throw 'The TUN virtual interface was not configured'
         }
+        if ($Mode -eq 'tun') {
+            foreach ($prefix in @('0.0.0.0/0', '::/0')) {
+                if (-not (Get-NetRoute -InterfaceAlias $tunAlias -DestinationPrefix $prefix -ErrorAction SilentlyContinue)) {
+                    throw "The TUN worker reported readiness before route $prefix was configured"
+                }
+            }
+        }
         $url = "http://127.0.0.1:$controllerPort/connections"
         $response = Invoke-WebRequest -Uri $url -NoProxy -TimeoutSec 3 -SkipHttpErrorCheck
         if ($response.StatusCode -ne 401) { throw 'The local controller must require authentication' }
