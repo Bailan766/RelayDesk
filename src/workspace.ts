@@ -1,4 +1,4 @@
-import { connectionSupport, ruleTypes, type RouteRule, type RuleDefaultAction } from "./config";
+import { connectionSupport, rulePresets, ruleTypes, type RouteRule, type RuleDefaultAction } from "./config";
 import { nodeRevision, parseSubscription, type ImportResult, type NodeProfile } from "./subscription";
 
 export type EntryMode = "system" | "tun" | "local";
@@ -53,15 +53,20 @@ export type Workspace = {
   nodeLatencies: Record<string, LatencyRecord>;
 };
 
+export const defaultRules: RouteRule[] = [
+  ...rulePresets[0].rules,
+  ...rulePresets[1].rules,
+];
+
 export const emptyWorkspace: Workspace = {
   subscriptions: [],
-  rules: [],
+  rules: defaultRules,
   entryMode: "system",
   routingMode: "rule",
   refreshHours: 0,
   favorites: [],
   autoReconnect: true,
-  autoFailover: false,
+  autoFailover: true,
   proxyPort: null,
   theme: "system",
   autoConnect: false,
@@ -229,7 +234,10 @@ export function replaceSubscription(state: Workspace, profile: Subscription): Wo
     const nextId = remapped.get(id) ?? id;
     if (validIds.has(nextId)) nodeLatencies[nextId] = record;
   }
-  return { ...state, subscriptions, selected: preferredNode(subscriptions, selection), favorites, rules, nodeLatencies };
+  const autoMihomo = !old && !state.subscriptions.length && !state.mihomoProfile && profile.parsed.mihomo
+    ? profile.id
+    : state.mihomoProfile;
+  return { ...state, subscriptions, selected: preferredNode(subscriptions, selection), mihomoProfile: autoMihomo, favorites, rules, nodeLatencies };
 }
 
 function isRule(value: unknown): value is RouteRule {
@@ -308,7 +316,7 @@ export function deserializeWorkspace(raw: string): Workspace {
       ? [...new Set<string>(saved.favorites.filter((id: unknown): id is string => typeof id === "string").map(recoverId))]
       : [],
     autoReconnect: saved.autoReconnect !== false,
-    autoFailover: saved.autoFailover === true,
+    autoFailover: saved.autoFailover !== false,
     proxyPort: Number.isInteger(saved.proxyPort) && saved.proxyPort >= 1024 && saved.proxyPort <= 65535
       ? saved.proxyPort : null,
     theme: saved.theme === "light" || saved.theme === "dark" ? saved.theme : "system",

@@ -930,14 +930,29 @@ fn mihomo_cache_dir() -> Option<PathBuf> {
 }
 
 fn seed_mihomo_geodata(home: &std::path::Path) {
-    let Some(cache) = mihomo_cache_dir() else {
-        return;
-    };
+    let cache = mihomo_cache_dir();
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
     for name in MIHOMO_GEODATA_FILES {
-        let src = cache.join(name);
         let dst = home.join(name);
-        if src.is_file() && !dst.exists() {
-            let _ = fs::copy(&src, &dst);
+        if dst.exists() {
+            continue;
+        }
+        if let Some(src) = cache
+            .as_ref()
+            .map(|dir| dir.join(name))
+            .filter(|path| path.is_file())
+        {
+            let _ = fs::copy(src, &dst);
+            continue;
+        }
+        if let Some(src) = exe_dir
+            .as_ref()
+            .map(|dir| dir.join(name))
+            .filter(|path| path.is_file())
+        {
+            let _ = fs::copy(src, &dst);
         }
     }
 }

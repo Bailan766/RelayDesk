@@ -156,4 +156,21 @@ describe("encrypted workspace data", () => {
     const chosen = preferredNode([sub]);
     expect(sub.parsed.nodes.find(node => node.id === chosen)?.name).toBe("backup");
   });
+
+  it("provides LAN/CN split rules and auto-failover by default and auto-activates first Mihomo profile", () => {
+    expect(emptyWorkspace.rules.length).toBeGreaterThan(10);
+    expect(emptyWorkspace.autoFailover).toBe(true);
+    const clashYaml = [
+      "proxies:",
+      "  - { name: HK, type: trojan, server: hk.example.com, port: 443, password: secret }",
+      "proxy-groups:",
+      "  - { name: Proxy, type: select, proxies: [HK] }",
+      "rules:",
+      "  - MATCH,Proxy",
+    ].join("\n");
+    const sub = receiveSubscription(clashYaml, source, null);
+    const next = replaceSubscription(emptyWorkspace, sub);
+    expect(next.mihomoProfile).toBe(sub.id);
+    expect(next.selected).toBe(sub.parsed.nodes[0].id);
+  });
 });

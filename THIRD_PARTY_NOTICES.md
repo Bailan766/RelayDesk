@@ -12,4 +12,8 @@ The Windows build also distributes the upstream Mihomo 1.19.34 Windows amd64 v1 
 - License: GNU General Public License, version 3. The complete license is included as `THIRD-PARTY-MIHOMO-LICENSE.txt`.
 - Release, source archives, vendor dependencies and toolchain: https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.34
 
+The Windows build also bundles GeoIP databases (`Country.mmdb` and `geoip.metadb`) built by `MetaCubeX/meta-rules-dat` using MaxMind GeoLite2 data so Mihomo starts offline without blocking on first-run downloads.
+
+- Project: https://github.com/MetaCubeX/meta-rules-dat
+
 RelayDesk's own source code is licensed under the MIT license. Both proxy cores run as separate programs under their respective licenses.

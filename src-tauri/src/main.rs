@@ -100,6 +100,18 @@ fn allocate_port() -> Result<u16, String> {
 }
 
 #[tauri::command]
+fn allocate_stable_port() -> Result<u16, String> {
+    for candidate in 17890u16..=17899 {
+        if TcpListener::bind(("127.0.0.1", candidate)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", candidate)).is_ok()
+        {
+            return Ok(candidate);
+        }
+    }
+    allocate_port()
+}
+
+#[tauri::command]
 async fn validate_proxy_config(config: serde_json::Value) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut check = core_command(&core_path()?)
@@ -1024,6 +1036,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             fetch_subscription,
             allocate_port,
+            allocate_stable_port,
             validate_proxy_config,
             start_proxy,
             start_mihomo,

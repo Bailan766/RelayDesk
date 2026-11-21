@@ -332,11 +332,11 @@ function FixedPortSetting({ value, disabled, onChange }: {
     void onChange(number).finally(() => setSaving(false));
   }}>
     <label className="port-setting"><span>本地 HTTP / SOCKS5 端口</span>
-      <input inputMode="numeric" value={port} disabled={disabled || saving} placeholder="自动分配"
+      <input inputMode="numeric" value={port} disabled={disabled || saving} placeholder="默认 17890"
         aria-describedby="proxy-port-note" onChange={event => { setPort(event.target.value); setError(""); }} />
     </label>
     <button className="mini-btn is-primary" disabled={disabled || saving || isUnchanged}>保存端口</button>
-    <p className="rule-hint port-setting-note" id="proxy-port-note">留空自动分配可用端口。停止代理后可更改。</p>
+    <p className="rule-hint port-setting-note" id="proxy-port-note">留空固定优先 17890（被占自动顺延），避免重启或重连后终端与 IDE 端口失联。</p>
     {error && <span className="error" role="alert">{error}</span>}
   </form>;
 }

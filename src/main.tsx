@@ -14,7 +14,6 @@ import {
   LayoutGrid,
   LayoutList,
   Link2,
-  List,
   Moon,
   Plus,
   RefreshCw,
@@ -26,6 +25,7 @@ import {
   Star,
   Sun,
   SunMoon,
+  Terminal,
   X,
   Zap,
 } from "lucide-react";
@@ -65,7 +65,7 @@ import "./accessibility.css";
 import "./rules.css";
 import "./dashboard.css";
 
-type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "设置";
+type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "诊断" | "设置";
 type ExitIpDetail = { ip: string; country?: string | null; region?: string | null; city?: string | null; isp?: string | null };
 
 const nodeHealthLabels = {
@@ -112,12 +112,11 @@ const pageIcons: Record<Page, typeof Activity> = {
   订阅: Boxes,
   连接: Link2,
   规则: Shield,
-  日志: List,
-  测试: FlaskConical,
+  诊断: FlaskConical,
   设置: Settings2,
 };
 
-const navOrder: Page[] = ["概览", "节点", "订阅", "连接", "规则", "日志", "测试", "设置"];
+const navOrder: Page[] = ["概览", "节点", "订阅", "连接", "规则", "诊断", "设置"];
 
 function latencyClass(ms?: number) {
   if (ms == null) return "";
@@ -193,6 +192,8 @@ function App() {
   const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [onlySupported, setOnlySupported] = useState(false);
   const [nodesTab, setNodesTab] = useState<"groups" | "nodes">("groups");
+  const [diagTab, setDiagTab] = useState<"checks" | "unlock" | "logs">("checks");
+  const [envCopied, setEnvCopied] = useState(false);
   const [dialog, setDialog] = useState(false);
   const [detailNode, setDetailNode] = useState<NodeProfile>();
   const [detailCopied, setDetailCopied] = useState(false);
@@ -433,7 +434,7 @@ function App() {
       const original = await work.add(text, request, customName);
       setSubscriptionFilter("");
       setDialog(false);
-      setPage(original ? "订阅" : "节点");
+      setPage(original ? "概览" : "节点");
     } catch (e) {
       setError(typeof e === "string" ? e : e instanceof Error ? e.message : "导入失败");
     } finally {
@@ -456,10 +457,66 @@ function App() {
       const ms = await invoke<number>("check_connection", { port: targetPort, probeUrl });
       if (epoch === diagnosticsEpoch.current) setCheckResult(`连通正常 · ${ms} ms`);
     } catch (e) {
-      if (epoch === diagnosticsEpoch.current) {
-        const message = typeof e === "string" ? e : "网络验证失败";
-        setCheckResult(automatic ? `端口已就绪但无法出站：${message}` : message);
+      if (epoch !== diagnosticsEpoch.current) return;
+      const loaded = session.current?.loaded;
+      if (automatic && !runningOriginal && routingMode !== "direct" && loaded && loaded.size > 1) {
+        setCheckResult("当前节点无响应，正在自动匹配可用节点…");
+        const candidates = Array.from(loaded.values())
+          .filter(entry => entry.tag !== "node-0")
+          .sort((a, b) => {
+            const starDiff = Number(starred.has(b.node.id)) - Number(starred.has(a.node.id));
+            if (starDiff !== 0) return starDiff;
+            return (probe(a.node)?.milliseconds ?? Number.MAX_SAFE_INTEGER)
+              - (probe(b.node)?.milliseconds ?? Number.MAX_SAFE_INTEGER);
+          })
+          .slice(0, 24);
+        const reachable: { entry: (typeof candidates)[number]; ms: number }[] = [];
+        let cursor = 0;
+        async function rescueWorker() {
+          while (cursor < candidates.length && epoch === diagnosticsEpoch.current) {
+            const entry = candidates[cursor++];
+            try {
+              const ms = await invoke<number>("probe_loaded_node", {
+                tag: entry.tag,
+                probeUrl,
+                timeoutMs: 3800,
+              });
+              reachable.push({ entry, ms });
+              if (reachable.length >= 3) break;
+            } catch { /* skip unreachable */ }
+          }
+        }
+        await Promise.all(Array.from({ length: Math.min(6, candidates.length) }, rescueWorker));
+        if (epoch !== diagnosticsEpoch.current) return;
+        reachable.sort((a, b) => a.ms - b.ms);
+        const best = reachable[0];
+        if (best) {
+          try {
+            await invoke("switch_proxy_node", { tag: best.entry.tag });
+            session.current = withSelectedOutbound(session.current!, best.entry.tag);
+            setRunningNode(best.entry.node);
+            const rev = nodeRevision(best.entry.node);
+            const record: LatencyRecord = { revision: rev, label: `${best.ms} ms`, milliseconds: best.ms, testedAt: Date.now() };
+            setLatencies(prev => ({ ...prev, [best.entry.node.id]: record }));
+            await saveSettings(state => ({
+              ...state,
+              selected: preferredNode(state.subscriptions, best.entry.node.id),
+              nodeLatencies: { ...state.nodeLatencies, [best.entry.node.id]: record },
+            }));
+            const verifiedMs = await invoke<number>("check_connection", { port: targetPort, probeUrl });
+            if (epoch === diagnosticsEpoch.current) {
+              setCheckResult(`已自动切至「${best.entry.node.name}」· ${verifiedMs} ms`);
+            }
+            return;
+          } catch { /* fall through to failure display */ }
+        }
+        if (epoch === diagnosticsEpoch.current) {
+          setCheckResult("当前节点及备用节点均无法访问外网，请检查网络或订阅");
+        }
+        return;
       }
+      const message = typeof e === "string" ? e : "网络验证失败";
+      setCheckResult(automatic ? `端口已就绪但无法出站：${message}` : message);
     } finally {
       if (epoch === diagnosticsEpoch.current) setChecking(false);
     }
@@ -580,7 +637,7 @@ function App() {
         clearSession();
       }
       await remember();
-      const localPort = proxyPort ?? (await invoke<number>("allocate_port"));
+      const localPort = proxyPort ?? (await invoke<number>("allocate_stable_port"));
       const next = await prepareSession(node, localPort);
       await invoke("start_proxy", {
         config: next.config,
@@ -635,7 +692,7 @@ function App() {
       await invoke("stop_proxy");
       clearSession();
       await saveSettings(state => ({ ...state, mihomoProfile: profile.id }));
-      const localPort = proxyPort ?? (await invoke<number>("allocate_port"));
+      const localPort = proxyPort ?? (await invoke<number>("allocate_stable_port"));
       const originalMode =
         profile.mihomoMode ??
         (profile.parsed.mihomo.mode === "global" || profile.parsed.mihomo.mode === "direct"
@@ -681,11 +738,11 @@ function App() {
     await connectNode(fallbackNode);
   }
 
-  async function testNodes(items: NodeProfile[]) {
-    if (!isTauri() || testing) return;
+  async function testNodes(items: NodeProfile[]): Promise<Record<string, LatencyRecord>> {
+    if (!isTauri() || testing) return {};
     if (probeMode === "url" && running && runningOriginal && mode === "tun") {
       setConnectionError("Mihomo TUN 运行期间不支持直接对 sing-box 节点做 URL 测速（会产生回环延迟）。请使用「Mihomo 策略组」测速，或切换为「TCP 握手延迟」。");
-      return;
+      return {};
     }
     cancelTesting.current = false;
     setTesting(true);
@@ -693,7 +750,7 @@ function App() {
     const queue = items.filter(node => !unavailableNodes.get(node.id));
     if (!queue.length) {
       setTesting(false);
-      return;
+      return {};
     }
     setProbeProgress({ done: 0, total: queue.length });
     const updates: Record<string, LatencyRecord> = {};
@@ -806,6 +863,7 @@ function App() {
       setProbeProgress(undefined);
       setTesting(false);
     }
+    return updates;
   }
 
   function stopNodeTests() {
@@ -816,14 +874,22 @@ function App() {
     if (batch) void invoke("cancel_probe_batch", { batch }).catch(() => setConnectionError("无法取消正在运行的测速"));
   }
 
-  function pickFastestNode() {
-    const candidates = filtered
+  async function pickFastestNode() {
+    let candidates = filtered
       .filter(n => !unavailableNodes.get(n.id))
       .map(n => ({ node: n, ms: probe(n)?.milliseconds }))
       .filter((item): item is { node: NodeProfile; ms: number } => typeof item.ms === "number")
       .sort((a, b) => a.ms - b.ms);
+    if (!candidates.length && !testing) {
+      const updates = await testNodes(filtered);
+      candidates = filtered
+        .filter(n => !unavailableNodes.get(n.id))
+        .map(n => ({ node: n, ms: updates[n.id]?.milliseconds ?? probe(n)?.milliseconds }))
+        .filter((item): item is { node: NodeProfile; ms: number } => typeof item.ms === "number")
+        .sort((a, b) => a.ms - b.ms);
+    }
     if (!candidates.length) {
-      setConnectionError("当前列表暂无有效延迟结果，请先点击「一键测速」。");
+      setConnectionError("未测出可用节点，请检查网络或订阅内容。");
       return;
     }
     void connectNode(candidates[0].node);
@@ -890,7 +956,7 @@ function App() {
       } else {
         const original = originalProfile?.parsed.mihomo;
         if (!original && !preferred) throw new Error("请先导入并选择节点或原配置");
-        const localPort = proxyPort ?? (await invoke<number>("allocate_port"));
+        const localPort = proxyPort ?? (await invoke<number>("allocate_stable_port"));
         if (original && originalProfile) {
           const originalMode =
             originalProfile.mihomoMode ??
@@ -934,7 +1000,7 @@ function App() {
     resetDiagnostics();
     try {
       await invoke("stop_proxy");
-      const localPort = proxyPort ?? (await invoke<number>("allocate_port"));
+      const localPort = proxyPort ?? (await invoke<number>("allocate_stable_port"));
       const next = await prepareSession(current, localPort);
       await startProxy(next);
       session.current = next;
@@ -990,6 +1056,15 @@ function App() {
     }).catch(() => {});
   }
 
+  function copyProxyEnv() {
+    if (!port) return;
+    const snippet = `$env:HTTP_PROXY="http://127.0.0.1:${port}"; $env:HTTPS_PROXY="http://127.0.0.1:${port}"`;
+    void navigator.clipboard.writeText(snippet).then(() => {
+      setEnvCopied(true);
+      window.setTimeout(() => setEnvCopied(false), 1600);
+    }).catch(() => {});
+  }
+
   function cycleTheme() {
     const order: ThemeMode[] = ["system", "light", "dark"];
     const next = order[(order.indexOf(theme) + 1) % order.length];
@@ -1008,7 +1083,7 @@ function App() {
           <div className="brand-mark"><Cat size={18} /></div>
           <div>
             <strong>RelayDesk</strong>
-            <small>v1.0.1</small>
+            <small>v1.1.0</small>
           </div>
         </div>
         <nav>
@@ -1042,10 +1117,16 @@ function App() {
               {recovering ? "正在恢复" : running ? (runningOriginal ? "Mihomo 运行中" : "sing-box 运行中") : "未连接"}
             </span>
             {running && port && (
-              <button type="button" className="chip-button" onClick={copyLocalEndpoint} title="复制本地代理地址">
-                {portCopied ? <Check size={12} /> : <Copy size={12} />}
-                <span>{allowLan ? "0.0.0.0" : "127.0.0.1"}:{port}</span>
-              </button>
+              <>
+                <button type="button" className="chip-button" onClick={copyLocalEndpoint} title="复制本地代理地址">
+                  {portCopied ? <Check size={12} /> : <Copy size={12} />}
+                  <span>{allowLan ? "0.0.0.0" : "127.0.0.1"}:{port}</span>
+                </button>
+                <button type="button" className="chip-button" onClick={copyProxyEnv} title="复制 PowerShell 终端/IDE 环境变量命令">
+                  {envCopied ? <Check size={12} /> : <Terminal size={12} />}
+                  <span>{envCopied ? "已复制变量" : "复制 env"}</span>
+                </button>
+              </>
             )}
           </div>
           <div className="header-right">
@@ -1146,7 +1227,16 @@ function App() {
                     </button>
                   </div>
                   {mode === "tun" && !running && !elevated && (
-                    <small className="muted">启用 TUN 时会弹出管理员权限授权</small>
+                    <small className="muted">
+                      普通权限开 TUN 会弹窗授权
+                      <button
+                        type="button"
+                        className="link inline-action"
+                        onClick={() => void invoke("relaunch_elevated").catch(() => {})}
+                      >
+                        以管理员模式重启
+                      </button>
+                    </small>
                   )}
                 </div>
               </section>
@@ -1796,26 +1886,47 @@ function App() {
             />
           )}
 
-          {page === "日志" && <EventLog />}
-
-          {page === "测试" && (
+          {page === "诊断" && (
             <>
-              <DownloadCheck key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
-              <WebsiteChecks key={`site-${diagnosticsVersion}`} port={running && !recovering ? port : undefined} disabled={busy} />
-              <UnlockTests port={running && !recovering ? port : undefined} disabled={busy} />
-              <section className="panel" style={{ marginTop: 16 }}>
-                <div className="panel-head">
-                  <h2>本机直连诊断</h2>
-                  <button className="mini-btn" disabled={localTcpBusy || !isTauri()} onClick={() => void testLocalTcp()}>
-                    {localTcpBusy ? "测试中…" : "测试 TCP 443"}
+              <div className="toolbar" style={{ marginBottom: 14 }}>
+                <div className="mode-switch" role="tablist" aria-label="诊断分类">
+                  <button type="button" aria-pressed={diagTab === "checks"} onClick={() => setDiagTab("checks")}>
+                    测速与连通
+                  </button>
+                  <button type="button" aria-pressed={diagTab === "unlock"} onClick={() => setDiagTab("unlock")}>
+                    服务解锁
+                  </button>
+                  <button type="button" aria-pressed={diagTab === "logs"} onClick={() => setDiagTab("logs")}>
+                    运行日志
                   </button>
                 </div>
-                <div className="env-row">
-                  <span>Google TCP 443（含本机 DNS 解析）</span>
-                  <span className="tag">{localTcp}</span>
-                </div>
-                <p className="rule-hint">直接从本机发起连接，启用 TUN 时会经过虚拟网卡。</p>
-              </section>
+              </div>
+
+              {diagTab === "checks" && (
+                <>
+                  <DownloadCheck key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
+                  <WebsiteChecks key={`site-${diagnosticsVersion}`} port={running && !recovering ? port : undefined} disabled={busy} />
+                  <section className="panel" style={{ marginTop: 16 }}>
+                    <div className="panel-head">
+                      <h2>本机直连诊断</h2>
+                      <button className="mini-btn" disabled={localTcpBusy || !isTauri()} onClick={() => void testLocalTcp()}>
+                        {localTcpBusy ? "测试中…" : "测试 TCP 443"}
+                      </button>
+                    </div>
+                    <div className="env-row">
+                      <span>Google TCP 443（含本机 DNS 解析）</span>
+                      <span className="tag">{localTcp}</span>
+                    </div>
+                    <p className="rule-hint">直接从本机发起连接，启用 TUN 时会经过虚拟网卡。</p>
+                  </section>
+                </>
+              )}
+
+              {diagTab === "unlock" && (
+                <UnlockTests port={running && !recovering ? port : undefined} disabled={busy} />
+              )}
+
+              {diagTab === "logs" && <EventLog />}
             </>
           )}
 
