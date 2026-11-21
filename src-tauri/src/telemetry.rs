@@ -537,6 +537,10 @@ struct Metadata {
     #[serde(rename = "destinationIP")]
     destination_ip: Option<String>,
     destination_port: Option<String>,
+    #[serde(default)]
+    process: Option<String>,
+    #[serde(default)]
+    process_path: Option<String>,
     network: String,
     #[serde(rename = "type")]
     inbound: String,

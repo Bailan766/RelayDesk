@@ -11,6 +11,8 @@ type Connection = {
     sourcePort: string | null;
     destinationIP: string | null;
     destinationPort: string | null;
+    process?: string | null;
+    processPath?: string | null;
     network: string;
     type: string;
   };
@@ -185,6 +187,13 @@ function endpoint(host: string | null, port: string | null): string {
   return port ? `${host.includes(":") ? `[${host}]` : host}:${port}` : host;
 }
 
+function processExeName(metadata: Connection["metadata"]): string | undefined {
+  const raw = metadata.processPath?.trim() || metadata.process?.trim();
+  if (!raw) return undefined;
+  const base = raw.split(/[\\/]/).pop()?.trim();
+  return base || undefined;
+}
+
 export function ConnectionMonitor({
   telemetry,
   running,
@@ -205,7 +214,7 @@ export function ConnectionMonitor({
     const q = query.trim().toLowerCase();
     const matched = q
       ? items.filter(({ metadata, chains, rule }) =>
-          [metadata.host, metadata.destinationIP, metadata.sourceIP, rule, ...(chains ?? [])]
+          [metadata.host, metadata.destinationIP, metadata.sourceIP, metadata.process, metadata.processPath, rule, ...(chains ?? [])]
             .filter(Boolean)
             .join(" ")
             .toLowerCase()
@@ -250,7 +259,7 @@ export function ConnectionMonitor({
         <label className="search" style={{ maxWidth: 220 }}>
           <Search size={14} />
           <input
-            placeholder="搜索域名、IP、规则或出站"
+            placeholder="搜索域名、进程、IP、规则或出站"
             value={query}
             onChange={e => setQuery(e.target.value)}
           />
@@ -276,26 +285,50 @@ export function ConnectionMonitor({
           <thead>
             <tr>
               <th scope="col">目标</th>
-              <th scope="col">来源</th>
+              <th scope="col">进程 / 来源</th>
               <th scope="col">规则 / 出站</th>
               <th scope="col" style={{ width: "6.5em", textAlign: "right" }}>上传</th>
               <th scope="col" style={{ width: "6.5em", textAlign: "right" }}>下载</th>
-              <th scope="col" style={{ width: "8.5em", textAlign: "right" }}>操作</th>
+              <th scope="col" style={{ width: "10em", textAlign: "right" }}>操作</th>
             </tr>
           </thead>
           <tbody>
             {filtered.map(({ id, metadata, chains, rule, upload, download }) => {
               const destination = endpoint(metadata.host || metadata.destinationIP, metadata.destinationPort);
               const source = endpoint(metadata.sourceIP, metadata.sourcePort);
+              const proc = processExeName(metadata);
+              const canProcessRule = !!proc && /^[^<>:"/\\|?*]+\.exe$/i.test(proc);
               const host = metadata.host?.trim();
               return <tr key={id}>
                 <td><strong title={destination}>{destination}</strong><small>{metadata.network.toUpperCase()} · {metadata.type}</small></td>
-                <td title={source}>{source}</td>
+                <td>
+                  {proc ? (
+                    <>
+                      <strong title={metadata.processPath || proc}>{proc}</strong>
+                      <small title={source}>{source}</small>
+                    </>
+                  ) : (
+                    <span title={source}>{source}</span>
+                  )}
+                </td>
                 <td><strong title={rule}>{rule === "final" ? "默认路由" : rule}</strong><small>{chains?.slice().reverse().join(" → ") || "—"}</small></td>
                 <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatBytes(upload)}</td>
                 <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{formatBytes(download)}</td>
                 <td style={{ textAlign: "right" }}>
                   <div style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+                    {onQuickRule && canProcessRule && proc && (
+                      <button
+                        type="button"
+                        className="link"
+                        title={`将进程 ${proc} 设为直连规则`}
+                        onClick={() => {
+                          onQuickRule({ type: "process_name", value: proc, action: "direct" });
+                          setActionMsg(`已添加进程直连：${proc}（热重载或重连后生效）`);
+                        }}
+                      >
+                        进程直连
+                      </button>
+                    )}
                     {onQuickRule && host && (
                       <button
                         type="button"
@@ -303,10 +336,10 @@ export function ConnectionMonitor({
                         title={`将 ${host} 设为直连规则`}
                         onClick={() => {
                           onQuickRule({ type: "domain", value: host, action: "direct" });
-                          setActionMsg(`已添加直连规则：${host}（重连节点模式后生效）`);
+                          setActionMsg(`已添加直连规则：${host}（热重载或重连后生效）`);
                         }}
                       >
-                        直连
+                        域名直连
                       </button>
                     )}
                     <button

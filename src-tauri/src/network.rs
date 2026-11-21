@@ -759,6 +759,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
             "final",
             "auto_detect_interface",
             "default_domain_resolver",
+            "find_process",
         ],
     )?;
     let mut rules = route.get("rules")?.as_array()?.as_slice();
@@ -810,7 +811,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         ],
         "outbounds": outbounds,
         "endpoints": endpoints,
-        "route":{"rules":output_rules,"final":route_final,"auto_detect_interface":true,"default_domain_resolver":"bootstrap"},
+        "route":{"rules":output_rules,"final":route_final,"auto_detect_interface":true,"find_process":true,"default_domain_resolver":"bootstrap"},
         "dns":{
             "servers":[{"type":"local","tag":"bootstrap"},{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","detour":"proxy"}],
             "rules": dns_rules,

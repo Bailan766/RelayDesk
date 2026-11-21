@@ -40,7 +40,7 @@ import {
   type RouteRule,
   type SessionPlan,
 } from "./config";
-import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
+import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, formatBytes, useTelemetry } from "./telemetry";
 import { SubscriptionCard } from "./SubscriptionCard";
 import { WebsiteChecks } from "./WebsiteChecks";
 import { DownloadCheck } from "./DownloadCheck";
@@ -272,10 +272,14 @@ function App() {
   const [elevated, setElevated] = useState(false);
   const [serviceStatus, setServiceStatus] = useState<TunServiceStatus | null>(null);
   const [serviceBusy, setServiceBusy] = useState(false);
+  const [proxyTampered, setProxyTampered] = useState(false);
+  const [trayMihomoGroup, setTrayMihomoGroup] = useState<{ name: string; selected: string; choices: string[] }>();
   const cancelTesting = useRef(false);
   const probeBatch = useRef<string>();
   const probeSessionId = useRef<string>();
   const autoConnectRan = useRef(false);
+  const lastProbeAt = useRef(0);
+  const trayPickRef = useRef<(() => void)[]>([]);
 
   const currentRulesKey = useMemo(() => JSON.stringify({ rules, ruleDefaultAction }), [rules, ruleDefaultAction]);
   const rulesDirtyWhileRunning = running && appliedRulesKey !== "" && appliedRulesKey !== currentRulesKey;
@@ -368,6 +372,8 @@ function App() {
     setRunningOriginal(undefined);
     setLiveRouting(undefined);
     setPort(undefined);
+    setProxyTampered(false);
+    setTrayMihomoGroup(undefined);
     setAppliedRulesKey("");
     resetDiagnostics();
   }
@@ -376,6 +382,7 @@ function App() {
     if (!isTauri() || busy || !running) return;
     let cancelled = false;
     let timer: number;
+    let ticks = 0;
     async function poll() {
       try {
         const status = await invoke<ProxyStatus>("proxy_status");
@@ -393,6 +400,26 @@ function App() {
               resetDiagnostics();
             }
           }
+          if (mode === "system" && port && ticks % 3 === 0) {
+            void invoke<boolean>("check_system_proxy_active", { port })
+              .then(active => { if (!cancelled) setProxyTampered(!active); })
+              .catch(() => {});
+          } else if (mode !== "system") {
+            setProxyTampered(false);
+          }
+          if (runningOriginal && ticks % 5 === 0) {
+            void invoke<{ name: string; kind: string; selected: string; choices: string[]; manual: boolean }[]>("mihomo_groups")
+              .then(groups => {
+                if (cancelled) return;
+                const primary = groups.find(g => g.manual && g.name !== "GLOBAL" && g.choices.length > 0)
+                  ?? groups.find(g => g.manual && g.choices.length > 0);
+                if (primary) {
+                  setTrayMihomoGroup({ name: primary.name, selected: primary.selected, choices: primary.choices });
+                }
+              })
+              .catch(() => {});
+          }
+          ticks++;
         }
         setRecovering(status.phase === "recovering");
         setRecoveryMessage(status.message ?? "");
@@ -412,7 +439,7 @@ function App() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [busy, running]);
+  }, [busy, mode, port, running, runningOriginal]);
 
   useEffect(() => {
     if (!isTauri() || !work.ready) return;
@@ -436,8 +463,81 @@ function App() {
       ? `${originalName} (Mihomo)`
       : current?.name ?? "未选择节点";
     const summary = running && port ? `${base} · 127.0.0.1:${port}` : base;
-    void invoke("update_tray_state", { running, summary, routingMode, entryMode: mode }).catch(() => {});
-  }, [current?.name, mode, originalName, port, routingMode, running, work.ready]);
+
+    const actions: (() => void)[] = [];
+    let quickChoices: { id: string; label: string; selected: boolean }[] = [];
+    if (runningOriginal && trayMihomoGroup && liveOriginalProfile) {
+      const skip = new Set(["DIRECT", "REJECT", "REJECT-DROP", "PASS"]);
+      const ranked = trayMihomoGroup.choices
+        .filter(c => c === trayMihomoGroup.selected || (!skip.has(c) && !isInfoNodeName(c)))
+        .sort((a, b) => {
+          if (a === trayMihomoGroup.selected) return -1;
+          if (b === trayMihomoGroup.selected) return 1;
+          const da = mihomoDelays[a];
+          const db = mihomoDelays[b];
+          return (typeof da === "number" && da > 0 ? da : 999_999) - (typeof db === "number" && db > 0 ? db : 999_999);
+        })
+        .slice(0, 8);
+      quickChoices = ranked.map((choice, index) => {
+        const delay = mihomoDelays[choice];
+        const suffix = typeof delay === "number" && delay > 0 ? ` (${delay} ms)` : "";
+        actions.push(() => {
+          void invoke("switch_mihomo_group", { group: trayMihomoGroup.name, choice })
+            .then(async () => {
+              setTrayMihomoGroup(prev => (prev ? { ...prev, selected: choice } : prev));
+              resetDiagnostics();
+              await saveSettings(state => ({
+                ...state,
+                subscriptions: state.subscriptions.map(profile =>
+                  profile.id === runningOriginal.id
+                    ? { ...profile, mihomoSelections: { ...profile.mihomoSelections, [trayMihomoGroup.name]: choice } }
+                    : profile,
+                ),
+              }));
+            })
+            .catch(() => {});
+        });
+        return {
+          id: String(index),
+          label: `${choice.slice(0, 36)}${suffix}`,
+          selected: choice === trayMihomoGroup.selected,
+        };
+      });
+    } else {
+      const candidates = nodes
+        .filter(n => !unavailableNodes.get(n.id) && !isInfoNodeName(n.name))
+        .sort((a, b) => {
+          const aSel = current?.id === a.id ? 1 : 0;
+          const bSel = current?.id === b.id ? 1 : 0;
+          if (aSel !== bSel) return bSel - aSel;
+          const starDiff = Number(starred.has(b.id)) - Number(starred.has(a.id));
+          if (starDiff !== 0) return starDiff;
+          return (latencies[a.id]?.milliseconds ?? Number.MAX_SAFE_INTEGER)
+            - (latencies[b.id]?.milliseconds ?? Number.MAX_SAFE_INTEGER);
+        })
+        .slice(0, 8);
+      quickChoices = candidates.map((node, index) => {
+        const rec = latencies[node.id];
+        const suffix = rec?.milliseconds != null ? ` (${rec.milliseconds} ms)` : "";
+        actions.push(() => {
+          void selectNode(node);
+        });
+        return {
+          id: String(index),
+          label: `${node.name.slice(0, 36)}${suffix}`,
+          selected: current?.id === node.id,
+        };
+      });
+    }
+    trayPickRef.current = actions;
+    void invoke("update_tray_state", {
+      running,
+      summary,
+      routingMode,
+      entryMode: mode,
+      quickChoices,
+    }).catch(() => {});
+  }, [current?.id, current?.name, latencies, liveOriginalProfile, mihomoDelays, mode, nodes, originalName, port, routingMode, running, runningOriginal, starred, trayMihomoGroup, unavailableNodes, work.ready]);
 
   const activeFilter = subscriptions.find(profile => profile.id === subscriptionFilter);
   function probe(node: NodeProfile) {
@@ -517,8 +617,24 @@ function App() {
       ? runningNode?.id === node.id && nodeRevision(runningNode) === nodeRevision(node)
       : node.id === selected);
 
+  async function repairSystemProxy() {
+    if (!port || busy || recovering) return;
+    setBusy(true);
+    setConnectionError("");
+    try {
+      await invoke("repair_system_proxy", { port, bypass: systemProxyBypass });
+      setProxyTampered(false);
+      void checkProxy(port, true);
+    } catch (e) {
+      setConnectionError(typeof e === "string" ? e : "恢复系统代理失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function checkProxy(targetPort = port, automatic = false) {
     if (!targetPort || (!automatic && (busy || recovering))) return;
+    lastProbeAt.current = Date.now();
     const epoch = diagnosticsEpoch.current;
     setChecking(true);
     setCheckResult(automatic ? "正在验证外网连通性…" : "");
@@ -1176,6 +1292,8 @@ function App() {
   changeRoutingRef.current = changeRouting;
   const switchEntryRef = useRef(switchEntryFromTray);
   switchEntryRef.current = switchEntryFromTray;
+  const checkProxyRef = useRef(checkProxy);
+  checkProxyRef.current = checkProxy;
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -1189,6 +1307,12 @@ function App() {
       else if (action === "entry:system") void switchEntryRef.current("system");
       else if (action === "entry:tun") void switchEntryRef.current("tun");
       else if (action === "entry:local") void switchEntryRef.current("local");
+      else if (action.startsWith("pick:")) {
+        const idx = Number(action.slice(5));
+        if (Number.isInteger(idx) && trayPickRef.current[idx]) {
+          trayPickRef.current[idx]();
+        }
+      }
     }).then(fn => {
       unlisten = fn;
     });
@@ -1196,6 +1320,21 @@ function App() {
       unlisten?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (!isTauri() || !running || recovering || busy || !port) return;
+    function reprobeOnResume() {
+      if (document.visibilityState === "hidden") return;
+      if (Date.now() - lastProbeAt.current < 15_000) return;
+      void checkProxyRef.current(port, true);
+    }
+    window.addEventListener("online", reprobeOnResume);
+    document.addEventListener("visibilitychange", reprobeOnResume);
+    return () => {
+      window.removeEventListener("online", reprobeOnResume);
+      document.removeEventListener("visibilitychange", reprobeOnResume);
+    };
+  }, [busy, port, recovering, running]);
 
   useEffect(() => {
     if (!isTauri() || !work.ready || autoConnectRan.current) return;
@@ -1243,6 +1382,12 @@ function App() {
   const ThemeIcon = theme === "light" ? Sun : theme === "dark" ? Moon : SunMoon;
   const statusStateClass = recovering ? "is-recovering" : running ? "is-running" : "";
   const activeCount = telemetry.snapshot?.connections.length;
+  const activeSub = liveOriginalProfile ?? originalProfile ?? (current ? subscriptions.find(s => s.parsed.nodes.some(n => n.id === current.id)) : undefined);
+  const activeSubUsed = activeSub?.usage?.upload != null && activeSub?.usage?.download != null ? activeSub.usage.upload + activeSub.usage.download : null;
+  const activeSubTotal = activeSub?.usage?.total;
+  const activeSubExpiry = activeSub?.usage?.expire && Number.isFinite(activeSub.usage.expire * 1000)
+    ? new Date(activeSub.usage.expire * 1000).toLocaleDateString()
+    : undefined;
 
   return (
     <div className="app">
@@ -1251,7 +1396,7 @@ function App() {
           <div className="brand-mark"><Cat size={18} /></div>
           <div>
             <strong>RelayDesk</strong>
-            <small>v1.2.2</small>
+            <small>v1.3.0</small>
           </div>
         </div>
         <nav>
@@ -1425,6 +1570,19 @@ function App() {
               </section>
 
               {connectionError && <div className="notice is-error" role="alert">{connectionError}</div>}
+              {running && mode === "system" && proxyTampered && (
+                <div className="notice is-warn" role="status">
+                  <span>Windows 系统代理已被其他软件或系统改写，当前浏览器与系统请求可能未走 RelayDesk。</span>
+                  <button
+                    type="button"
+                    className="mini-btn is-primary"
+                    disabled={busy || recovering || !port}
+                    onClick={() => void repairSystemProxy()}
+                  >
+                    立即写回系统代理
+                  </button>
+                </div>
+              )}
               {rulesDirtyWhileRunning && (
                 <div className="notice is-warn" role="status">
                   <span>{runningOriginal ? "分流规则已修改，点击热重载即时生效（不断网）。" : "分流规则已修改，重新连接后生效。"}</span>
@@ -1477,6 +1635,10 @@ function App() {
                   <strong title={originalName || current?.name}>{originalName || current?.name || "尚未选择"}</strong>
                   <small>
                     {originalName ? "保留原策略组与完整规则" : current ? `${current.protocol.toUpperCase()} · ${current.server}:${current.port}` : "导入订阅后选择节点"}
+                    {activeSubTotal && activeSubUsed != null
+                      ? ` · 已用 ${formatBytes(activeSubUsed)}/${formatBytes(activeSubTotal)}`
+                      : ""}
+                    {activeSubExpiry ? ` · 到期 ${activeSubExpiry}` : ""}
                   </small>
                 </div>
 

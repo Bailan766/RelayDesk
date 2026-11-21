@@ -129,6 +129,9 @@ pub fn prepare_with_lan(
     }
     config.entry("tcp-concurrent").or_insert_with(|| json!(true));
     config.entry("unified-delay").or_insert_with(|| json!(true));
+    config
+        .entry("find-process-mode")
+        .or_insert_with(|| json!("always"));
     Ok(Value::Object(config))
 }
 

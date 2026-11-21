@@ -304,6 +304,163 @@ fn open_project_repo() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn check_system_proxy_active(port: u16, state: tauri::State<'_, ProxyState>) -> bool {
+    running_port(&state) == Some(port) && system_proxy::is_port_active(port)
+}
+
+#[tauri::command]
+fn repair_system_proxy(
+    port: u16,
+    bypass: Option<String>,
+    state: tauri::State<'_, ProxyState>,
+) -> Result<(), String> {
+    if running_port(&state) != Some(port) {
+        return Err("代理未在当前端口运行".into());
+    }
+    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("无法定位本地数据目录")?)
+        .join("RelayDesk")
+        .join("network-state");
+    let _ = fs::create_dir_all(&dir);
+    let journal = dir.join("proxy.json");
+    let bypass_text = bypass.unwrap_or_default();
+    system_proxy::enable_with_bypass(&journal, port, &bypass_text)
+        .map_err(|_| "无法重新写入 Windows 系统代理".into())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateInfo {
+    current: String,
+    latest: String,
+    has_update: bool,
+    release_url: String,
+    download_url: Option<String>,
+    mirror_download_url: Option<String>,
+    notes: String,
+}
+
+fn parse_semver(tag: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = tag.trim().trim_start_matches(['v', 'V']);
+    if trimmed.contains('-') {
+        return None;
+    }
+    let mut parts = trimmed.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+#[tauri::command]
+async fn check_app_update(state: tauri::State<'_, ProxyState>) -> Result<AppUpdateInfo, String> {
+    #[derive(serde::Deserialize)]
+    struct ReleaseAsset {
+        name: String,
+        browser_download_url: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct LatestRelease {
+        tag_name: String,
+        html_url: String,
+        body: Option<String>,
+        #[serde(default)]
+        assets: Vec<ReleaseAsset>,
+    }
+    let current = env!("CARGO_PKG_VERSION").to_owned();
+    let local_port = running_port(&state);
+    let direct_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .user_agent(format!("RelayDesk/{current}"))
+        .build()
+        .map_err(|_| "无法初始化版本检查请求".to_string())?;
+    let proxy_client = local_port.and_then(|port| {
+        let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).ok()?;
+        reqwest::Client::builder()
+            .no_proxy()
+            .proxy(proxy)
+            .timeout(Duration::from_secs(8))
+            .user_agent(format!("RelayDesk/{current}"))
+            .build()
+            .ok()
+    });
+    const OFFICIAL_API: &str = "https://api.github.com/repos/Bailan766/RelayDesk/releases/latest";
+    const MIRROR_API: &str = "https://gh-proxy.com/https://api.github.com/repos/Bailan766/RelayDesk/releases/latest";
+    let mut release: Option<LatestRelease> = None;
+    if let Some(client) = &proxy_client {
+        if let Ok(resp) = client.get(OFFICIAL_API).send().await {
+            if let Ok(ok) = resp.error_for_status() {
+                release = ok.json::<LatestRelease>().await.ok();
+            }
+        }
+    }
+    if release.is_none() {
+        for endpoint in [OFFICIAL_API, MIRROR_API] {
+            if let Ok(resp) = direct_client.get(endpoint).send().await {
+                if let Ok(ok) = resp.error_for_status() {
+                    if let Ok(parsed) = ok.json::<LatestRelease>().await {
+                        release = Some(parsed);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let release = release.ok_or_else(|| "无法从 GitHub 或 gh-proxy 加速源检查更新，请稍后重试".to_string())?;
+    let latest_clean = release.tag_name.trim().trim_start_matches(['v', 'V']).to_owned();
+    let has_update = match (parse_semver(&current), parse_semver(&release.tag_name)) {
+        (Some(cur), Some(lat)) => lat > cur,
+        _ => false,
+    };
+    let download_url = release
+        .assets
+        .into_iter()
+        .find(|a| a.name.ends_with("-setup.exe") && a.browser_download_url.starts_with("https://github.com/Bailan766/RelayDesk/"))
+        .map(|a| a.browser_download_url);
+    let mirror_download_url = download_url
+        .as_ref()
+        .map(|url| format!("https://gh-proxy.com/{url}"));
+    let release_url = if release.html_url.starts_with("https://github.com/Bailan766/RelayDesk/releases") {
+        release.html_url
+    } else {
+        "https://github.com/Bailan766/RelayDesk/releases".to_owned()
+    };
+    let notes = release
+        .body
+        .unwrap_or_default()
+        .lines()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(AppUpdateInfo {
+        current,
+        latest: latest_clean,
+        has_update,
+        release_url,
+        download_url,
+        mirror_download_url,
+        notes,
+    })
+}
+
+#[tauri::command]
+fn open_release_page(url: String) -> Result<(), String> {
+    let allowed = url == "https://github.com/Bailan766/RelayDesk/releases"
+        || url.starts_with("https://github.com/Bailan766/RelayDesk/releases/")
+        || url.starts_with("https://gh-proxy.com/https://github.com/Bailan766/RelayDesk/releases/");
+    if !allowed {
+        return Err("不支持打开非官方发布地址".into());
+    }
+    Command::new("explorer")
+        .arg(url)
+        .spawn()
+        .map_err(|_| "无法打开下载页面")?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn probe_loaded_node(
     tag: String,
     probe_url: Option<String>,
@@ -432,12 +589,20 @@ fn set_close_action(exit_on_close: bool, prefs: tauri::State<'_, AppPreferences>
     prefs.exit_on_close.store(exit_on_close, Ordering::Release);
 }
 
+#[derive(serde::Deserialize)]
+struct TrayQuickChoice {
+    id: String,
+    label: String,
+    selected: bool,
+}
+
 #[tauri::command]
 fn update_tray_state(
     running: bool,
     summary: String,
     routing_mode: String,
     entry_mode: Option<String>,
+    quick_choices: Option<Vec<TrayQuickChoice>>,
     app: tauri::AppHandle,
 ) {
     let entry = entry_mode.unwrap_or_else(|| "system".to_owned());
@@ -455,6 +620,53 @@ fn update_tray_state(
         let _ = ui.entry_system.set_checked(entry == "system");
         let _ = ui.entry_tun.set_checked(entry == "tun");
         let _ = ui.entry_local.set_checked(entry == "local");
+        if let Some(choices) = quick_choices {
+            let trimmed: Vec<TrayQuickChoice> = choices.into_iter().take(8).collect();
+            let sig = trimmed
+                .iter()
+                .map(|c| format!("{}:{}:{}", c.id, c.label, c.selected))
+                .collect::<Vec<_>>()
+                .join("|");
+            let changed = ui
+                .quick_sig
+                .lock()
+                .map(|mut prev| {
+                    if *prev == sig {
+                        false
+                    } else {
+                        *prev = sig;
+                        true
+                    }
+                })
+                .unwrap_or(false);
+            if changed {
+                while matches!(ui.quick_menu.remove_at(0), Ok(Some(_))) {}
+                if trimmed.is_empty() {
+                    if let Ok(empty) = tauri::menu::MenuItem::with_id(
+                        &app,
+                        "pick_empty",
+                        "暂无可切换节点",
+                        false,
+                        None::<&str>,
+                    ) {
+                        let _ = ui.quick_menu.append(&empty);
+                    }
+                } else {
+                    for choice in trimmed {
+                        if let Ok(item) = tauri::menu::CheckMenuItem::with_id(
+                            &app,
+                            format!("pick:{}", choice.id),
+                            choice.label,
+                            true,
+                            choice.selected,
+                            None::<&str>,
+                        ) {
+                            let _ = ui.quick_menu.append(&item);
+                        }
+                    }
+                }
+            }
+        }
     }
     if let Some(tray) = app.tray_by_id("main-tray") {
         let tip = if running {
@@ -875,6 +1087,8 @@ struct TrayUi {
     entry_system: tauri::menu::CheckMenuItem<tauri::Wry>,
     entry_tun: tauri::menu::CheckMenuItem<tauri::Wry>,
     entry_local: tauri::menu::CheckMenuItem<tauri::Wry>,
+    quick_menu: tauri::menu::Submenu<tauri::Wry>,
+    quick_sig: std::sync::Mutex<String>,
 }
 
 #[cfg(windows)]
@@ -1020,12 +1234,14 @@ fn main() {
             let entry_tun = CheckMenuItem::with_id(app, "entry_tun", "TUN 虚拟网卡", true, false, None::<&str>)?;
             let entry_local = CheckMenuItem::with_id(app, "entry_local", "仅本地端口", true, false, None::<&str>)?;
             let entry_menu = Submenu::with_items(app, "接管方式", true, &[&entry_system, &entry_tun, &entry_local])?;
+            let quick_empty = MenuItem::with_id(app, "pick_empty", "暂无可切换节点", false, None::<&str>)?;
+            let quick_menu = Submenu::with_items(app, "快捷切换", true, &[&quick_empty])?;
             let stop = MenuItem::with_id(app, "stop", "停止代理", true, None::<&str>)?;
             let sep2 = PredefinedMenuItem::separator(app)?;
             let quit = MenuItem::with_id(app, "quit", "彻底退出", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
-                &[&status, &sep1, &show, &toggle, &mode_menu, &entry_menu, &stop, &sep2, &quit],
+                &[&status, &sep1, &show, &toggle, &quick_menu, &mode_menu, &entry_menu, &stop, &sep2, &quit],
             )?;
             app.manage(TrayUi {
                 status,
@@ -1036,42 +1252,51 @@ fn main() {
                 entry_system,
                 entry_tun,
                 entry_local,
+                quick_menu,
+                quick_sig: std::sync::Mutex::new(String::new()),
             });
             let mut tray = TrayIconBuilder::with_id("main-tray")
                 .tooltip("RelayDesk · 未连接")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_main(app),
-                    "toggle" => {
-                        let _ = app.emit("tray-action", "toggle");
+                .on_menu_event(|app, event| {
+                    let id = event.id().as_ref();
+                    if id.starts_with("pick:") {
+                        let _ = app.emit("tray-action", id);
+                        return;
                     }
-                    "mode_rule" => {
-                        let _ = app.emit("tray-action", "mode:rule");
+                    match id {
+                        "show" => show_main(app),
+                        "toggle" => {
+                            let _ = app.emit("tray-action", "toggle");
+                        }
+                        "mode_rule" => {
+                            let _ = app.emit("tray-action", "mode:rule");
+                        }
+                        "mode_global" => {
+                            let _ = app.emit("tray-action", "mode:global");
+                        }
+                        "mode_direct" => {
+                            let _ = app.emit("tray-action", "mode:direct");
+                        }
+                        "entry_system" => {
+                            let _ = app.emit("tray-action", "entry:system");
+                        }
+                        "entry_tun" => {
+                            let _ = app.emit("tray-action", "entry:tun");
+                        }
+                        "entry_local" => {
+                            let _ = app.emit("tray-action", "entry:local");
+                        }
+                        "stop" => {
+                            let app = app.clone();
+                            tauri::async_runtime::spawn_blocking(move || {
+                                let _ = app.state::<ProxyState>().stop();
+                            });
+                        }
+                        "quit" => app.exit(0),
+                        _ => (),
                     }
-                    "mode_global" => {
-                        let _ = app.emit("tray-action", "mode:global");
-                    }
-                    "mode_direct" => {
-                        let _ = app.emit("tray-action", "mode:direct");
-                    }
-                    "entry_system" => {
-                        let _ = app.emit("tray-action", "entry:system");
-                    }
-                    "entry_tun" => {
-                        let _ = app.emit("tray-action", "entry:tun");
-                    }
-                    "entry_local" => {
-                        let _ = app.emit("tray-action", "entry:local");
-                    }
-                    "stop" => {
-                        let app = app.clone();
-                        tauri::async_runtime::spawn_blocking(move || {
-                            let _ = app.state::<ProxyState>().stop();
-                        });
-                    }
-                    "quit" => app.exit(0),
-                    _ => (),
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
@@ -1123,6 +1348,10 @@ fn main() {
             clear_proxy_events,
             open_log_folder,
             open_project_repo,
+            check_system_proxy_active,
+            repair_system_proxy,
+            check_app_update,
+            open_release_page,
             probe_loaded_node,
             probe_mihomo_group,
             close_proxy_connection,

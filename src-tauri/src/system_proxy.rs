@@ -157,6 +157,14 @@ fn apply(settings: &Settings) -> Result<(), ()> {
     Ok(())
 }
 
+pub fn is_port_active(port: u16) -> bool {
+    let Ok(current) = query() else {
+        return false;
+    };
+    let expected: Vec<u16> = format!("127.0.0.1:{port}").encode_utf16().collect();
+    (current.flags & 2) != 0 && current.server == expected
+}
+
 pub fn recover(path: &Path) -> Result<(), ()> {
     let raw = match fs::read(path) {
         Ok(raw) => raw,

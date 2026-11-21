@@ -1,12 +1,24 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   defaultProbeUrl,
   defaultSystemProxyBypass,
+  deserializeWorkspace,
+  serializeWorkspace,
   type CloseAction,
   type ThemeMode,
   type Workspace,
 } from "../workspace";
+
+type AppUpdateInfo = {
+  current: string;
+  latest: string;
+  hasUpdate: boolean;
+  releaseUrl: string;
+  downloadUrl?: string | null;
+  mirrorDownloadUrl?: string | null;
+  notes: string;
+};
 
 export type TunServiceStatus = {
   installed: boolean;
@@ -44,7 +56,10 @@ export function SettingsPage({
   const [probeUrlDraft, setProbeUrlDraft] = useState(workspace.probeUrl);
   const [feedback, setFeedback] = useState("");
   const [repoCopied, setRepoCopied] = useState(false);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<AppUpdateInfo>();
   const [error, setError] = useState("");
+  const backupInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setBypassDraft(workspace.systemProxyBypass);
@@ -372,7 +387,128 @@ export function SettingsPage({
       </section>
 
       <section className="panel">
-        <div className="panel-head"><h2>关于与开源</h2></div>
+        <div className="panel-head"><h2>备份与恢复</h2></div>
+        <div className="setting-item">
+          <div className="setting-label">
+            <strong>导出 / 导入工作区配置</strong>
+            <small>备份全部订阅、分流规则、收藏与界面偏好为 JSON 文件（含订阅链接，请妥善保管）</small>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="mini-btn"
+              disabled={!ready}
+              onClick={() => {
+                const json = serializeWorkspace(workspace);
+                const blob = new Blob([json], { type: "application/json;charset=utf-8" });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = `relaydesk-backup-${new Date().toISOString().slice(0, 10)}.json`;
+                link.click();
+                URL.revokeObjectURL(url);
+                setError("");
+                setFeedback("已导出工作区配置备份");
+              }}
+            >
+              导出备份 JSON
+            </button>
+            <input
+              ref={backupInputRef}
+              type="file"
+              accept=".json,application/json"
+              hidden
+              onChange={async e => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                if (!file) return;
+                try {
+                  const text = await file.text();
+                  const parsed = JSON.parse(text) as unknown;
+                  if (
+                    !parsed ||
+                    typeof parsed !== "object" ||
+                    Array.isArray(parsed) ||
+                    (!("subscriptions" in parsed) && !("rules" in parsed))
+                  ) {
+                    throw new Error("备份文件不是有效的 RelayDesk 工作区 JSON");
+                  }
+                  const restored = deserializeWorkspace(text);
+                  await onSave(() => restored);
+                  setError("");
+                  setFeedback(`已恢复备份（含 ${restored.subscriptions.length} 份订阅与 ${restored.rules.length} 条规则）`);
+                } catch (failure) {
+                  setError(failure instanceof Error ? failure.message : "导入备份失败，请确认文件格式");
+                }
+              }}
+            />
+            <button
+              type="button"
+              className="mini-btn is-primary"
+              disabled={!ready || busy || running}
+              onClick={() => backupInputRef.current?.click()}
+            >
+              从备份恢复
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <h2>关于与开源</h2>
+          <button
+            type="button"
+            className="mini-btn"
+            disabled={!isTauri() || updateChecking}
+            onClick={() => {
+              setUpdateChecking(true);
+              setError("");
+              void invoke<AppUpdateInfo>("check_app_update")
+                .then(info => {
+                  setUpdateInfo(info);
+                  setFeedback(info.hasUpdate ? `发现新版本 v${info.latest}` : `当前已是最新版本 v${info.current}`);
+                })
+                .catch(failure => setError(typeof failure === "string" ? failure : "检查更新失败"))
+                .finally(() => setUpdateChecking(false));
+            }}
+          >
+            {updateChecking ? "检查中…" : "检查更新"}
+          </button>
+        </div>
+        {updateInfo?.hasUpdate && (
+          <div className="notice is-warn" role="status" style={{ marginBottom: 12 }}>
+            <span>
+              发现新版本 <strong>v{updateInfo.latest}</strong>（当前 v{updateInfo.current}）
+            </span>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {updateInfo.mirrorDownloadUrl && (
+                <button
+                  type="button"
+                  className="mini-btn is-primary"
+                  onClick={() =>
+                    void invoke("open_release_page", { url: updateInfo.mirrorDownloadUrl }).catch(() =>
+                      setError("无法打开加速下载地址"),
+                    )
+                  }
+                >
+                  国内加速下载
+                </button>
+              )}
+              <button
+                type="button"
+                className={updateInfo.mirrorDownloadUrl ? "mini-btn" : "mini-btn is-primary"}
+                onClick={() =>
+                  void invoke("open_release_page", { url: updateInfo.downloadUrl ?? updateInfo.releaseUrl }).catch(() =>
+                    setError("无法打开更新发布页"),
+                  )
+                }
+              >
+                GitHub 下载
+              </button>
+            </div>
+          </div>
+        )}
         <div className="setting-item">
           <div className="setting-label">
             <strong>作者</strong>

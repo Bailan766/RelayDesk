@@ -89,7 +89,7 @@ function compileConfig(
       rules: wireguard
         ? [{ inbound: endpoints.map(endpoint => endpoint.tag), action: 'reject' }, ...compiledRules]
         : compiledRules,
-      final: ruleDefaultAction, auto_detect_interface: true,
+      final: ruleDefaultAction, auto_detect_interface: true, find_process: true,
       ...(wireguard ? { default_domain_resolver: 'bootstrap' } : {}),
     },
   };
