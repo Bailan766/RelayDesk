@@ -700,7 +700,7 @@ pub struct Session {
     pub port: u16,
     pub controller: crate::telemetry::Controller,
     pub id: String,
-    pub policy_dns: Option<u16>,
+    pub tun_dns: Option<(u16, u16)>,
     policy: Option<Box<Session>>,
 }
 
@@ -720,6 +720,7 @@ struct WorkerInput {
 struct CaptureTarget {
     mixed_port: u16,
     dns_port: u16,
+    system_dns: u16,
     policy_pid: u32,
 }
 
@@ -743,6 +744,7 @@ fn capture_config(
         "log":{"level":"warn"},
         "inbounds":[
             {"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port},
+            {"type":"direct","tag":"system-dns-in","listen":"127.0.0.1","listen_port":target.system_dns},
             {"type":"tun","tag":"tun","interface_name":interface,"address":["172.28.254.1/30","fdfe:dcba:9876::1/126"],
              "auto_route":true,"strict_route":true,"stack":"mixed"}
         ],
@@ -750,12 +752,16 @@ fn capture_config(
             {"type":"socks","tag":"policy","server":"127.0.0.1","server_port":target.mixed_port,"version":"5"},
             {"type":"direct","tag":"physical"}
         ],
-        "route":{"auto_detect_interface":true,"final":"policy","rules":[
+        "route":{"auto_detect_interface":true,"default_domain_resolver":"system-dns","final":"policy","rules":[
+            {"inbound":"system-dns-in","action":"hijack-dns"},
             {"process_path_regex":[expression],"outbound":"physical"},
             {"action":"sniff"},
             {"protocol":"dns","action":"hijack-dns"}
         ]},
-        "dns":{"servers":[{"type":"udp","tag":"policy-dns","server":"127.0.0.1","server_port":target.dns_port}],"final":"policy-dns"}
+        "dns":{"servers":[
+            {"type":"udp","tag":"policy-dns","server":"127.0.0.1","server_port":target.dns_port},
+            {"type":"local","tag":"system-dns","prefer_go":true}
+        ],"rules":[{"inbound":"system-dns-in","action":"route","server":"system-dns"}],"final":"policy-dns"}
     })
 }
 
@@ -789,7 +795,18 @@ impl Session {
         }
         if settings.core == Core::Mihomo && mode == "tun" {
             let dns_port = auxiliary_port(&[port])?;
-            mihomo::prepare_tun_policy(&settings.config, port, routing_mode, dns_port)?;
+            let system_dns = auxiliary_port(&[port, dns_port])?;
+            let local_port = auxiliary_port(&[port, dns_port, system_dns])?;
+            let initial =
+                mihomo::prepare_tun_policy(&settings.config, port, routing_mode, dns_port, None)?;
+            let attached = mihomo::prepare_tun_policy(
+                &settings.config,
+                port,
+                routing_mode,
+                dns_port,
+                Some(system_dns),
+            )?;
+            let selections = settings.selections.clone();
             let policy = Self::start_worker(
                 settings,
                 port,
@@ -802,10 +819,10 @@ impl Session {
             if policy_pid == 0 {
                 return Err("无法监视 Mihomo 网络进程".into());
             }
-            let local_port = auxiliary_port(&[port, dns_port])?;
             let target = CaptureTarget {
                 mixed_port: port,
                 dns_port,
+                system_dns,
                 policy_pid,
             };
             let settings = CoreSettings {
@@ -823,8 +840,27 @@ impl Session {
             )?;
             capture.port = port;
             capture.controller = policy.controller.clone();
-            capture.policy_dns = Some(dns_port);
+            capture.tun_dns = Some((dns_port, system_dns));
             capture.policy = Some(Box::new(policy));
+            // Provider startup uses the ordinary system resolver until the TUN is attached.
+            if initial != attached {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "无法配置 TUN 的系统 DNS")?;
+                runtime.block_on(async {
+                    if !capture.controller.reload_mihomo(attached).await? {
+                        return Err("Mihomo 未启用 TUN 的系统 DNS".to_string());
+                    }
+                    mihomo::restore_selections(
+                        &capture.controller,
+                        selections,
+                        Duration::from_secs(6),
+                    )
+                    .await;
+                    Ok(())
+                })?;
+            }
             return Ok(capture);
         }
         if settings.core == Core::Mihomo {
@@ -902,7 +938,7 @@ impl Session {
             port,
             controller,
             id: token,
-            policy_dns,
+            tun_dns: None,
             policy: None,
         };
         let deadline = Instant::now()
@@ -1120,7 +1156,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                 return Err("Mihomo DNS 端口无效".into());
             }
             ensure_port_available(dns)?;
-            mihomo::prepare_tun_policy(&config, port, routing_mode, dns)?
+            mihomo::prepare_tun_policy(&config, port, routing_mode, dns, None)?
         } else {
             mihomo::prepare(&config, port, routing_mode)?
         };
@@ -1131,10 +1167,10 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     } else if core == Core::Bridge {
         let target: CaptureTarget =
             serde_json::from_value(config).map_err(|_| "TUN 转发目标无效")?;
-        if target.mixed_port < 1024
-            || target.dns_port < 1024
+        let ports = [target.mixed_port, target.dns_port, target.system_dns];
+        if ports.iter().any(|entry| *entry < 1024 || *entry == port)
             || target.mixed_port == target.dns_port
-            || [target.mixed_port, target.dns_port].contains(&port)
+            || [target.mixed_port, target.dns_port].contains(&target.system_dns)
             || target.policy_pid == 0
             || target.policy_pid == std::process::id()
             || target.policy_pid == parent_id
@@ -1144,6 +1180,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         dependency = Some(Handle::new(unsafe {
             OpenProcess(SYNCHRONIZE, FALSE, target.policy_pid)
         })?);
+        ensure_port_available(target.system_dns)?;
         let program = crate::bundled_binary("mihomo.exe")?;
         config = capture_config(&target, port, &interface, &program);
         None

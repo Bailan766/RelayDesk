@@ -117,6 +117,7 @@ pub fn prepare_tun_policy(
     port: u16,
     mode: RoutingMode,
     dns_port: u16,
+    system_dns: Option<u16>,
 ) -> Result<Value, String> {
     let mut prepared = prepare(config, port, mode)?;
     let dns = prepared["dns"].take();
@@ -133,8 +134,41 @@ pub fn prepare_tun_policy(
     }
     dns.insert("enable".into(), json!(true));
     dns.insert("listen".into(), json!(format!("127.0.0.1:{dns_port}")));
+    if let Some(port) = system_dns {
+        let local = format!("udp://127.0.0.1:{port}#DIRECT");
+        for key in [
+            "nameserver",
+            "fallback",
+            "default-nameserver",
+            "proxy-server-nameserver",
+            "direct-nameserver",
+            "nameserver-policy",
+            "proxy-server-nameserver-policy",
+        ] {
+            if let Some(value) = dns.get_mut(key) {
+                use_physical_system_dns(value, &local);
+            }
+        }
+    }
     prepared["dns"] = Value::Object(dns);
     Ok(prepared)
+}
+
+fn use_physical_system_dns(value: &mut Value, local: &str) {
+    match value {
+        Value::String(server)
+            if matches!(server.as_str(), "system" | "system://" | "dhcp://system") =>
+        {
+            *server = local.to_owned();
+        }
+        Value::Array(values) => values
+            .iter_mut()
+            .for_each(|value| use_physical_system_dns(value, local)),
+        Value::Object(values) => values
+            .values_mut()
+            .for_each(|value| use_physical_system_dns(value, local)),
+        _ => {}
+    }
 }
 
 pub async fn restore_selections(
@@ -177,7 +211,8 @@ mod tests {
             "dns":{"enable":true,"listen":"0.0.0.0:53","nameserver":["https://dns.example/query"],
                    "enhanced-mode":"fake-ip"}
         });
-        let dns = prepare_tun_policy(&configured, 17070, RoutingMode::Rule, 17071).unwrap()["dns"]
+        let dns = prepare_tun_policy(&configured, 17070, RoutingMode::Rule, 17071, Some(17072))
+            .unwrap()["dns"]
             .clone();
         assert_eq!(dns["listen"], "127.0.0.1:17071");
         assert_eq!(dns["nameserver"], configured["dns"]["nameserver"]);
@@ -187,12 +222,26 @@ mod tests {
             json!({"rules":["MATCH,DIRECT"]}),
             json!({"rules":["MATCH,DIRECT"],"dns":{"enable":false,"nameserver":["127.0.0.2"]}}),
         ] {
-            let prepared = prepare_tun_policy(&config, 17070, RoutingMode::Rule, 17071).unwrap();
+            let prepared =
+                prepare_tun_policy(&config, 17070, RoutingMode::Rule, 17071, None).unwrap();
             let dns = &prepared["dns"];
             assert_eq!(dns["enable"], true);
             assert_eq!(dns["listen"], "127.0.0.1:17071");
             assert_eq!(dns["nameserver"], json!(["system"]));
         }
+
+        let mut explicit = configured;
+        explicit["dns"]["nameserver-policy"] =
+            json!({"fixture.test":["system://","dhcp://system"]});
+        let prepared =
+            prepare_tun_policy(&explicit, 17070, RoutingMode::Rule, 17071, Some(17072)).unwrap();
+        assert_eq!(
+            prepared["dns"]["nameserver-policy"]["fixture.test"],
+            json!([
+                "udp://127.0.0.1:17072#DIRECT",
+                "udp://127.0.0.1:17072#DIRECT"
+            ])
+        );
     }
 
     #[test]

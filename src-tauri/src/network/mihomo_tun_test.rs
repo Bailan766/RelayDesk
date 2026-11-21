@@ -146,7 +146,8 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         CoreSettings {
             core: Core::Mihomo,
             config: json!({
-                "dns":{"enable":true,"ipv6":false,"nameserver":[format!("udp://127.0.0.1:{resolver_port}")]},
+                "dns":{"enable":true,"ipv6":false,"nameserver":["system"],
+                    "nameserver-policy":{"relaydesk.fixture.test":[format!("udp://127.0.0.1:{resolver_port}")]}},
                 "proxies":[
                     {"name":"tcp-fixture","type":"http","server":"127.0.0.1","port":http_port},
                     {"name":"udp-fixture","type":"ss","server":"127.0.0.1","port":ss_port,
@@ -159,7 +160,7 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         },
         mixed, "tun", RoutingMode::Rule, &app,
     ).unwrap();
-    let policy_dns = session.policy_dns.unwrap();
+    let (policy_dns, system_dns) = session.tun_dns.unwrap();
     assert!(session.running() && session.controller.ready());
     assert!(UdpSocket::bind((TUN_ADDRESS, 0)).is_ok());
     let target_address: std::net::Ipv4Addr = TARGET.parse().unwrap();
@@ -234,4 +235,5 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         Duration::from_secs(4),
     );
     assert!(UdpSocket::bind(("127.0.0.1", policy_dns)).is_ok());
+    assert!(UdpSocket::bind(("127.0.0.1", system_dns)).is_ok());
 }

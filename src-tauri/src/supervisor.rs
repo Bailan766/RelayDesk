@@ -387,13 +387,15 @@ impl Supervisor {
                 active.session.controller.clone(),
                 active.plan.settings.config.clone(),
                 active.plan.port,
-                active.session.policy_dns,
+                active.session.tun_dns,
                 active.plan.routing_mode,
                 active.plan.settings.selections.clone(),
             )
         };
         let prepare = |profile: &Value| match dns {
-            Some(dns) => crate::mihomo::prepare_tun_policy(profile, port, mode, dns),
+            Some((dns, system_dns)) => {
+                crate::mihomo::prepare_tun_policy(profile, port, mode, dns, Some(system_dns))
+            }
             None => crate::mihomo::prepare(profile, port, mode),
         };
         let next = prepare(&config)?;
