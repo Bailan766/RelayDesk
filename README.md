@@ -14,6 +14,8 @@ npm run dev
 
 推送到 GitHub 后，Windows build 工作流生成 Windows x64 安装程序和免安装包。使用免安装版时，请完整解压到同一目录。导入订阅后，选择受支持的节点和首页的接管方式。系统代理适用于读取 Windows 代理设置的应用。TUN 适用于需要接管 TCP/UDP 的应用，启动时需要管理员授权。本地端口模式需在目标应用中配置界面显示的 HTTP/SOCKS5 地址。彻底退出请使用托盘菜单。
 
+开启自动恢复后，TUN 接管内核意外退出时，会在当前授权会话内重启。节点模式会保留当前节点和路由模式。TUN 重建期间，Windows 可能恢复原有网络路径。
+
 ## 当前限制
 
 桌面应用支持分别管理并更新多份 HTTPS 订阅，通过 sing-box 连接 VLESS、Hysteria2、VMess、Trojan、Shadowsocks、TUIC v5 和 WireGuard。节点模式可从分享链接、Clash YAML 和 sing-box JSON 提取连接参数。WireGuard 使用 Clash 节点配置或 sing-box 用户态端点。订阅、所选节点和工作区设置由 Windows DPAPI 加密后保存在 SQLite。域名、域名后缀、IP 网段和 Windows 进程规则按顺序匹配，支持直连、拦截或指定代理节点，修改在下次连接时生效。当前会话中已加载的节点支持热切换。

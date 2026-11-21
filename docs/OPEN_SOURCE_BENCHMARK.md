@@ -20,6 +20,7 @@
 | A04/A06 Mihomo 原配置接入 TUN | Windows 实机使用全量严格路由验证未手动设置代理的 TCP、Shadowsocks UDP 回显和按原配置解析的 DNS。复现了直接使用系统 DNS 时的解析回路，修正后在 TUN 启用时查询成功，真实 HTTPS 上游连接也从物理网卡出去。`v0.1.15-preview.3` 通过安装后的 TCP、UDP、DNS 测试，验证策略进程异常退出后释放网卡和 DNS 监听。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44844993377) | 来源和进程规则的原始连接信息、切网和休眠唤醒、IPv6、应用自带加密 DNS。 |
 | A03 按订阅设定刷新周期 | 工作区测试验证默认、独立周期、关闭、旧版数据和失败后的退避。模拟桌面下载的界面测试验证全局关闭时独立周期仍生效，以及单份订阅关闭后仍能手动刷新。 | 长时间后台运行与系统唤醒后的现场刷新。 |
 | A04 TUN 默认路由丢失 | Windows 实机移除测试网卡的默认路由后，原实现的内核仍在运行，路由没有自行回来。使用 Windows 网络接口重建该网卡的 IPv4、IPv6 默认路由后，TCP 请求恢复。`v0.1.17-preview.1` 验证安装后的应用会自动补回丢失的测试路由，保持同一会话，且可再次转发 TCP。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44846758386) | 恢复失败后的完整状态提示、真正的切网和休眠唤醒。 |
+| A04/A09 TUN 接管内核退出 | `v0.1.18-preview.2` 强制结束已安装应用的接管内核，验证同一授权进程恢复 Mihomo TUN 的实际 TCP 流量。节点模式恢复上次所选节点和路由模式，重试期间关闭自动恢复会停止接管。模拟界面验证恢复中仍可点击停止。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44849122906) | 授权进程自身退出、Mihomo 策略进程退出后重连、恢复期间阻断直连、Windows 服务及真实休眠唤醒。 |
 
 ## 优先解决的用户风险
 
@@ -123,6 +124,8 @@ proxies:
 #### 一次授权的 Windows TUN 服务验收
 
 Clash Verge Rev 已实现独立服务和受保护的内核安装。它公布的本地提权公告也指出了客户端鉴别和可执行文件路径两个验收面。RelayDesk 当前的安装器按用户安装。未来服务的程序和内核应独立安装到仅管理员可写的位置，由安装程序固定并验证版本。服务只接管自建网卡和路由，普通用户进程继续解析远程订阅和策略。 [Clash Verge Rev 服务源码](https://github.com/clash-verge-rev/clash-verge-rev/blob/dev/src-tauri/src/core/service.rs) · [上游安全公告](https://github.com/clash-verge-rev/clash-verge-rev/security/advisories/GHSA-99qg-xv7m-jf4v) · [Windows 服务权限](https://learn.microsoft.com/en-us/windows/win32/services/service-security-and-access-rights)
+
+Hiddify v5 的发布说明将后台服务安装和核心原位重启列为独立能力。WireGuard for Windows 的文档还区分管理服务和每个隧道的服务，允许单独启动隧道。对标时分别记录关闭桌面窗口、退出托盘、结束网络内核、结束管理服务和系统重启后的实际网络行为。 [Hiddify v5 发行说明](https://github.com/hiddify/hiddify-app/discussions/2487) · [Hiddify v5.9.8 变更](https://github.com/hiddify/hiddify-app/discussions/2583) · [WireGuard Windows 服务](https://git.zx2c4.com/wireguard-windows/about/docs/enterprise.md)
 
 安装后以授权的普通用户测试启停和异常恢复，分别覆盖重启、休眠、切换网络及进程退出。用第二个普通用户账号和不同登录会话发起同样的请求，检查服务拒绝访问。用 Windows 管道访问控制绑定授权会话，并在服务端核对连接进程的令牌。安装包升级、覆盖安装、卸载时复查内核文件权限、服务注册和网卡清理，验证普通用户写入安装目录或配置目录不会改变服务启动的二进制。 [Windows 命名管道访问控制](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights)
 
