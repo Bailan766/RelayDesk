@@ -817,30 +817,31 @@ impl Supervisor {
         }
         match launch(&pending.1) {
             Ok(session) => {
-                let stale = {
+                let (stale, previous) = {
                     let Ok(mut slot) = self.slot.lock() else {
                         let _ = session.stop();
                         return;
                     };
                     if self.closing.load(Ordering::Acquire) {
-                        true
+                        (Some(session), None)
                     } else if let Some(active) = slot
                         .active
                         .as_mut()
                         .filter(|active| active.session.id == pending.0)
                     {
-                        active.session = session;
+                        let previous = std::mem::replace(&mut active.session, session);
                         active.generation = 0;
                         active.since = Instant::now();
                         active.health.reset();
                         slot.message = Some("代理已自动恢复");
                         slot.record("info", "检测到内核中断，代理已自动恢复");
-                        false
+                        (None, Some(previous))
                     } else {
-                        true
+                        (Some(session), None)
                     }
                 };
-                if stale {
+                drop(previous);
+                if let Some(session) = stale {
                     let _ = session.stop();
                 }
             }
