@@ -663,12 +663,29 @@ impl Supervisor {
             return;
         };
         if active.session.running() {
+            if active.session.needs_policy_restart() {
+                // Policy changes hold this lock until the in-memory plan is committed.
+                if let Ok(_control) = self.control.try_lock() {
+                    if active
+                        .session
+                        .stage_policy_restart(&active.plan.settings, active.plan.routing_mode)
+                        .is_err()
+                    {
+                        active.session.configure_tun_recovery(false);
+                        slot.record(
+                            "warn",
+                            "无法保存本次 Mihomo 恢复所需的配置，正在退出 TUN 接管",
+                        );
+                    }
+                }
+                return;
+            }
             let generation = active.session.generation();
             if generation != active.generation {
                 active.generation = generation;
                 active.health.reset();
                 slot.message = Some("TUN 已自动恢复");
-                slot.record("info", "TUN 接管内核已恢复，原节点和路由设置保持生效");
+                slot.record("info", "TUN 连接已恢复，当前节点和路由设置保持生效");
                 return;
             }
             if active.since.elapsed() >= HEALTHY_INTERVAL {

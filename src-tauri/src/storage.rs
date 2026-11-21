@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf, ptr};
 use tauri::Manager;
 use winapi::um::{dpapi::{CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN}, winbase::LocalFree, wincrypt::DATA_BLOB};
 
-fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
+pub(crate) fn transform(input: &[u8], encrypt: bool) -> Result<Vec<u8>, String> {
     const LIMIT: usize = 32 * 1024 * 1024;
     let limit = if encrypt { LIMIT } else { LIMIT + 64 * 1024 };
     if input.len() > limit { return Err("订阅和规则数据过大".into()); }

@@ -2,6 +2,7 @@ use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
 
 const TARGET: &str = "198.18.117.33";
+const UPDATED_TARGET: &str = "198.18.117.34";
 const TUN_ADDRESS: &str = "172.28.254.1";
 
 fn port(listener: &TcpListener) -> u16 {
@@ -22,7 +23,7 @@ fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) {
     );
 }
 
-fn stop_fixture_tun_core(session: &Session) {
+fn stop_fixture_core(session: &Session, executable: &str) {
     use winapi::um::{
         handleapi::INVALID_HANDLE_VALUE,
         processthreadsapi::TerminateProcess,
@@ -40,9 +41,9 @@ fn stop_fixture_tun_core(session: &Session) {
     let mut row: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
     row.dwSize = std::mem::size_of_val(&row) as u32;
     let mut present = unsafe { Process32FirstW(snapshot.0, &mut row) };
+    let exe = wide(executable);
     while present != 0 {
-        if row.th32ParentProcessID == parent_id && row.szExeFile.starts_with(&wide("sing-box.exe"))
-        {
+        if row.th32ParentProcessID == parent_id && row.szExeFile.starts_with(&exe) {
             let child = Handle::new(unsafe {
                 OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, row.th32ProcessID)
             })
@@ -53,7 +54,7 @@ fn stop_fixture_tun_core(session: &Session) {
         }
         present = unsafe { Process32NextW(snapshot.0, &mut row) };
     }
-    panic!("The authorized worker's sing-box child was not found");
+    panic!("The worker's {executable} child was not found");
 }
 
 fn read_headers(socket: &mut TcpStream) -> String {
@@ -109,7 +110,7 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let http_port = port(&connect_proxy);
     let http = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(45);
-        for _ in 0..3 {
+        for destination in [TARGET, TARGET, TARGET, UPDATED_TARGET] {
             let mut socket = loop {
                 match connect_proxy.accept() {
                     Ok((socket, _)) => break socket,
@@ -126,7 +127,7 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
             socket
                 .set_read_timeout(Some(Duration::from_secs(4)))
                 .unwrap();
-            assert!(read_headers(&mut socket).starts_with(&format!("CONNECT {TARGET}:8089 ")));
+            assert!(read_headers(&mut socket).starts_with(&format!("CONNECT {destination}:8089 ")));
             socket
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .unwrap();
@@ -202,24 +203,30 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     });
 
     let mixed = auxiliary_port(&[ss_port, http_port, resolver_port, echo_port]).unwrap();
-    let session = Session::start_using(
-        CoreSettings {
-            core: Core::Mihomo,
-            config: json!({
-                "dns":{"enable":true,"ipv6":false,"nameserver":["system"],
-                    "nameserver-policy":{"relaydesk.fixture.test":[format!("udp://127.0.0.1:{resolver_port}")]}},
-                "proxies":[
-                    {"name":"tcp-fixture","type":"http","server":"127.0.0.1","port":http_port},
-                    {"name":"udp-fixture","type":"ss","server":"127.0.0.1","port":ss_port,
-                     "password":password,"cipher":"aes-128-gcm","udp":true}
-                ],
-                "proxy-groups":[{"name":"Fixture","type":"select","proxies":["tcp-fixture","REJECT"]}],
-                "rules":[format!("DST-PORT,{echo_port},udp-fixture"), format!("IP-CIDR,{TARGET}/32,Fixture,no-resolve"), "MATCH,REJECT"]
-            }),
-            selections: BTreeMap::new(),
-        },
-        mixed, "tun", RoutingMode::Rule, &app, true,
-    ).unwrap();
+    let mut settings = CoreSettings {
+        core: Core::Mihomo,
+        config: json!({
+            "dns":{"enable":true,"ipv6":false,"nameserver":["system"],
+                "nameserver-policy":{"relaydesk.fixture.test":[format!("udp://127.0.0.1:{resolver_port}")]}},
+            "proxies":[
+                {"name":"tcp-fixture","type":"http","server":"127.0.0.1","port":http_port},
+                {"name":"udp-fixture","type":"ss","server":"127.0.0.1","port":ss_port,
+                 "password":password,"cipher":"aes-128-gcm","udp":true}
+            ],
+            "proxy-groups":[{"name":"Fixture","type":"select","proxies":["tcp-fixture","REJECT"]}],
+            "rules":[format!("DST-PORT,{echo_port},udp-fixture"), format!("IP-CIDR,{TARGET}/32,Fixture,no-resolve"), "MATCH,REJECT"]
+        }),
+        selections: BTreeMap::new(),
+    };
+    let mut session = Session::start_using(
+        settings.clone(),
+        mixed,
+        "tun",
+        RoutingMode::Rule,
+        &app,
+        true,
+    )
+    .unwrap();
     let (policy_dns, system_dns) = session.tun_dns.unwrap();
     assert!(session.running() && session.controller.ready());
     assert!(UdpSocket::bind((TUN_ADDRESS, 0)).is_ok());
@@ -258,7 +265,7 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     assert!(session.running());
     assert_http_through_tun(&session, address);
 
-    stop_fixture_tun_core(&session);
+    stop_fixture_core(&session, "sing-box.exe");
     wait_until(|| session.recovering_tun(), Duration::from_secs(3));
     assert!(session.running() && !session.ready());
     wait_until(|| session.ready(), Duration::from_secs(24));
@@ -287,6 +294,58 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let len = app_dns.recv(&mut data).unwrap();
     assert_eq!(&data[..2], b"\x19\x29");
     assert!(data[..len].ends_with(&[192, 0, 2, 10]));
+
+    settings.config["proxy-groups"] = json!([{
+        "name":"Updated","type":"select","proxies":["REJECT","tcp-fixture"]
+    }]);
+    settings.config["rules"] = json!([
+        format!("IP-CIDR,{UPDATED_TARGET}/32,Updated,no-resolve"),
+        "MATCH,REJECT"
+    ]);
+    settings
+        .selections
+        .insert("Updated".into(), "tcp-fixture".into());
+    let updated = mihomo::prepare_tun_policy(
+        &settings.config,
+        mixed,
+        RoutingMode::Rule,
+        policy_dns,
+        Some(system_dns),
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        assert!(session.controller.reload_mihomo(updated).await.unwrap());
+        session
+            .controller
+            .switch_group("Updated", "tcp-fixture")
+            .await
+            .unwrap();
+    });
+    stop_fixture_core(session.policy.as_ref().unwrap(), "mihomo.exe");
+    wait_until(|| session.needs_policy_restart(), Duration::from_secs(3));
+    assert!(session.running() && !session.ready());
+    assert!(
+        UdpSocket::bind((TUN_ADDRESS, 0)).is_ok(),
+        "TUN stopped while the policy core was down"
+    );
+    session
+        .stage_policy_restart(&settings, RoutingMode::Rule)
+        .unwrap();
+    assert!(!session.needs_policy_restart());
+    wait_until(|| session.ready(), Duration::from_secs(24));
+    assert_eq!(session.generation(), 2);
+    runtime.block_on(async {
+        let groups = session.controller.groups().await.unwrap();
+        assert!(groups
+            .iter()
+            .any(|group| group.name == "Updated" && group.selected == "tcp-fixture"));
+    });
+    assert_http_through_tun(&session, format!("{UPDATED_TARGET}:8089").parse().unwrap());
+
     http.join().unwrap();
     udp.join().unwrap();
     dns.join().unwrap();
@@ -342,7 +401,7 @@ fn installed_node_tun_keeps_the_selected_node_and_mode_and_can_cancel_recovery()
     });
     config["outbounds"][0]["default"] = json!("node-1");
     session.remember_tun_route(RoutingMode::Direct, &config);
-    stop_fixture_tun_core(&session);
+    stop_fixture_core(&session, "sing-box.exe");
     wait_until(|| session.recovering_tun(), Duration::from_secs(3));
     wait_until(|| session.ready(), Duration::from_secs(24));
     assert_eq!(session.generation(), 1);
@@ -362,7 +421,7 @@ fn installed_node_tun_keeps_the_selected_node_and_mode_and_can_cancel_recovery()
             .unwrap()
             .eq_ignore_ascii_case("direct"));
     });
-    stop_fixture_tun_core(&session);
+    stop_fixture_core(&session, "sing-box.exe");
     wait_until(|| session.recovering_tun(), Duration::from_secs(3));
     session.configure_tun_recovery(false);
     assert!(

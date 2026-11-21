@@ -48,6 +48,7 @@ mod tun_control;
 const APPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const TUN_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const MIHOMO_READY_TIMEOUT: Duration = Duration::from_secs(40);
+const MIHOMO_RESTART_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TUN_ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const TUN_ROUTE_RECOVERY_ATTEMPTS: u8 = 6;
 
@@ -729,6 +730,7 @@ pub struct Session {
     pub tun_dns: Option<(u16, u16)>,
     policy: Option<Box<Session>>,
     tun_control: Option<TunControl>,
+    staged_policy_recovery: Option<u32>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -749,6 +751,44 @@ struct CaptureTarget {
     dns_port: u16,
     system_dns: u16,
     policy_pid: u32,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PolicyRestart {
+    config: Value,
+    selections: BTreeMap<String, String>,
+}
+
+fn request_policy_restart(home: &std::path::Path, restart: &PolicyRestart) -> Result<(), String> {
+    let data = serde_json::to_vec(restart).map_err(|_| "无法保存 Mihomo 恢复状态")?;
+    let protected = crate::storage::transform(&data, true)?;
+    let temporary = home.join(format!("restart-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let _cleanup = crate::TemporaryConfig(temporary.clone());
+    fs::write(&temporary, protected).map_err(|_| "无法保存 Mihomo 恢复状态")?;
+    fs::rename(&temporary, home.join("restart.bin")).map_err(|_| "无法提交 Mihomo 恢复状态".into())
+}
+
+fn receive_policy_restart(
+    home: &std::path::Path,
+    lifetime: &WorkerLifetime<'_>,
+    control: &TunControl,
+) -> Result<Option<PolicyRestart>, String> {
+    let path = home.join("restart.bin");
+    let _cleanup = crate::TemporaryConfig(path.clone());
+    let deadline = Instant::now() + MIHOMO_RESTART_REQUEST_TIMEOUT;
+    while control.enabled() && !lifetime.ended(60) && Instant::now() < deadline {
+        match fs::read(&path) {
+            Ok(protected) => {
+                let data = crate::storage::transform(&protected, false)?;
+                return serde_json::from_slice(&data)
+                    .map(Some)
+                    .map_err(|_| "Mihomo 恢复状态无效".into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("无法读取 Mihomo 恢复状态".into()),
+        }
+    }
+    Ok(None)
 }
 
 fn capture_config(
@@ -843,7 +883,7 @@ impl Session {
                 routing_mode,
                 executable,
                 Some(dns_port),
-                false,
+                recover,
             )?;
             let policy_pid = unsafe { GetProcessId(policy.worker.0) };
             if policy_pid == 0 {
@@ -921,7 +961,7 @@ impl Session {
         ensure_port_available(port)?;
         let directory = runtime_dir()?;
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let tun_control = if mode == "tun" {
+        let tun_control = if matches!(mode, "tun" | "policy") {
             Some(TunControl::create(
                 &token,
                 recover,
@@ -991,6 +1031,7 @@ impl Session {
             tun_dns: None,
             policy: None,
             tun_control,
+            staged_policy_recovery: None,
         };
         let deadline = Instant::now()
             + if core == Core::Mihomo {
@@ -1026,6 +1067,10 @@ impl Session {
         self.tun_control
             .as_ref()
             .is_some_and(TunControl::recovering)
+            || self
+                .policy
+                .as_ref()
+                .is_some_and(|policy| policy.recovering_tun())
     }
 
     pub fn ready(&self) -> bool {
@@ -1033,13 +1078,58 @@ impl Session {
     }
 
     pub fn generation(&self) -> u32 {
-        self.tun_control.as_ref().map_or(0, TunControl::generation)
+        self.tun_control
+            .as_ref()
+            .map_or(0, TunControl::generation)
+            .wrapping_add(self.policy.as_ref().map_or(0, |policy| policy.generation()))
     }
 
     pub fn configure_tun_recovery(&self, enabled: bool) {
         if let Some(control) = &self.tun_control {
             control.set_recovery(enabled);
         }
+        if let Some(policy) = &self.policy {
+            policy.configure_tun_recovery(enabled);
+        }
+    }
+
+    pub fn needs_policy_restart(&self) -> bool {
+        self.policy
+            .as_ref()
+            .and_then(|policy| policy.tun_control.as_ref())
+            .is_some_and(|control| {
+                control.enabled()
+                    && control.recovering()
+                    && self.staged_policy_recovery != Some(control.generation())
+            })
+    }
+
+    pub fn stage_policy_restart(
+        &mut self,
+        settings: &CoreSettings,
+        mode: RoutingMode,
+    ) -> Result<(), String> {
+        let Some((policy, (dns, system_dns))) = self.policy.as_ref().zip(self.tun_dns) else {
+            return Ok(());
+        };
+        if !self.needs_policy_restart() {
+            return Ok(());
+        }
+        let generation = policy.generation();
+        let request = PolicyRestart {
+            config: mihomo::prepare_tun_policy(
+                &settings.config,
+                self.port,
+                mode,
+                dns,
+                Some(system_dns),
+            )?,
+            selections: settings.selections.clone(),
+        };
+        let home = runtime_dir()?.join(format!("mihomo-{}", policy.id));
+        request_policy_restart(&home, &request)?;
+        self.staged_policy_recovery = Some(generation);
+        Ok(())
     }
 
     pub fn remember_tun_route(&self, mode: RoutingMode, config: &Value) {
@@ -1281,6 +1371,29 @@ fn supervise_core(
     false
 }
 
+fn restore_policy_choices(
+    controller: &crate::telemetry::Controller,
+    selections: &BTreeMap<String, String>,
+    deadline: Instant,
+) {
+    if selections.is_empty() {
+        return;
+    }
+    let budget = deadline
+        .saturating_duration_since(Instant::now())
+        .min(Duration::from_secs(6));
+    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        runtime.block_on(mihomo::restore_selections(
+            controller,
+            selections.clone(),
+            budget,
+        ));
+    }
+}
+
 fn run_worker(args: &[String]) -> Result<(), String> {
     let [parent, token, port, mode] = args else {
         return Err("网络参数无效".into());
@@ -1335,7 +1448,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         return Err("TUN 转发参数不符合入口类型".into());
     }
     let mut interface = tun_interface(token);
-    let control = if mode == "tun" {
+    let control = if matches!(mode.as_str(), "tun" | "policy") {
         TunControl::open(token).ok()
     } else {
         None
@@ -1460,20 +1573,9 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         Ok::<_, String>((child, route))
     };
     let (mut child, mut route) = launch(&initial, initial_deadline, &interface, None)?;
-    if core == Core::Mihomo && !selections.is_empty() {
-        let budget = initial_deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(6));
-        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            runtime.block_on(mihomo::restore_selections(&controller, selections, budget));
-        }
-        if stop.signaled(0)
-            || parent.signaled(0)
-            || child.try_wait().map_err(|_| "无法读取内核状态")?.is_some()
-        {
+    if core == Core::Mihomo {
+        restore_policy_choices(&controller, &selections, initial_deadline);
+        if lifetime.ended(0) || !matches!(child.try_wait(), Ok(None)) {
             stop_core(&mut child);
             return Err("Mihomo 在恢复策略选择时已停止".into());
         }
@@ -1498,34 +1600,58 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         if !lost || lifetime.ended(0) {
             break;
         }
-        failed = mode == "tun";
+        failed = matches!(mode.as_str(), "tun" | "policy");
         let Some(control) = &control else {
             break;
         };
         if started.elapsed() >= TUN_STABLE_TIME {
             retries = 0;
         }
+        let policy_restart = if mode == "policy" && retries < TUN_RETRY_DELAYS_MS.len() {
+            let home = home.as_ref().ok_or("Mihomo 恢复目录不可用")?;
+            let Some(mut restart) = receive_policy_restart(&home.0, &lifetime, control)? else {
+                break;
+            };
+            controller.configure_mihomo(&mut restart.config);
+            Some(restart)
+        } else {
+            None
+        };
         while let Some(delay) = TUN_RETRY_DELAYS_MS.get(retries) {
             if !wait_tun_retry(&lifetime, control, *delay) {
                 break 'session;
             }
             retries += 1;
-            interface = tun_interface(&uuid::Uuid::new_v4().simple().to_string());
-            let tun = config["inbounds"]
-                .as_array_mut()
-                .and_then(|inbounds| inbounds.iter_mut().find(|entry| entry["type"] == "tun"))
-                .ok_or("恢复 TUN 时找不到网卡设置")?;
-            tun["interface_name"] = json!(&interface);
-            if core == Core::Singbox {
-                control.restore_routing(&mut config);
-            }
-            let replacement = serde_json::to_vec(&config).map_err(|_| "恢复 TUN 配置失败")?;
-            if let Ok((next, replacement_route)) = launch(
-                &replacement,
-                Instant::now() + timeout,
-                &interface,
-                Some(control),
-            ) {
+            let replacement = if let Some(policy) = &policy_restart {
+                &policy.config
+            } else {
+                interface = tun_interface(&uuid::Uuid::new_v4().simple().to_string());
+                let tun = config["inbounds"]
+                    .as_array_mut()
+                    .and_then(|inbounds| inbounds.iter_mut().find(|entry| entry["type"] == "tun"))
+                    .ok_or("恢复 TUN 时找不到网卡设置")?;
+                tun["interface_name"] = json!(&interface);
+                if core == Core::Singbox {
+                    control.restore_routing(&mut config);
+                }
+                &config
+            };
+            let replacement = serde_json::to_vec(replacement).map_err(|_| "恢复 TUN 配置失败")?;
+            let deadline = Instant::now() + timeout;
+            if let Ok((mut next, replacement_route)) =
+                launch(&replacement, deadline, &interface, Some(control))
+            {
+                if let Some(policy) = &policy_restart {
+                    restore_policy_choices(&controller, &policy.selections, deadline);
+                    if !matches!(next.try_wait(), Ok(None)) {
+                        stop_core(&mut next);
+                        continue;
+                    }
+                }
+                if !control.enabled() || lifetime.ended(0) {
+                    stop_core(&mut next);
+                    break 'session;
+                }
                 child = next;
                 route = replacement_route;
                 started = Instant::now();
