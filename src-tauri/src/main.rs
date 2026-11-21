@@ -932,6 +932,7 @@ fn main() {
     let app = tauri::Builder::default()
         .manage(ProxyState::default())
         .manage(probes::ProbeBatch::default())
+        .manage(probes::ProbeSessions::default())
         .manage(AppPreferences::default())
         .setup(|app| {
             use tauri::{
@@ -1048,6 +1049,10 @@ fn main() {
             probes::begin_probe_batch,
             probes::cancel_probe_batch,
             probes::probe_node,
+            probes::start_probe_session,
+            probes::probe_session_node,
+            probes::stop_probe_session,
+            probes::probe_tcp_latency,
             check_exit_ip,
             check_exit_ip_detail,
             check_unlock_service,

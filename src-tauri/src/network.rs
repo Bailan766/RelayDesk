@@ -786,8 +786,8 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         "route":{"rules":output_rules,"final":"proxy","auto_detect_interface":true,"default_domain_resolver":"bootstrap"},
         "dns":{
             "servers":[{"type":"local","tag":"bootstrap"},{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","detour":"proxy"}],
-            "rules":[{"clash_mode":"direct","action":"route","server":"bootstrap"}],
-            "final":"remote"
+            "rules":[{"clash_mode":"direct","action":"route","server":"bootstrap"},{"inbound":["tun","local"],"action":"route","server":"remote"}],
+            "final":"bootstrap"
         }
     }))
 }

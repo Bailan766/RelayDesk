@@ -11,10 +11,13 @@ import {
   FlaskConical,
   Globe2,
   LayoutDashboard,
+  LayoutGrid,
+  LayoutList,
   Link2,
   List,
   Moon,
   Plus,
+  RefreshCw,
   Search,
   Settings2,
   Shield,
@@ -24,6 +27,7 @@ import {
   Sun,
   SunMoon,
   X,
+  Zap,
 } from "lucide-react";
 import { nodeRevision, type NodeProfile } from "./subscription";
 import {
@@ -122,6 +126,27 @@ function latencyClass(ms?: number) {
   return "is-bad";
 }
 
+const regionRules: [string, RegExp][] = [
+  ["🇭🇰 香港", /香港|hong\s*kong|\bhk\b/i],
+  ["🇹🇼 台湾", /台湾|台北|新北|taiwan|\btw\b/i],
+  ["🇯🇵 日本", /日本|东京|大阪|tokyo|osaka|japan|\bjp\b/i],
+  ["🇸🇬 新加坡", /新加坡|狮城|singapore|\bsg\b/i],
+  ["🇺🇸 美国", /美国|洛杉矶|硅谷|圣何塞|纽约|西雅图|达拉斯|芝加哥|united\s*states|\busa?\b/i],
+  ["🇰🇷 韩国", /韩国|首尔|korea|seoul|\bkr\b/i],
+  ["🇬🇧 英国", /英国|伦敦|united\s*kingdom|london|\buk\b|\bgb\b/i],
+  ["🇩🇪 德国", /德国|法兰克福|germany|frankfurt|\bde\b/i],
+  ["🇫🇷 法国", /法国|巴黎|france|paris|\bfr\b/i],
+  ["🇨🇦 加拿大", /加拿大|多伦多|温哥华|canada|\bca\b/i],
+  ["🇦🇺 澳大利亚", /澳大利亚|悉尼|澳洲|australia|\bau\b/i],
+];
+
+function nodeRegion(name: string): string {
+  for (const [label, pattern] of regionRules) {
+    if (pattern.test(name)) return label;
+  }
+  return "🌐 其他";
+}
+
 function App() {
   const [page, setPage] = useState<Page>("概览");
   const work = useWorkspace();
@@ -161,11 +186,16 @@ function App() {
 
   const [subscriptionFilter, setSubscriptionFilter] = useState("");
   const [protocolFilter, setProtocolFilter] = useState("");
+  const [regionFilter, setRegionFilter] = useState("");
   const [nodeSort, setNodeSort] = useState("source");
+  const [nodeView, setNodeView] = useState<"list" | "grid">("list");
+  const [groupBySub, setGroupBySub] = useState(false);
   const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [onlySupported, setOnlySupported] = useState(false);
+  const [nodesTab, setNodesTab] = useState<"groups" | "nodes">("groups");
   const [dialog, setDialog] = useState(false);
   const [detailNode, setDetailNode] = useState<NodeProfile>();
+  const [detailCopied, setDetailCopied] = useState(false);
   const [error, setError] = useState("");
   const [importing, setImporting] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -209,7 +239,10 @@ function App() {
   const confirmedSession = useRef<string | null>(null);
 
   const [latencies, setLatencies] = useState<Record<string, LatencyRecord>>({});
+  const [mihomoDelays, setMihomoDelays] = useState<Record<string, number | null>>({});
   const [testing, setTesting] = useState(false);
+  const [probeMode, setProbeMode] = useState<"url" | "tcp">("url");
+  const [probeProgress, setProbeProgress] = useState<{ done: number; total: number }>();
   const [exitIp, setExitIp] = useState<ExitIpDetail>();
   const [exitIpError, setExitIpError] = useState("");
   const [localTcp, setLocalTcp] = useState("尚未测试");
@@ -217,6 +250,7 @@ function App() {
   const [elevated, setElevated] = useState(false);
   const cancelTesting = useRef(false);
   const probeBatch = useRef<string>();
+  const probeSessionId = useRef<string>();
   const autoConnectRan = useRef(false);
 
   const currentRulesKey = useMemo(() => JSON.stringify({ rules, ruleDefaultAction }), [rules, ruleDefaultAction]);
@@ -341,12 +375,31 @@ function App() {
     return value?.revision === nodeRevision(node) ? value : undefined;
   }
 
+  const nodeSubName = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const sub of subscriptions) {
+      for (const n of sub.parsed.nodes) map.set(n.id, sub.name);
+    }
+    return map;
+  }, [subscriptions]);
+
+  const regionCounts = useMemo(() => {
+    const source = activeFilter?.parsed.nodes ?? nodes;
+    const counts = new Map<string, number>();
+    for (const n of source) {
+      const reg = nodeRegion(n.name);
+      counts.set(reg, (counts.get(reg) ?? 0) + 1);
+    }
+    return Array.from(counts.entries());
+  }, [activeFilter, nodes]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const list = (activeFilter?.parsed.nodes ?? nodes).filter(n => {
       if (onlyFavorites && !starred.has(n.id)) return false;
       if (onlySupported && unavailableNodes.get(n.id)) return false;
       if (protocolFilter && n.protocol !== protocolFilter) return false;
+      if (regionFilter && nodeRegion(n.name) !== regionFilter) return false;
       if (!q) return true;
       return `#${n.sourceIndex ?? ""} ${n.name} ${n.protocol} ${n.server}`.toLowerCase().includes(q);
     });
@@ -359,13 +412,19 @@ function App() {
       return [...list].sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
     }
     return list;
-  }, [activeFilter, latencies, nodeSort, nodes, onlyFavorites, onlySupported, protocolFilter, search, starred, unavailableNodes]);
+  }, [activeFilter, latencies, nodeSort, nodes, onlyFavorites, onlySupported, protocolFilter, regionFilter, search, starred, unavailableNodes]);
 
   const quickNodes = useMemo(() => {
     const usable = nodes.filter(n => !unavailableNodes.get(n.id));
-    const sorted = [...usable].sort((a, b) => Number(starred.has(b.id)) - Number(starred.has(a.id)));
+    const sorted = [...usable].sort((a, b) => {
+      const activeDiff = Number(b.id === (runningNode?.id ?? selected)) - Number(a.id === (runningNode?.id ?? selected));
+      if (activeDiff !== 0) return activeDiff;
+      const starDiff = Number(starred.has(b.id)) - Number(starred.has(a.id));
+      if (starDiff !== 0) return starDiff;
+      return (probe(a)?.milliseconds ?? Number.MAX_SAFE_INTEGER) - (probe(b)?.milliseconds ?? Number.MAX_SAFE_INTEGER);
+    });
     return sorted.slice(0, 6);
-  }, [nodes, starred, unavailableNodes]);
+  }, [latencies, nodes, runningNode?.id, selected, starred, unavailableNodes]);
 
   async function importSubscription(text: string, request?: SubscriptionRequest, customName?: string) {
     setImporting(true);
@@ -617,15 +676,44 @@ function App() {
 
   async function testNodes(items: NodeProfile[]) {
     if (!isTauri() || testing) return;
+    if (probeMode === "url" && running && runningOriginal && mode === "tun") {
+      setConnectionError("Mihomo TUN 运行期间不支持直接对 sing-box 节点做 URL 测速（会产生回环延迟）。请使用「Mihomo 策略组」测速，或切换为「TCP 握手延迟」。");
+      return;
+    }
     cancelTesting.current = false;
     setTesting(true);
+    setConnectionError("");
+    const queue = items.filter(node => !unavailableNodes.get(node.id));
+    if (!queue.length) {
+      setTesting(false);
+      return;
+    }
+    setProbeProgress({ done: 0, total: queue.length });
     const updates: Record<string, LatencyRecord> = {};
+    let doneCount = 0;
+
     try {
-      const batch = await invoke<string>("begin_probe_batch");
-      probeBatch.current = batch;
-      const queue = items.filter(node => !unavailableNodes.get(node.id));
-      let next = 0;
       const loadedMap = running && !runningOriginal ? session.current?.loaded : undefined;
+      let tempSessionId: string | undefined;
+      let tempTags = new Map<string, string>();
+
+      if (probeMode === "url") {
+        const unloaded = queue.filter(node => {
+          const loaded = loadedMap?.get(node.id);
+          return !(loaded && loaded.revision === nodeRevision(node) && !recovering);
+        });
+        if (unloaded.length > 0) {
+          const plan = buildSessionConfig(unloaded[0], unloaded, 18080, []);
+          tempSessionId = await invoke<string>("start_probe_session", { config: plan.config });
+          probeSessionId.current = tempSessionId;
+          for (const [id, info] of plan.loaded.entries()) {
+            tempTags.set(id, info.tag);
+          }
+        }
+      }
+
+      let next = 0;
+      const concurrency = probeMode === "tcp" ? 10 : 6;
 
       async function testQueue() {
         while (next < queue.length && !cancelTesting.current) {
@@ -635,20 +723,37 @@ function App() {
           let label: string;
           let milliseconds: number | undefined;
           try {
-            const loaded = loadedMap?.get(node.id);
-            if (loaded && loaded.revision === rev && !recovering) {
-              const ms = await invoke<number>("probe_loaded_node", {
-                tag: loaded.tag,
-                probeUrl,
-                timeoutMs: 5000,
+            if (probeMode === "tcp") {
+              const ms = await invoke<number>("probe_tcp_latency", {
+                server: node.server,
+                port: node.port,
+                timeoutMs: 3500,
               });
               milliseconds = ms;
-              label = `${ms} ms`;
+              label = `${ms} ms (TCP)`;
             } else {
-              const localPort = await invoke<number>("allocate_port");
-              if (cancelTesting.current) {
-                label = "已取消";
+              const loaded = loadedMap?.get(node.id);
+              if (loaded && loaded.revision === rev && !recovering) {
+                const ms = await invoke<number>("probe_loaded_node", {
+                  tag: loaded.tag,
+                  probeUrl,
+                  timeoutMs: 5000,
+                });
+                milliseconds = ms;
+                label = `${ms} ms`;
+              } else if (tempSessionId && tempTags.has(node.id)) {
+                const ms = await invoke<number>("probe_session_node", {
+                  session: tempSessionId,
+                  tag: tempTags.get(node.id)!,
+                  probeUrl,
+                  timeoutMs: 5000,
+                });
+                milliseconds = ms;
+                label = `${ms} ms`;
               } else {
+                const batch = probeBatch.current ?? (await invoke<string>("begin_probe_batch"));
+                probeBatch.current = batch;
+                const localPort = await invoke<number>("allocate_port");
                 const ms = await invoke<number>("probe_node", {
                   config: buildConfig(node, localPort),
                   port: localPort,
@@ -660,7 +765,7 @@ function App() {
               }
             }
           } catch (e) {
-            label = typeof e === "string" ? e : "测速失败";
+            label = cancelTesting.current ? "已取消" : typeof e === "string" ? e : "测速失败";
           }
           const record: LatencyRecord = {
             revision: rev,
@@ -669,11 +774,13 @@ function App() {
             testedAt: Date.now(),
           };
           updates[node.id] = record;
+          doneCount += 1;
+          setProbeProgress({ done: doneCount, total: queue.length });
           setLatencies(previous => ({ ...previous, [node.id]: record }));
         }
       }
 
-      await Promise.all(Array.from({ length: Math.min(6, queue.length) }, testQueue));
+      await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, testQueue));
       if (Object.keys(updates).length) {
         await saveSettings(state => ({
           ...state,
@@ -683,17 +790,41 @@ function App() {
     } catch (e) {
       setConnectionError(typeof e === "string" ? e : "启动测速失败");
     } finally {
+      const sid = probeSessionId.current;
+      probeSessionId.current = undefined;
+      if (sid) await invoke("stop_probe_session", { session: sid }).catch(() => {});
       const batch = probeBatch.current;
       probeBatch.current = undefined;
       if (batch) await invoke("cancel_probe_batch", { batch }).catch(() => {});
+      setProbeProgress(undefined);
       setTesting(false);
     }
   }
 
   function stopNodeTests() {
     cancelTesting.current = true;
+    const sid = probeSessionId.current;
+    if (sid) void invoke("stop_probe_session", { session: sid }).catch(() => {});
     const batch = probeBatch.current;
     if (batch) void invoke("cancel_probe_batch", { batch }).catch(() => setConnectionError("无法取消正在运行的测速"));
+  }
+
+  function pickFastestNode() {
+    const candidates = filtered
+      .filter(n => !unavailableNodes.get(n.id))
+      .map(n => ({ node: n, ms: probe(n)?.milliseconds }))
+      .filter((item): item is { node: NodeProfile; ms: number } => typeof item.ms === "number")
+      .sort((a, b) => a.ms - b.ms);
+    if (!candidates.length) {
+      setConnectionError("当前列表暂无有效延迟结果，请先点击「一键测速」。");
+      return;
+    }
+    void connectNode(candidates[0].node);
+  }
+
+  async function refreshAllSubscriptions() {
+    const remote = subscriptions.filter(s => !!s.source);
+    await Promise.all(remote.map(s => work.refresh(s.id).catch(() => {})));
   }
 
   async function showExitIp() {
@@ -1080,14 +1211,19 @@ function App() {
                     <span>节点健康与延迟</span>
                     {!originalName && current && isTauri() && (
                       <button type="button" className="link" disabled={testing} onClick={() => void testNodes([current])}>
-                        测速
+                        {testing ? "测速中…" : "测速"}
                       </button>
                     )}
                   </div>
-                  <strong>
-                    {nodeHealth ? nodeHealthLabels[nodeHealth] : (!originalName && current && probe(current)?.label) || (running ? "运行正常" : "待连接")}
+                  <strong style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span>{(!originalName && current && probe(current)?.label) || (running ? "运行中" : "待连接")}</span>
+                    {nodeHealth && (
+                      <span className={`badge ${nodeHealth === "healthy" ? "is-good" : nodeHealth === "unreachable" ? "is-bad" : "is-warn"}`}>
+                        {nodeHealth === "healthy" ? "正常" : nodeHealth === "checking" ? "探测中" : nodeHealth === "unreachable" ? "失联" : "不可检测"}
+                      </span>
+                    )}
                   </strong>
-                  <small>{checkResult || "点击上方“测试连通性”核实真实出站"}</small>
+                  <small>{checkResult || "点击上方“测试连通性”核实当前路由出站"}</small>
                 </div>
 
                 <div className="stat-card">
@@ -1111,6 +1247,10 @@ function App() {
                   mode={routingMode}
                   disabled={busy || recovering}
                   probeUrl={probeUrl}
+                  delays={mihomoDelays}
+                  compact
+                  onDelays={setMihomoDelays}
+                  onOpenFull={() => { setNodesTab("groups"); setPage("节点"); }}
                   onMode={value => void changeRouting(value)}
                   onChange={async (group, choice) => {
                     resetDiagnostics();
@@ -1198,151 +1338,344 @@ function App() {
           {page === "节点" && (
             <section>
               {runningOriginal && (
-                <div className="notice is-warn" style={{ marginBottom: 14 }}>
-                  <span>当前正在运行 Mihomo 原配置「{runningOriginal.name}」。点击任意节点「连接」将自动停止原配置并切换到 sing-box 节点模式。</span>
-                  <button type="button" className="mini-btn" onClick={() => setPage("概览")}>返回策略组</button>
+                <div className="panel" style={{ marginBottom: 14, padding: "12px 16px" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+                    <span className="muted">
+                      当前正在运行 Mihomo 原配置「<strong>{runningOriginal.name}</strong>」
+                    </span>
+                    <div className="mode-switch" role="tablist" aria-label="节点页视图">
+                      <button type="button" aria-pressed={nodesTab === "groups"} onClick={() => setNodesTab("groups")}>
+                        Mihomo 策略组
+                      </button>
+                      <button type="button" aria-pressed={nodesTab === "nodes"} onClick={() => setNodesTab("nodes")}>
+                        提取节点（sing-box）
+                      </button>
+                    </div>
+                  </div>
                 </div>
               )}
 
-              <div className="toolbar">
-                <label className="search">
-                  <Search size={15} />
-                  <input placeholder="搜索节点名、序号、协议或域名" value={search} onChange={e => setSearch(e.target.value)} />
-                </label>
-                {subscriptions.length > 1 && (
-                  <select className="toolbar-select" aria-label="筛选订阅来源" value={activeFilter?.id ?? ""} onChange={e => setSubscriptionFilter(e.target.value)}>
-                    <option value="">全部订阅</option>
-                    {subscriptions.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
-                  </select>
-                )}
-                {protocols.length > 1 && (
-                  <select className="toolbar-select" aria-label="筛选协议" value={protocolFilter} onChange={e => setProtocolFilter(e.target.value)}>
-                    <option value="">全部协议</option>
-                    {protocols.map(p => <option key={p} value={p}>{p.toUpperCase()}</option>)}
-                  </select>
-                )}
-                <select className="toolbar-select" aria-label="排序节点" value={nodeSort} onChange={e => setNodeSort(e.target.value)}>
-                  <option value="source">订阅顺序</option>
-                  <option value="latency">延迟优先</option>
-                  <option value="name">名称排序</option>
-                </select>
-                <button type="button" className="toolbar-pill" aria-pressed={onlyFavorites} onClick={() => setOnlyFavorites(v => !v)}>
-                  仅看收藏
-                </button>
-                <button type="button" className="toolbar-pill" aria-pressed={onlySupported} onClick={() => setOnlySupported(v => !v)}>
-                  隐藏不可用
-                </button>
-                <button
-                  type="button"
-                  className="mini-btn is-primary"
-                  disabled={(!testing && !filtered.length) || !isTauri()}
-                  onClick={() => (testing ? stopNodeTests() : void testNodes(filtered))}
-                >
-                  {testing ? "停止测速" : "一键测速"}
-                </button>
-                <span className="muted">{filtered.length} 个节点</span>
-                <div className="mode-switch" role="group" aria-label="路由模式" style={{ marginLeft: "auto" }}>
-                  {routingModes.map(option => (
-                    <button
-                      key={option.value}
-                      type="button"
-                      aria-pressed={routingMode === option.value}
-                      disabled={busy || recovering || !work.ready}
-                      onClick={() => void changeRouting(option.value)}
-                    >
-                      {option.label}
+              {runningOriginal && nodesTab === "groups" ? (
+                <MihomoGroups
+                  mode={routingMode}
+                  disabled={busy || recovering}
+                  probeUrl={probeUrl}
+                  delays={mihomoDelays}
+                  onDelays={setMihomoDelays}
+                  onMode={value => void changeRouting(value)}
+                  onChange={async (group, choice) => {
+                    resetDiagnostics();
+                    await saveSettings(state => ({
+                      ...state,
+                      subscriptions: state.subscriptions.map(profile =>
+                        profile.id === runningOriginal.id
+                          ? { ...profile, mihomoSelections: { ...profile.mihomoSelections, [group]: choice } }
+                          : profile,
+                      ),
+                    }));
+                  }}
+                />
+              ) : (
+                <>
+                  <div className="toolbar">
+                    <label className="search">
+                      <Search size={15} />
+                      <input placeholder="搜索节点名、序号、协议或域名" value={search} onChange={e => setSearch(e.target.value)} />
+                    </label>
+                    {subscriptions.length > 1 && (
+                      <select className="toolbar-select" aria-label="筛选订阅来源" value={activeFilter?.id ?? ""} onChange={e => setSubscriptionFilter(e.target.value)}>
+                        <option value="">全部订阅</option>
+                        {subscriptions.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                      </select>
+                    )}
+                    {protocols.length > 1 && (
+                      <select className="toolbar-select" aria-label="筛选协议" value={protocolFilter} onChange={e => setProtocolFilter(e.target.value)}>
+                        <option value="">全部协议</option>
+                        {protocols.map(p => <option key={p} value={p}>{p.toUpperCase()}</option>)}
+                      </select>
+                    )}
+                    <select className="toolbar-select" aria-label="排序节点" value={nodeSort} onChange={e => setNodeSort(e.target.value)}>
+                      <option value="source">订阅顺序</option>
+                      <option value="latency">延迟优先</option>
+                      <option value="name">名称排序</option>
+                    </select>
+                    <select className="toolbar-select" aria-label="测速模式" value={probeMode} disabled={testing} onChange={e => setProbeMode(e.target.value as "url" | "tcp")}>
+                      <option value="url">真连接延迟 (URL)</option>
+                      <option value="tcp">TCP 握手延迟</option>
+                    </select>
+                    <button type="button" className="toolbar-pill" aria-pressed={onlyFavorites} onClick={() => setOnlyFavorites(v => !v)}>
+                      收藏
                     </button>
-                  ))}
-                </div>
-              </div>
-
-              {connectionError && <div className="notice is-error" role="alert" style={{ marginBottom: 12 }}>{connectionError}</div>}
-              {activeFilter?.parsed.warnings.length ? (
-                <div className="notice is-warn" style={{ marginBottom: 12 }}>
-                  <span>该订阅有 {activeFilter.parsed.warnings.length} 项因格式或协议不支持未导入。</span>
-                </div>
-              ) : null}
-
-              <div className="node-grid">
-                {filtered.map(n => {
-                  const reason = unavailableNodes.get(n.id);
-                  const p = probe(n);
-                  const active = isSelected(n);
-                  return (
-                    <div
-                      className={`node-card ${active ? "selected" : ""} ${reason ? "is-unavailable" : ""}`}
-                      key={n.id}
-                      onDoubleClick={() => { if (!reason) void connectNode(n); }}
+                    <button type="button" className="toolbar-pill" aria-pressed={onlySupported} onClick={() => setOnlySupported(v => !v)}>
+                      仅可用
+                    </button>
+                    {subscriptions.length > 1 && !activeFilter && (
+                      <button type="button" className="toolbar-pill" aria-pressed={groupBySub} onClick={() => setGroupBySub(v => !v)}>
+                        按订阅分组
+                      </button>
+                    )}
+                    <div className="mode-switch" role="group" aria-label="视图模式">
+                      <button type="button" aria-pressed={nodeView === "list"} onClick={() => setNodeView("list")} title="列表视图">
+                        <LayoutList size={14} />
+                      </button>
+                      <button type="button" aria-pressed={nodeView === "grid"} onClick={() => setNodeView("grid")} title="卡片视图">
+                        <LayoutGrid size={14} />
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      className="mini-btn is-primary"
+                      disabled={(!testing && !filtered.length) || !isTauri()}
+                      onClick={() => (testing ? stopNodeTests() : void testNodes(filtered))}
                     >
-                      <div className="node-name">
-                        <span className="node-icon"><Globe2 size={17} /></span>
-                        <div>
-                          <strong title={n.name}><span className="source-index">#{n.sourceIndex}</span> {n.name}</strong>
-                          <small>{n.server}:{n.port}</small>
-                        </div>
-                      </div>
-                      <div className="node-meta-row">
-                        <span className="badge">{n.protocol.toUpperCase()} · {n.transport}{n.security !== "none" ? ` · ${n.security}` : ""}</span>
-                        <span className={`badge ${reason ? "is-bad" : p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
-                          {reason ? "不可用" : p?.label || "未测速"}
-                        </span>
-                      </div>
-                      {reason && <div className="error" style={{ lineHeight: 1.4 }}>{reason}</div>}
-                      <div className="node-actions">
-                        <div className="node-actions-left">
-                          {!reason && (
-                            <>
+                      {testing ? `停止 (${probeProgress?.done ?? 0}/${probeProgress?.total ?? filtered.length})` : "一键测速"}
+                    </button>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      disabled={busy || recovering || !filtered.length || !isTauri()}
+                      onClick={pickFastestNode}
+                      title="自动选择当前列表延迟最低的节点"
+                    >
+                      <Zap size={13} /> 选最快
+                    </button>
+                    <div className="mode-switch" role="group" aria-label="路由模式" style={{ marginLeft: "auto" }}>
+                      {routingModes.map(option => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          aria-pressed={routingMode === option.value}
+                          disabled={busy || recovering || !work.ready}
+                          onClick={() => void changeRouting(option.value)}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {regionCounts.length > 1 && (
+                    <div className="region-bar" role="group" aria-label="按地区筛选">
+                      <button
+                        type="button"
+                        className="toolbar-pill"
+                        aria-pressed={regionFilter === ""}
+                        onClick={() => setRegionFilter("")}
+                      >
+                        全部 ({(activeFilter?.parsed.nodes ?? nodes).length})
+                      </button>
+                      {regionCounts.map(([reg, count]) => (
+                        <button
+                          key={reg}
+                          type="button"
+                          className="toolbar-pill"
+                          aria-pressed={regionFilter === reg}
+                          onClick={() => setRegionFilter(prev => (prev === reg ? "" : reg))}
+                        >
+                          {reg} ({count})
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {connectionError && <div className="notice is-error" role="alert" style={{ marginBottom: 12 }}>{connectionError}</div>}
+                  {activeFilter?.parsed.warnings.length ? (
+                    <div className="notice is-warn" style={{ marginBottom: 12 }}>
+                      <span>该订阅有 {activeFilter.parsed.warnings.length} 项因格式或协议不支持未导入。</span>
+                    </div>
+                  ) : null}
+
+                  {(() => {
+                    const renderNodeItem = (n: NodeProfile) => {
+                      const reason = unavailableNodes.get(n.id);
+                      const p = probe(n);
+                      const active = isSelected(n);
+                      const region = nodeRegion(n.name);
+                      const subLabel = !activeFilter && subscriptions.length > 1 && !groupBySub ? nodeSubName.get(n.id) : undefined;
+
+                      if (nodeView === "list") {
+                        return (
+                          <div
+                            className={`node-list-row ${active ? "selected" : ""} ${reason ? "is-unavailable" : ""}`}
+                            key={n.id}
+                            onDoubleClick={() => { if (!reason) void connectNode(n); }}
+                          >
+                            <div className="node-list-main">
+                              <div className="node-list-title">
+                                <span className="badge">{region}</span>
+                                <span className="source-index">#{n.sourceIndex}</span>
+                                <strong>{n.name}</strong>
+                                {active && <span className="badge is-accent">{running ? "使用中" : "已选中"}</span>}
+                              </div>
+                              <div className="node-list-sub">
+                                <span>{n.server}:{n.port}</span>
+                                <span>· {n.protocol.toUpperCase()} / {n.transport}{n.security !== "none" ? ` / ${n.security}` : ""}</span>
+                                {subLabel && <span>· {subLabel}</span>}
+                                {reason && <span className="error">· {reason}</span>}
+                              </div>
+                            </div>
+                            <span className={`badge ${reason ? "is-bad" : p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
+                              {reason ? "不可用" : p?.label || "未测速"}
+                            </span>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              {!reason && (
+                                <>
+                                  <button
+                                    type="button"
+                                    className={`mini-btn ${active ? "is-primary" : ""}`}
+                                    disabled={busy || recovering || (running && !runningOriginal && active)}
+                                    onClick={() => void selectNode(n)}
+                                  >
+                                    {active ? (running ? "使用中" : "已选中") : running ? "切换" : "选中"}
+                                  </button>
+                                  {(!running || runningOriginal) && (
+                                    <button
+                                      type="button"
+                                      className="mini-btn is-primary"
+                                      disabled={busy || recovering || !isTauri()}
+                                      onClick={() => void connectNode(n)}
+                                    >
+                                      连接
+                                    </button>
+                                  )}
+                                </>
+                              )}
+                              <button type="button" className="link" onClick={() => { setDetailCopied(false); setDetailNode(n); }}>详情</button>
                               <button
                                 type="button"
-                                className={`mini-btn ${active ? "is-primary" : ""}`}
-                                disabled={busy || recovering || (running && !runningOriginal && active)}
-                                onClick={() => void selectNode(n)}
+                                className="link node-favorite"
+                                aria-pressed={starred.has(n.id)}
+                                aria-label={starred.has(n.id) ? `取消收藏 ${n.name}` : `收藏 ${n.name}`}
+                                onClick={() =>
+                                  void saveSettings(state => ({
+                                    ...state,
+                                    favorites: state.favorites.includes(n.id)
+                                      ? state.favorites.filter(id => id !== n.id)
+                                      : [...state.favorites, n.id],
+                                  }))
+                                }
                               >
-                                {active ? (running ? "使用中" : "已选中") : running ? "切换" : "选中"}
+                                <Star size={16} aria-hidden />
                               </button>
-                              {(!running || runningOriginal) && (
-                                <button
-                                  type="button"
-                                  className="mini-btn is-primary"
-                                  disabled={busy || recovering || !isTauri()}
-                                  onClick={() => void connectNode(n)}
-                                >
-                                  连接
-                                </button>
-                              )}
-                            </>
-                          )}
-                          <button type="button" className="link" onClick={() => setDetailNode(n)}>详情</button>
-                        </div>
-                        <button
-                          type="button"
-                          className="link node-favorite"
-                          aria-pressed={starred.has(n.id)}
-                          aria-label={starred.has(n.id) ? `取消收藏 ${n.name}` : `收藏 ${n.name}`}
-                          onClick={() =>
-                            void saveSettings(state => ({
-                              ...state,
-                              favorites: state.favorites.includes(n.id)
-                                ? state.favorites.filter(id => id !== n.id)
-                                : [...state.favorites, n.id],
-                            }))
-                          }
+                            </div>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div
+                          className={`node-card ${active ? "selected" : ""} ${reason ? "is-unavailable" : ""}`}
+                          key={n.id}
+                          onDoubleClick={() => { if (!reason) void connectNode(n); }}
                         >
-                          <Star size={16} aria-hidden />
-                        </button>
+                          <div className="node-name">
+                            <span className="node-icon"><Globe2 size={17} /></span>
+                            <div>
+                              <strong title={n.name} style={{ whiteSpace: "normal", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+                                <span className="source-index">#{n.sourceIndex}</span> {n.name}
+                              </strong>
+                              <small>{n.server}:{n.port}</small>
+                            </div>
+                          </div>
+                          <div className="node-meta-row">
+                            <span className="badge">{region} · {n.protocol.toUpperCase()} · {n.transport}</span>
+                            <span className={`badge ${reason ? "is-bad" : p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
+                              {reason ? "不可用" : p?.label || "未测速"}
+                            </span>
+                          </div>
+                          {reason && <div className="error" style={{ lineHeight: 1.4 }}>{reason}</div>}
+                          <div className="node-actions">
+                            <div className="node-actions-left">
+                              {!reason && (
+                                <>
+                                  <button
+                                    type="button"
+                                    className={`mini-btn ${active ? "is-primary" : ""}`}
+                                    disabled={busy || recovering || (running && !runningOriginal && active)}
+                                    onClick={() => void selectNode(n)}
+                                  >
+                                    {active ? (running ? "使用中" : "已选中") : running ? "切换" : "选中"}
+                                  </button>
+                                  {(!running || runningOriginal) && (
+                                    <button
+                                      type="button"
+                                      className="mini-btn is-primary"
+                                      disabled={busy || recovering || !isTauri()}
+                                      onClick={() => void connectNode(n)}
+                                    >
+                                      连接
+                                    </button>
+                                  )}
+                                </>
+                              )}
+                              <button type="button" className="link" onClick={() => { setDetailCopied(false); setDetailNode(n); }}>详情</button>
+                            </div>
+                            <button
+                              type="button"
+                              className="link node-favorite"
+                              aria-pressed={starred.has(n.id)}
+                              aria-label={starred.has(n.id) ? `取消收藏 ${n.name}` : `收藏 ${n.name}`}
+                              onClick={() =>
+                                void saveSettings(state => ({
+                                  ...state,
+                                  favorites: state.favorites.includes(n.id)
+                                    ? state.favorites.filter(id => id !== n.id)
+                                    : [...state.favorites, n.id],
+                                }))
+                              }
+                            >
+                              <Star size={16} aria-hidden />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    };
+
+                    if (!filtered.length) {
+                      return (
+                        <div className="empty">
+                          {nodes.length ? "没有符合筛选条件的节点" : "还没有节点，点击右上角「导入订阅」。"}
+                        </div>
+                      );
+                    }
+
+                    if (groupBySub && subscriptions.length > 1 && !activeFilter) {
+                      const filteredIds = new Set(filtered.map(n => n.id));
+                      return subscriptions.map(sub => {
+                        const groupNodes = sub.parsed.nodes.filter(n => filteredIds.has(n.id));
+                        if (!groupNodes.length) return null;
+                        const sortedGroup = nodeSort === "latency"
+                          ? [...groupNodes].sort((a, b) => (probe(a)?.milliseconds ?? Number.MAX_SAFE_INTEGER) - (probe(b)?.milliseconds ?? Number.MAX_SAFE_INTEGER))
+                          : nodeSort === "name"
+                            ? [...groupNodes].sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+                            : groupNodes;
+                        return (
+                          <div className="node-group-box" key={sub.id}>
+                            <div className="node-group-head">
+                              <strong>{sub.name} ({sortedGroup.length})</strong>
+                              <button type="button" className="mini-btn" disabled={testing || !isTauri()} onClick={() => void testNodes(sortedGroup)}>
+                                测本组
+                              </button>
+                            </div>
+                            <div className={nodeView === "list" ? "node-list" : "node-grid"}>
+                              {sortedGroup.map(renderNodeItem)}
+                            </div>
+                          </div>
+                        );
+                      });
+                    }
+
+                    return (
+                      <div className={nodeView === "list" ? "node-list" : "node-grid"}>
+                        {filtered.map(renderNodeItem)}
                       </div>
-                    </div>
-                  );
-                })}
-                {!filtered.length && (
-                  <div className="empty">
-                    {nodes.length ? "没有符合筛选条件的节点" : "还没有节点，点击右上角「导入订阅」。"}
-                  </div>
-                )}
-              </div>
-              <p className="rule-hint" style={{ marginTop: 12 }}>
-                提示：双击节点卡片可直接连接/切换。运行节点模式时测速将直接复用当前内核通道，无需重拉进程。
-              </p>
+                    );
+                  })()}
+                  <p className="rule-hint" style={{ marginTop: 12 }}>
+                    提示：真连接延迟（URL）使用统一单实例 Clash API 测速，反映完整代理+TLS 握手耗时；TCP 握手延迟反映节点服务器直连 RTT。双击节点即可连接/切换。
+                  </p>
+                </>
+              )}
             </section>
           )}
 
@@ -1350,18 +1683,30 @@ function App() {
             <section className="panel">
               <div className="panel-head">
                 <h2>订阅来源</h2>
-                <label className="refresh-setting">默认自动更新
-                  <select
-                    value={work.workspace.refreshHours}
-                    disabled={!work.ready || !isTauri()}
-                    onChange={event => {
-                      const refreshHours = parseRefreshHours(Number(event.target.value)) ?? 0;
-                      void saveSettings(state => ({ ...state, refreshHours }));
-                    }}
-                  >
-                    {refreshOptions.map(([hours, label]) => <option key={hours} value={hours}>{label}</option>)}
-                  </select>
-                </label>
+                <div className="event-controls">
+                  {subscriptions.some(s => !!s.source) && (
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      disabled={!isTauri() || Object.values(work.refreshStatus).some(s => s?.pending)}
+                      onClick={() => void refreshAllSubscriptions()}
+                    >
+                      <RefreshCw size={13} /> 更新全部
+                    </button>
+                  )}
+                  <label className="refresh-setting">默认自动更新
+                    <select
+                      value={work.workspace.refreshHours}
+                      disabled={!work.ready || !isTauri()}
+                      onChange={event => {
+                        const refreshHours = parseRefreshHours(Number(event.target.value)) ?? 0;
+                        void saveSettings(state => ({ ...state, refreshHours }));
+                      }}
+                    >
+                      {refreshOptions.map(([hours, label]) => <option key={hours} value={hours}>{label}</option>)}
+                    </select>
+                  </label>
+                </div>
               </div>
               {subscriptions.length ? (
                 <div className="subscription-grid">
@@ -1380,9 +1725,11 @@ function App() {
                       onBrowse={() => {
                         setSubscriptionFilter(profile.id);
                         setProtocolFilter("");
+                        setRegionFilter("");
                         setSearch("");
                         setOnlyFavorites(false);
                         setOnlySupported(false);
+                        setNodesTab("nodes");
                         setPage("节点");
                       }}
                       onRename={name =>
@@ -1507,12 +1854,25 @@ function App() {
                 不可用原因：{unavailableNodes.get(detailNode.id)}
               </div>
             )}
+            <div className="env-row"><span>地区识别</span><strong>{nodeRegion(detailNode.name)}</strong></div>
+            <div className="env-row"><span>所属订阅</span><strong>{nodeSubName.get(detailNode.id) ?? "—"}</strong></div>
             <div className="env-row"><span>协议</span><strong>{detailNode.protocol}</strong></div>
             <div className="env-row"><span>传输方式</span><strong>{detailNode.transport}</strong></div>
             <div className="env-row"><span>安全传输</span><strong>{detailNode.security}</strong></div>
             <div className="env-row"><span>订阅序号</span><strong>#{detailNode.sourceIndex ?? "—"}</strong></div>
             <div className="modal-actions">
               <button type="button" className="btn" onClick={() => setDetailNode(undefined)}>关闭</button>
+              {detailNode.uri && (
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(detailNode.uri!).then(() => setDetailCopied(true)).catch(() => {});
+                  }}
+                >
+                  {detailCopied ? <><Check size={14} /> 已复制链接</> : <><Copy size={14} /> 复制分享链接</>}
+                </button>
+              )}
               {!unavailableNodes.get(detailNode.id) && isTauri() && (
                 <button
                   type="button"

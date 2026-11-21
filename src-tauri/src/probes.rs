@@ -1,5 +1,12 @@
 use serde_json::Value;
-use std::{net::SocketAddr, path::Path, process::Stdio, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::Path,
+    process::Stdio,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 use tokio::{io::AsyncWriteExt, process::Child, sync::watch};
 
 const DOWNLOAD_LIMIT: u64 = 8 * 1024 * 1024;
@@ -346,6 +353,131 @@ async fn download_sample(
         milliseconds: elapsed.as_millis().max(1) as u64,
         megabits_per_second: bytes as f64 * 8.0 / elapsed.as_secs_f64().max(0.001) / 1_000_000.0,
     })
+}
+
+#[derive(Default)]
+pub struct ProbeSessions(tokio::sync::Mutex<HashMap<uuid::Uuid, ProbeSession>>);
+
+struct ProbeSession {
+    controller: crate::telemetry::Controller,
+    child: Child,
+}
+
+#[tauri::command]
+pub async fn start_probe_session(
+    mut config: Value,
+    state: tauri::State<'_, ProbeSessions>,
+) -> Result<uuid::Uuid, String> {
+    if !config
+        .get("outbounds")
+        .and_then(Value::as_array)
+        .is_some_and(|list| !list.is_empty())
+    {
+        return Err("没有可供测速的节点配置".into());
+    }
+    let core = crate::core_path()?;
+    let controller = crate::telemetry::Controller::new(0)?;
+    if let Some(root) = config.as_object_mut() {
+        root.insert("inbounds".into(), serde_json::json!([]));
+    }
+    controller.configure(&mut config, "rule");
+    let content = serde_json::to_vec(&config).map_err(|_| "测速配置无效")?;
+    let mut child = launch(&core, "run", &content).await?;
+    let ready = tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            if child
+                .try_wait()
+                .map_err(|_| "无法检查测速内核")?
+                .is_some()
+            {
+                return Err("测速内核启动失败".to_owned());
+            }
+            let check = controller.clone();
+            if tokio::task::spawn_blocking(move || check.ready())
+                .await
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    })
+    .await
+    .map_err(|_| "测速内核启动超时".to_owned());
+    match ready {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let _ = child.kill().await;
+            return Err(err);
+        }
+        Err(err) => {
+            let _ = child.kill().await;
+            return Err(err);
+        }
+    }
+    let id = uuid::Uuid::new_v4();
+    let mut guard = state.0.lock().await;
+    for (_, mut old) in guard.drain() {
+        let _ = old.child.kill().await;
+    }
+    guard.insert(id, ProbeSession { controller, child });
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn probe_session_node(
+    session: uuid::Uuid,
+    tag: String,
+    probe_url: Option<String>,
+    timeout_ms: Option<u64>,
+    state: tauri::State<'_, ProbeSessions>,
+) -> Result<u64, String> {
+    let controller = {
+        let guard = state.0.lock().await;
+        guard
+            .get(&session)
+            .map(|entry| entry.controller.clone())
+            .ok_or("测速会话已结束")?
+    };
+    let url = probe_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| value.starts_with("https://") || value.starts_with("http://"))
+        .unwrap_or("https://www.gstatic.com/generate_204");
+    controller
+        .probe_delay(&tag, url, timeout_ms.unwrap_or(5000))
+        .await
+}
+
+#[tauri::command]
+pub async fn stop_probe_session(
+    session: uuid::Uuid,
+    state: tauri::State<'_, ProbeSessions>,
+) -> Result<(), String> {
+    let removed = state.0.lock().await.remove(&session);
+    if let Some(mut entry) = removed {
+        let _ = entry.child.kill().await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn probe_tcp_latency(
+    server: String,
+    port: u16,
+    timeout_ms: Option<u64>,
+) -> Result<u64, String> {
+    let host = server.trim();
+    if host.is_empty() || port == 0 {
+        return Err("节点地址或端口无效".into());
+    }
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(3500).clamp(500, 10000));
+    let started = Instant::now();
+    tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| "TCP 握手超时".to_owned())?
+        .map_err(|_| "TCP 连接失败".to_owned())?;
+    Ok(started.elapsed().as_millis().max(1) as u64)
 }
 
 #[derive(Default)]

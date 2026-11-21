@@ -54,6 +54,7 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
   const [saving, setSaving] = useState(false);
   const [requestError, setRequestError] = useState("");
   const [confirmRemove, setConfirmRemove] = useState(false);
+  const [copiedSource, setCopiedSource] = useState(false);
   const supported = profile.parsed.nodes.filter(node => !connectionSupport(node)).length;
   const usage = profile.usage;
   const used = usage?.upload != null && usage.download != null ? usage.upload + usage.download : null;
@@ -147,6 +148,12 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
           setRequestError("");
           setDraft({ request: profile.request, refreshHours: profile.refreshHours });
         }}>设置</button>}
+        {profile.source && <button className="link" onClick={() => {
+          void navigator.clipboard.writeText(profile.source).then(() => {
+            setCopiedSource(true);
+            window.setTimeout(() => setCopiedSource(false), 1500);
+          }).catch(() => {});
+        }}>{copiedSource ? "已复制链接" : "复制链接"}</button>}
         <button className="link" onClick={() => setName(profile.name)}>重命名</button>
         {confirmRemove ? <>
           <button className="link error" onClick={onRemove}>确认移除</button>
