@@ -162,12 +162,32 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let policy_dns = session.policy_dns.unwrap();
     assert!(session.running() && session.controller.ready());
     assert!(UdpSocket::bind((TUN_ADDRESS, 0)).is_ok());
-
-    let mut stream = TcpStream::connect_timeout(
-        &format!("{TARGET}:8089").parse().unwrap(),
-        Duration::from_secs(4),
-    )
-    .unwrap();
+    let target_address: std::net::Ipv4Addr = TARGET.parse().unwrap();
+    let address = SocketAddr::from((target_address, 8089));
+    let adapter = tun_interface(&session.id);
+    let mut best = 0;
+    let result = unsafe {
+        winapi::um::iphlpapi::GetBestInterface(
+            u32::from_ne_bytes(target_address.octets()),
+            &mut best,
+        )
+    };
+    assert_eq!(result, 0, "Windows could not resolve a route to {TARGET}");
+    assert_eq!(
+        Some(best),
+        interface_index(&adapter),
+        "Windows chose a different adapter for {TARGET}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(9);
+    let mut stream = loop {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(1500)) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline && session.running() => {
+                thread::sleep(Duration::from_millis(70));
+            }
+            Err(error) => panic!("The installed TUN's connection to {address} failed: {error}"),
+        }
+    };
     stream
         .set_read_timeout(Some(Duration::from_secs(4)))
         .unwrap();

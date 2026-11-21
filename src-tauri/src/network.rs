@@ -14,7 +14,15 @@ use std::{
     process::{Child, Stdio},
 };
 use winapi::{
-    shared::minwindef::{FALSE, TRUE},
+    shared::{
+        ifdef::NET_LUID,
+        minwindef::{FALSE, TRUE},
+        netioapi::{
+            ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, FreeMibTable,
+            GetIpForwardTable2, MIB_IPFORWARD_ROW2,
+        },
+        ws2def::AF_INET,
+    },
     um::{
         handleapi::CloseHandle,
         jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject},
@@ -65,6 +73,43 @@ impl CoreSettings {
 
 fn tun_interface(token: &str) -> String {
     format!("RelayDesk-{}", &token[..12])
+}
+
+fn interface_index(alias: &str) -> Option<u32> {
+    let name = wide(alias);
+    let mut luid = NET_LUID { Value: 0 };
+    let mut index = 0;
+    unsafe {
+        if ConvertInterfaceAliasToLuid(name.as_ptr(), &mut luid) == 0
+            && ConvertInterfaceLuidToIndex(&luid, &mut index) == 0
+        {
+            Some(index)
+        } else {
+            None
+        }
+    }
+}
+
+fn tun_route_ready(alias: &str) -> bool {
+    let Some(index) = interface_index(alias) else {
+        return false;
+    };
+    let mut table = ptr::null_mut();
+    unsafe {
+        if GetIpForwardTable2(AF_INET as u16, &mut table) != 0 || table.is_null() {
+            return false;
+        }
+        // Windows allocates NumEntries rows after the header, including SDK alignment padding.
+        let rows = std::slice::from_raw_parts(
+            ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>(),
+            (*table).NumEntries as usize,
+        );
+        let ready = rows
+            .iter()
+            .any(|row| row.InterfaceIndex == index && row.DestinationPrefix.PrefixLength == 0);
+        FreeMibTable(table.cast());
+        ready
+    }
 }
 
 #[derive(Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
@@ -1064,6 +1109,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     {
         return Err("TUN 转发参数不符合入口类型".into());
     }
+    let interface = tun_interface(token);
     let mut dependency = None;
     let home = if core == Core::Mihomo {
         if mode == "tun" {
@@ -1099,11 +1145,11 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             OpenProcess(SYNCHRONIZE, FALSE, target.policy_pid)
         })?);
         let program = crate::bundled_binary("mihomo.exe")?;
-        config = capture_config(&target, port, &tun_interface(token), &program);
+        config = capture_config(&target, port, &interface, &program);
         None
     } else {
         if mode == "tun" {
-            config = tun_config(&config, port, &tun_interface(token)).ok_or("TUN 配置无效")?;
+            config = tun_config(&config, port, &interface).ok_or("TUN 配置无效")?;
         }
         add_routing_modes(&mut config, mode == "tun").ok_or("无法配置路由模式")?;
         controller.configure(&mut config, routing_mode.name());
@@ -1200,8 +1246,9 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             let _ = child.wait();
             return Err("本地代理入口未就绪".into());
         }
-        let tun_ready =
-            mode != "tun" || UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_ok();
+        let tun_ready = mode != "tun"
+            || (UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_ok()
+                && tun_route_ready(&interface));
         let dns_ready = policy_dns.is_none_or(|dns| UdpSocket::bind(("127.0.0.1", dns)).is_err());
         if tun_ready
             && dns_ready
