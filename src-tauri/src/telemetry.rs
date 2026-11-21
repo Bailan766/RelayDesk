@@ -221,7 +221,8 @@ impl Controller {
         if !response.status().is_success() {
             return Err("节点连接失败或超时".into());
         }
-        let parsed: Delay = response.json().await.map_err(|_| "测速响应无效")?;
+        let bytes = response.bytes().await.map_err(|_| "测速响应无效")?;
+        let parsed: Delay = serde_json::from_slice(&bytes).map_err(|_| "测速响应无效")?;
         Ok(parsed.delay)
     }
 
@@ -250,9 +251,8 @@ impl Controller {
         if !response.status().is_success() {
             return Err("策略组测速失败".into());
         }
-        response
-            .json::<std::collections::BTreeMap<String, u64>>()
-            .await
+        let bytes = response.bytes().await.map_err(|_| "策略组测速响应无效")?;
+        serde_json::from_slice::<std::collections::BTreeMap<String, u64>>(&bytes)
             .map_err(|_| "策略组测速响应无效".into())
     }
 

@@ -42,26 +42,28 @@ pub async fn check_exit_ip_detail(port: u16) -> Result<ExitIpDetail, String> {
         .map_err(|_| "无法初始化出口检查")?;
     if let Ok(response) = client.get("https://ipwho.is/").send().await {
         if response.status().is_success() {
-            if let Ok(body) = response.json::<Value>().await {
-                if body.get("success").and_then(Value::as_bool) != Some(false) {
-                    if let Some(ip_str) = body.get("ip").and_then(Value::as_str) {
-                        if ip_str.trim().parse::<std::net::IpAddr>().is_ok() {
-                            let non_empty = |v: Option<&str>| {
-                                v.map(str::trim)
-                                    .filter(|s| !s.is_empty())
-                                    .map(str::to_owned)
-                            };
-                            return Ok(ExitIpDetail {
-                                ip: ip_str.trim().to_owned(),
-                                country: non_empty(body.get("country").and_then(Value::as_str)),
-                                region: non_empty(body.get("region").and_then(Value::as_str)),
-                                city: non_empty(body.get("city").and_then(Value::as_str)),
-                                isp: non_empty(
-                                    body.get("connection")
-                                        .and_then(|c| c.get("isp"))
-                                        .and_then(Value::as_str),
-                                ),
-                            });
+            if let Ok(bytes) = response.bytes().await {
+                if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+                    if body.get("success").and_then(Value::as_bool) != Some(false) {
+                        if let Some(ip_str) = body.get("ip").and_then(Value::as_str) {
+                            if ip_str.trim().parse::<std::net::IpAddr>().is_ok() {
+                                let non_empty = |v: Option<&str>| {
+                                    v.map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_owned)
+                                };
+                                return Ok(ExitIpDetail {
+                                    ip: ip_str.trim().to_owned(),
+                                    country: non_empty(body.get("country").and_then(Value::as_str)),
+                                    region: non_empty(body.get("region").and_then(Value::as_str)),
+                                    city: non_empty(body.get("city").and_then(Value::as_str)),
+                                    isp: non_empty(
+                                        body.get("connection")
+                                            .and_then(|c| c.get("isp"))
+                                            .and_then(Value::as_str),
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -237,7 +239,8 @@ pub async fn check_unlock_service(service: &str, port: u16) -> Result<UnlockResu
         "哔哩哔哩大陆" => {
             match get("https://api.bilibili.com/pgc/player/web/playurl?avid=82846771&cid=141738666&qn=0&type=&otype=json&ep_id=300998&fourk=1&fnver=0&fnval=16&module=bangumi").await {
                 Ok(resp) if resp.status().is_success() => {
-                    let json = resp.json::<Value>().await.unwrap_or_default();
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    let json: Value = serde_json::from_slice(&bytes).unwrap_or_default();
                     if json.get("code").and_then(Value::as_i64) == Some(0) {
                         ("available", Some("CN".to_owned()), "可播放大陆限定番剧".to_owned())
                     } else {
@@ -251,7 +254,8 @@ pub async fn check_unlock_service(service: &str, port: u16) -> Result<UnlockResu
         "哔哩哔哩港澳台" => {
             match get("https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777&qn=0&type=&otype=json&ep_id=183799&fourk=1&fnver=0&fnval=16&module=bangumi").await {
                 Ok(resp) if resp.status().is_success() => {
-                    let json = resp.json::<Value>().await.unwrap_or_default();
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    let json: Value = serde_json::from_slice(&bytes).unwrap_or_default();
                     if json.get("code").and_then(Value::as_i64) == Some(0) {
                         ("available", Some("HK/TW".to_owned()), "可播放港澳台限定番剧".to_owned())
                     } else {
@@ -264,7 +268,8 @@ pub async fn check_unlock_service(service: &str, port: u16) -> Result<UnlockResu
         }
         "Bahamut Anime" => match get("https://ani.gamer.com.tw/ajax/token.php?adID=89422&sn=14667").await {
             Ok(resp) if resp.status().is_success() => {
-                let json = resp.json::<Value>().await.unwrap_or_default();
+                let bytes = resp.bytes().await.unwrap_or_default();
+                let json: Value = serde_json::from_slice(&bytes).unwrap_or_default();
                 if json.get("animeSn").is_some() {
                     ("available", Some("TW".to_owned()), "解锁动画疯".to_owned())
                 } else {
