@@ -2,7 +2,8 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   deserializeWorkspace, emptyWorkspace, receiveSubscription, replaceSubscription,
-  serializeWorkspace, type SubscriptionDownload, type SubscriptionRequest, type Workspace,
+  serializeWorkspace, subscriptionRefreshDue, type Subscription, type SubscriptionDownload,
+  type SubscriptionRequest, type Workspace,
 } from "./workspace";
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -26,6 +27,12 @@ export function useWorkspace() {
   const [refreshStatus, setRefreshStatus] = useState<Record<string, RefreshStatus>>({});
   const refreshes = useRef(new Map<string, Promise<void>>());
   const lastAttempt = useRef(new Map<string, number>());
+  const refreshSchedule = JSON.stringify(workspace.subscriptions.flatMap(profile =>
+    profile.source && profile.refreshHours !== undefined ? [[profile.id, profile.refreshHours]] : []
+  ));
+  const refreshEnabled = workspace.refreshHours > 0 || workspace.subscriptions.some(profile =>
+    profile.source && (profile.refreshHours ?? 0) > 0
+  );
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -82,35 +89,46 @@ export function useWorkspace() {
     return task;
   }, [commit]);
 
-  function configureRequest(id: string, request: SubscriptionRequest) {
+  function configureSubscription(id: string, patch: Partial<Pick<Subscription, "request" | "refreshHours">>) {
     return commit(state => {
       const existing = state.subscriptions.find(profile => profile.id === id);
-      if (!existing || (existing.request.route === request.route && existing.request.userAgent === request.userAgent)) return state;
+      if (!existing?.source) return state;
+      const next = { ...existing, ...patch };
+      const requestChanged = existing.request.route !== next.request.route || existing.request.userAgent !== next.request.userAgent;
+      if (!requestChanged && existing.refreshHours === next.refreshHours) return state;
+      if (!requestChanged) next.request = existing.request;
       return {
         ...state,
-        subscriptions: state.subscriptions.map(profile => profile.id === id ? { ...profile, request } : profile),
+        subscriptions: state.subscriptions.map(profile => profile.id === id ? next : profile),
       };
     });
   }
 
   useEffect(() => {
-    if (!ready || !workspace.refreshHours || !isTauri()) return;
+    if (!ready || !refreshEnabled || !isTauri()) return;
+    let cancelled = false;
     async function refreshDue() {
-      const interval = current.current.refreshHours * 3_600_000;
-      if (!interval) return;
-      const due = current.current.subscriptions.filter(profile => profile.source
-        && Date.now() - (profile.updatedAt ?? 0) >= interval
-        && Date.now() - (lastAttempt.current.get(profile.id) ?? 0) >= 15 * 60_000);
-      for (const profile of due) {
-        if (!current.current.refreshHours) break;
-        if (Date.now() - (lastAttempt.current.get(profile.id) ?? 0) < 15 * 60_000) continue;
-        await refresh(profile.id).catch(() => {});
+      const initial = current.current;
+      const now = Date.now();
+      const candidates = initial.subscriptions.filter(profile =>
+        subscriptionRefreshDue(profile, initial.refreshHours, now, lastAttempt.current.get(profile.id))
+      );
+      for (const { id } of candidates) {
+        if (cancelled) break;
+        const { subscriptions, refreshHours } = current.current;
+        const profile = subscriptions.find(item => item.id === id);
+        if (profile && subscriptionRefreshDue(profile, refreshHours, Date.now(), lastAttempt.current.get(id))) {
+          await refresh(id).catch(() => {});
+        }
       }
     }
     void refreshDue();
     const timer = window.setInterval(() => void refreshDue(), 60_000);
-    return () => window.clearInterval(timer);
-  }, [ready, refresh, workspace.refreshHours]);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [ready, refresh, refreshEnabled, workspace.refreshHours, refreshSchedule]);
 
   async function add(raw: string, request?: SubscriptionRequest) {
     const text = raw.trim();
@@ -119,7 +137,7 @@ export function useWorkspace() {
     const previous = source ? current.current.subscriptions.find(item => item.source === source) : undefined;
     if (previous) {
       if (request) {
-        await configureRequest(previous.id, request);
+        await configureSubscription(previous.id, { request });
         await refreshes.current.get(previous.id)?.catch(() => {});
       }
       await refresh(previous.id);
@@ -133,5 +151,5 @@ export function useWorkspace() {
     return !!subscription.parsed.mihomo;
   }
 
-  return { workspace, ready, storageError, commit, add, refresh, refreshStatus, configureRequest };
+  return { workspace, ready, storageError, commit, add, refresh, refreshStatus, configureSubscription };
 }

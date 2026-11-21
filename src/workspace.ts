@@ -8,6 +8,9 @@ export type SubscriptionDownload = { content: string; usage: Usage | null };
 export type SubscriptionRequest = { route: "automatic" | "direct" | "relaydesk"; userAgent: string };
 export const defaultSubscriptionRequest: SubscriptionRequest = { route: "automatic", userAgent: "" };
 
+export const refreshOptions = [[0, "关闭"], [1, "每小时"], [6, "每 6 小时"], [24, "每天"]] as const;
+export type RefreshHours = (typeof refreshOptions)[number][0];
+
 export type Subscription = {
   id: string;
   name: string;
@@ -16,6 +19,7 @@ export type Subscription = {
   updatedAt: number | null;
   usage: Usage | null;
   request: SubscriptionRequest;
+  refreshHours?: RefreshHours;
   mihomoSelections: Record<string, string>;
   mihomoMode?: RoutingMode;
   parsed: ImportResult;
@@ -50,6 +54,22 @@ export const emptyWorkspace: Workspace = {
 export function subscriptionHost(source: string): string {
   try { return new URL(source).hostname; }
   catch { return ""; }
+}
+
+export function parseRefreshHours(value: unknown): RefreshHours | undefined {
+  return refreshOptions.find(([hours]) => hours === value)?.[0];
+}
+
+export function subscriptionRefreshDue(
+  profile: Pick<Subscription, "source" | "refreshHours" | "updatedAt">,
+  defaultHours: number,
+  now: number,
+  lastAttempt?: number,
+): boolean {
+  const hours = profile.refreshHours ?? defaultHours;
+  return !!profile.source && hours > 0
+    && (profile.updatedAt === null || now - profile.updatedAt >= hours * 3_600_000)
+    && (lastAttempt === undefined || now - lastAttempt >= 15 * 60_000);
 }
 
 function subscriptionRequest(value: unknown): SubscriptionRequest {
@@ -111,6 +131,7 @@ export function receiveSubscription(
     updatedAt: Date.now(),
     usage: validUsage(usage),
     request: request ?? previous?.request ?? defaultSubscriptionRequest,
+    refreshHours: previous?.refreshHours,
     mihomoSelections: previous?.mihomoSelections ?? {},
     mihomoMode: previous?.mihomoMode,
   });
@@ -193,6 +214,7 @@ export function deserializeWorkspace(raw: string): Workspace {
       updatedAt: Number.isSafeInteger(profile.updatedAt) ? profile.updatedAt : null,
       usage: validUsage(profile.usage),
       request: subscriptionRequest(profile.request),
+      refreshHours: profile.source ? parseRefreshHours(profile.refreshHours) : undefined,
       mihomoSelections: mihomoSelections(profile.mihomoSelections),
       mihomoMode: ["global", "direct", "rule"].includes(profile.mihomoMode ?? "") ? profile.mihomoMode : undefined,
     });
@@ -216,7 +238,7 @@ export function deserializeWorkspace(raw: string): Workspace {
     rules: (saved.rules as RouteRule[]).map(rule => rule.target ? { ...rule, target: recoverId(rule.target) } : rule),
     entryMode: saved.entryMode === "local" || saved.entryMode === "tun" ? saved.entryMode : "system",
     routingMode: saved.routingMode === "direct" || saved.routingMode === "global" ? saved.routingMode : "rule",
-    refreshHours: [1, 6, 24].includes(saved.refreshHours) ? saved.refreshHours : 0,
+    refreshHours: parseRefreshHours(saved.refreshHours) ?? 0,
     favorites: Array.isArray(saved.favorites)
       ? [...new Set<string>(saved.favorites.filter((id: unknown): id is string => typeof id === "string").map(recoverId))]
       : [],

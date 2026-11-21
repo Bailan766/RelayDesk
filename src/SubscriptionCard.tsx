@@ -1,7 +1,10 @@
 import { useState } from "react";
 import { connectionSupport } from "./config";
 import { formatBytes } from "./telemetry";
-import { subscriptionHost, type Subscription, type SubscriptionRequest } from "./workspace";
+import {
+  parseRefreshHours, refreshOptions, subscriptionHost,
+  type RefreshHours, type Subscription, type SubscriptionRequest,
+} from "./workspace";
 
 export function SubscriptionRequestFields({ value, disabled, onChange }: {
   value: SubscriptionRequest;
@@ -36,13 +39,13 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
   canSelectOriginal: boolean;
   onRefresh: () => void;
   onRename: (name: string) => void;
-  onConfigure: (request: SubscriptionRequest) => Promise<void>;
+  onConfigure: (request: SubscriptionRequest, refreshHours?: RefreshHours) => Promise<void>;
   onRemove: () => void;
   onBrowse: () => void;
   onSelectOriginal: () => void;
 }) {
   const [name, setName] = useState<string>();
-  const [draft, setDraft] = useState<SubscriptionRequest>();
+  const [draft, setDraft] = useState<{ request: SubscriptionRequest; refreshHours?: RefreshHours }>();
   const [saving, setSaving] = useState(false);
   const [requestError, setRequestError] = useState("");
   const [confirmRemove, setConfirmRemove] = useState(false);
@@ -59,10 +62,10 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
     setSaving(true);
     setRequestError("");
     try {
-      await onConfigure({ ...draft, userAgent: draft.userAgent.trim() });
+      await onConfigure({ ...draft.request, userAgent: draft.request.userAgent.trim() }, draft.refreshHours);
       setDraft(undefined);
     } catch {
-      setRequestError("请求设置保存失败");
+      setRequestError("订阅设置保存失败");
     } finally {
       setSaving(false);
     }
@@ -80,6 +83,8 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
     <div className="subscription-meta">
       {!!profile.parsed.nodes.length && <span>节点模式 · {supported} 个可连接 / {profile.parsed.nodes.length} 个识别</span>}
       {expiry && <span className={expired ? "error" : undefined}>{expired ? "已过期" : "到期"} {expiry}</span>}
+      {profile.source && profile.refreshHours !== undefined &&
+        <span>自动更新 · {refreshOptions.find(([hours]) => hours === profile.refreshHours)?.[1]}</span>}
     </div>
     {profile.parsed.mihomo && <p className="rule-hint">
       {originalSelected ? "已选用 Mihomo 原配置" : "可使用 Mihomo 原配置"}
@@ -97,10 +102,20 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
         event.preventDefault();
         void saveRequest();
       }}>
-        <SubscriptionRequestFields value={draft} disabled={saving} onChange={setDraft} />
+        <SubscriptionRequestFields value={draft.request} disabled={saving}
+          onChange={request => setDraft({ ...draft, request })} />
+        <label className="refresh-setting">自动更新频率
+          <select value={draft.refreshHours ?? ""} disabled={saving}
+            onChange={event => setDraft({
+              ...draft, refreshHours: event.target.value === "" ? undefined : parseRefreshHours(Number(event.target.value)),
+            })}>
+            <option value="">跟随默认设置</option>
+            {refreshOptions.map(([hours, label]) => <option key={hours} value={hours}>{label}</option>)}
+          </select>
+        </label>
         {requestError && <p className="error" role="status">{requestError}</p>}
         <div className="subscription-actions">
-          <button className="link" type="submit" disabled={saving}>保存请求设置</button>
+          <button className="link" type="submit" disabled={saving}>保存订阅设置</button>
           <button className="link" type="button" disabled={saving} onClick={() => setDraft(undefined)}>取消</button>
         </div>
       </form>
@@ -123,8 +138,8 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
         {profile.source && <button className="link" disabled={pending || !refreshable} onClick={onRefresh}>{pending ? "更新中…" : "更新"}</button>}
         {profile.source && <button className="link" disabled={!refreshable} onClick={() => {
           setRequestError("");
-          setDraft(profile.request);
-        }}>请求设置</button>}
+          setDraft({ request: profile.request, refreshHours: profile.refreshHours });
+        }}>订阅设置</button>}
         <button className="link" onClick={() => setName(profile.name)}>重命名</button>
         {confirmRemove ? <>
           <button className="link error" onClick={onRemove}>确认移除</button>

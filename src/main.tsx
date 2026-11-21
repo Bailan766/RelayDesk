@@ -28,7 +28,10 @@ import { DownloadCheck } from "./DownloadCheck";
 import { MihomoGroups } from "./MihomoGroups";
 import { EventLog } from "./EventLog";
 import { useWorkspace } from "./useWorkspace";
-import { defaultSubscriptionRequest, preferredNode, type EntryMode, type RoutingMode, type SubscriptionRequest, type Workspace } from "./workspace";
+import {
+  defaultSubscriptionRequest, parseRefreshHours, preferredNode, refreshOptions,
+  type EntryMode, type RoutingMode, type SubscriptionRequest, type Workspace,
+} from "./workspace";
 import "./style.css";
 import "./accessibility.css";
 import "./rules.css";
@@ -807,15 +810,12 @@ function App() {
             <section className="panel">
               <div className="panel-head">
                 <h2>订阅来源</h2>
-                <label className="refresh-setting">自动更新
+                <label className="refresh-setting">默认自动更新
                   <select value={work.workspace.refreshHours} disabled={!work.ready || !isTauri()} onChange={event => {
-                    const refreshHours = Number(event.target.value);
+                    const refreshHours = parseRefreshHours(Number(event.target.value)) ?? 0;
                     void saveSettings(state => ({ ...state, refreshHours }));
                   }}>
-                    <option value="0">关闭</option>
-                    <option value="1">每小时</option>
-                    <option value="6">每 6 小时</option>
-                    <option value="24">每天</option>
+                    {refreshOptions.map(([hours, label]) => <option key={hours} value={hours}>{label}</option>)}
                   </select>
                 </label>
               </div>
@@ -831,7 +831,7 @@ function App() {
                     setPage("概览");
                   }}
                   onRefresh={() => void work.refresh(profile.id).catch(() => {})}
-                  onConfigure={request => work.configureRequest(profile.id, request)}
+                  onConfigure={(request, refreshHours) => work.configureSubscription(profile.id, { request, refreshHours })}
                   onBrowse={() => { setSubscriptionFilter(profile.id); setSearch(""); setOnlyFavorites(false); setPage("节点"); }}
                   onRename={name => void saveSettings(state => ({ ...state, subscriptions:
                     state.subscriptions.map(item => item.id === profile.id ? { ...item, name } : item) }))}

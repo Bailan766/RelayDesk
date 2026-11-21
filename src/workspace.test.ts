@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { deserializeWorkspace, emptyWorkspace, receiveSubscription, replaceSubscription, serializeWorkspace } from "./workspace";
+import {
+  deserializeWorkspace, emptyWorkspace, receiveSubscription, replaceSubscription,
+  serializeWorkspace, subscriptionRefreshDue,
+} from "./workspace";
 
 const vless = (server: string, label: string, user = "00000000-0000-4000-8000-000000000000") =>
   `vless://${user}@${server}:443?security=tls#${label}`;
@@ -41,6 +44,32 @@ describe("encrypted workspace data", () => {
     expect(deserializeWorkspace(serializeWorkspace(workspace)).subscriptions[0].request).toEqual(request);
     expect(deserializeWorkspace(JSON.stringify({ content: primary, source })).subscriptions[0].request)
       .toEqual({ route: "automatic", userAgent: "" });
+  });
+
+  it("applies per-source refresh intervals, preserving explicit off and inherited defaults on reload", () => {
+    const hour = 3_600_000;
+    const inherited = { ...receiveSubscription(primary, source, null), updatedAt: hour };
+    const hourly = { ...receiveSubscription(backup, "https://hourly.example.com/profile", null),
+      updatedAt: hour, refreshHours: 1 as const };
+    const disabled = { ...receiveSubscription(primary, "https://manual.example.com/profile", null),
+      updatedAt: hour, refreshHours: 0 as const };
+    const local = { ...receiveSubscription(primary, "", null), updatedAt: hour };
+    const settings = { ...emptyWorkspace, refreshHours: 6, subscriptions: [inherited, hourly, disabled, local] };
+    const restored = deserializeWorkspace(serializeWorkspace(settings));
+    expect(restored.subscriptions.map(profile => profile.refreshHours)).toEqual([undefined, 1, 0, undefined]);
+
+    const due = (now: number, defaultHours: number) => restored.subscriptions
+      .filter(profile => subscriptionRefreshDue(profile, defaultHours, now))
+      .map(profile => profile.id);
+    expect(due(2 * hour, restored.refreshHours)).toEqual([hourly.id]);
+    expect(due(7 * hour, restored.refreshHours)).toEqual([inherited.id, hourly.id]);
+    expect(due(7 * hour, 0)).toEqual([hourly.id]);
+    expect(subscriptionRefreshDue(hourly, 6, 2 * hour, 2 * hour - 60_000)).toBe(false);
+
+    const updated = receiveSubscription(primary, hourly.source, null, hourly);
+    expect(updated.refreshHours).toBe(1);
+    const legacy = deserializeWorkspace(JSON.stringify({ content: primary, source }));
+    expect(subscriptionRefreshDue(legacy.subscriptions[0], 6, 7 * hour)).toBe(true);
   });
 
   it("retains a provider-only original and its strategy after reload and refresh", () => {
