@@ -19,6 +19,7 @@
 | A02/A06/A09 Mihomo 原配置 | `v0.1.14-preview.2` 从仅含提供者的配置启动。已安装的 Windows 进程加载远程节点和规则、按原 DNS 查询，并改变策略组后实际转发或拒绝同一请求。重新启动前保存的提供者节点在入口就绪前恢复。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44838304370) | TUN 原配置、文件型提供者、YAML 覆写、生产环境的大型远程规则集，以及其他桌面和移动平台。 |
 | A04/A06 Mihomo 原配置接入 TUN | Windows 实机使用全量严格路由验证未手动设置代理的 TCP、Shadowsocks UDP 回显和按原配置解析的 DNS。复现了直接使用系统 DNS 时的解析回路，修正后在 TUN 启用时查询成功，真实 HTTPS 上游连接也从物理网卡出去。`v0.1.15-preview.3` 通过安装后的 TCP、UDP、DNS 测试，验证策略进程异常退出后释放网卡和 DNS 监听。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44844993377) | 来源和进程规则的原始连接信息、切网和休眠唤醒、IPv6、应用自带加密 DNS。 |
 | A03 按订阅设定刷新周期 | 工作区测试验证默认、独立周期、关闭、旧版数据和失败后的退避。模拟桌面下载的界面测试验证全局关闭时独立周期仍生效，以及单份订阅关闭后仍能手动刷新。 | 长时间后台运行与系统唤醒后的现场刷新。 |
+| A04 TUN 默认路由丢失 | Windows 实机移除测试网卡的默认路由后，原实现的内核仍在运行，路由没有自行回来。使用 Windows 网络接口重建该网卡的 IPv4、IPv6 默认路由后，TCP 请求恢复。`v0.1.17-preview.1` 验证安装后的应用会自动补回丢失的测试路由，保持同一会话，且可再次转发 TCP。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44846758386) | 恢复失败后的完整状态提示、真正的切网和休眠唤醒。 |
 
 ## 优先解决的用户风险
 
@@ -118,6 +119,12 @@ proxies:
 ### A04 · Windows 三种接管方式和恢复 · P0
 
 在连接前分别准备原本直连、已有手动系统代理、带 PAC/绕过项的自动代理三组基线并记录 WinINet 设置。系统代理模式用读取当前 Windows 设置的应用和明确直连的原始 TCP 客户端各发一条请求，记录两条路径。本地端口模式用显式 HTTP 或 SOCKS5 客户端访问夹具，确认系统设置保持原值。TUN 模式另用不读系统代理的 TCP 客户端及 UDP 回显验证接管，取消管理员授权时复查原设置、进程与网卡。对三类模式执行停止、托盘退出、模拟 GUI 父进程退出、内核退出、启动失败、切换失败、安装包重装及卸载；有恢复延迟时记录耗时与界面状态。系统代理运行中用实验工具改为另一个代理，退出后以实际用户设置核对保留行为。同时比较服务器、开关、PAC、WPAD、绕过项和网络可达性。每组先用 PowerShell 7 执行仓库的网络冒烟脚本，并通过 `-App` 指向该组安装的 `relaydesk.exe`。再跑数据路径，捕捉监听仍在但上游失效的情况。 [本地网络冒烟入口](../.github/scripts/test-windows-network.ps1) · [Windows 代理配置](https://learn.microsoft.com/en-us/windows/win32/winhttp/setting-wininet-proxy-configurations-in-winhttp)
+
+#### 一次授权的 Windows TUN 服务验收
+
+Clash Verge Rev 已实现独立服务和受保护的内核安装。它公布的本地提权公告也指出了客户端鉴别和可执行文件路径两个验收面。RelayDesk 当前的安装器按用户安装。未来服务的程序和内核应独立安装到仅管理员可写的位置，由安装程序固定并验证版本。服务只接管自建网卡和路由，普通用户进程继续解析远程订阅和策略。 [Clash Verge Rev 服务源码](https://github.com/clash-verge-rev/clash-verge-rev/blob/dev/src-tauri/src/core/service.rs) · [上游安全公告](https://github.com/clash-verge-rev/clash-verge-rev/security/advisories/GHSA-99qg-xv7m-jf4v) · [Windows 服务权限](https://learn.microsoft.com/en-us/windows/win32/services/service-security-and-access-rights)
+
+安装后以授权的普通用户测试启停和异常恢复，分别覆盖重启、休眠、切换网络及进程退出。用第二个普通用户账号和不同登录会话发起同样的请求，检查服务拒绝访问。用 Windows 管道访问控制绑定授权会话，并在服务端核对连接进程的令牌。安装包升级、覆盖安装、卸载时复查内核文件权限、服务注册和网卡清理，验证普通用户写入安装目录或配置目录不会改变服务启动的二进制。 [Windows 命名管道访问控制](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights)
 
 ### A05 · DNS、IPv6、UDP 与 LAN · P0
 
