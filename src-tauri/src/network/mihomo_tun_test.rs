@@ -34,6 +34,28 @@ fn read_headers(socket: &mut TcpStream) -> String {
     first
 }
 
+fn assert_http_through_tun(session: &Session, address: SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(9);
+    let mut stream = loop {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(1500)) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline && session.running() => {
+                thread::sleep(Duration::from_millis(70));
+            }
+            Err(error) => panic!("The installed TUN's connection to {address} failed: {error}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
+    stream
+        .write_all(b"GET /bridge HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut body = String::new();
+    stream.read_to_string(&mut body).unwrap();
+    assert!(body.ends_with("bridge"));
+}
+
 struct FixtureCore(Child);
 
 impl Drop for FixtureCore {
@@ -53,30 +75,34 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let http_port = port(&connect_proxy);
     let http = thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(45);
-        let mut socket = loop {
-            match connect_proxy.accept() {
-                Ok((socket, _)) => break socket,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(30))
+        for _ in 0..2 {
+            let mut socket = loop {
+                match connect_proxy.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(30))
+                    }
+                    Err(error) => panic!("HTTP fixture was never reached: {error}"),
                 }
-                Err(error) => panic!("HTTP fixture was never reached: {error}"),
-            }
-        };
-        socket.set_nonblocking(false).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(4)))
-            .unwrap();
-        assert!(read_headers(&mut socket).starts_with(&format!("CONNECT {TARGET}:8089 ")));
-        socket
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .unwrap();
-        assert!(read_headers(&mut socket).starts_with("GET /bridge "));
-        socket
-            .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n\r\nbridge")
-            .unwrap();
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(4)))
+                .unwrap();
+            assert!(read_headers(&mut socket).starts_with(&format!("CONNECT {TARGET}:8089 ")));
+            socket
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .unwrap();
+            assert!(read_headers(&mut socket).starts_with("GET /bridge "));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 6\r\n\r\nbridge",
+                )
+                .unwrap();
+        }
     });
 
     let echo = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
@@ -179,25 +205,24 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         interface_index(&adapter),
         "Windows chose a different adapter for {TARGET}"
     );
-    let deadline = Instant::now() + Duration::from_secs(9);
-    let mut stream = loop {
-        match TcpStream::connect_timeout(&address, Duration::from_millis(1500)) {
-            Ok(stream) => break stream,
-            Err(_) if Instant::now() < deadline && session.running() => {
-                thread::sleep(Duration::from_millis(70));
-            }
-            Err(error) => panic!("The installed TUN's connection to {address} failed: {error}"),
+    assert_http_through_tun(&session, address);
+
+    let required = AF_INET as u16;
+    assert!(tun_default_route(&adapter, required).is_some());
+    for family in [required, AF_INET6 as u16] {
+        if let Some(route) = tun_default_route(&adapter, family) {
+            assert_eq!(
+                unsafe { winapi::shared::netioapi::DeleteIpForwardEntry2(&route) }, 0,
+                "Could not simulate loss of the test TUN's default route for address family {family}"
+            );
+            wait_until(
+                || tun_default_route(&adapter, family).is_some(),
+                Duration::from_secs(4),
+            );
         }
-    };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(4)))
-        .unwrap();
-    stream
-        .write_all(b"GET /bridge HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
-        .unwrap();
-    let mut body = String::new();
-    stream.read_to_string(&mut body).unwrap();
-    assert!(body.ends_with("bridge"));
+    }
+    assert!(session.running());
+    assert_http_through_tun(&session, address);
 
     let app_udp = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
     app_udp
@@ -234,6 +259,8 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
         || UdpSocket::bind((TUN_ADDRESS, 0)).is_err(),
         Duration::from_secs(4),
     );
+    assert!(tun_default_route(&adapter, AF_INET as u16).is_none());
+    assert!(tun_default_route(&adapter, AF_INET6 as u16).is_none());
     assert!(UdpSocket::bind(("127.0.0.1", policy_dns)).is_ok());
     assert!(UdpSocket::bind(("127.0.0.1", system_dns)).is_ok());
 }

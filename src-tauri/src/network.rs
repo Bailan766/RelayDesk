@@ -18,10 +18,11 @@ use winapi::{
         ifdef::NET_LUID,
         minwindef::{FALSE, TRUE},
         netioapi::{
-            ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, FreeMibTable,
-            GetIpForwardTable2, MIB_IPFORWARD_ROW2,
+            ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
+            FreeMibTable, GetIpForwardEntry2, GetIpForwardTable2, MIB_IPFORWARD_ROW2,
         },
-        ws2def::AF_INET,
+        winerror::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS},
+        ws2def::{AF_INET, AF_INET6},
     },
     um::{
         handleapi::CloseHandle,
@@ -42,6 +43,8 @@ use winapi::{
 const APPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const TUN_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const MIHOMO_READY_TIMEOUT: Duration = Duration::from_secs(40);
+const TUN_ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const TUN_ROUTE_RECOVERY_ATTEMPTS: u8 = 6;
 
 #[derive(Clone, Copy, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -90,25 +93,40 @@ fn interface_index(alias: &str) -> Option<u32> {
     }
 }
 
-fn tun_route_ready(alias: &str) -> bool {
-    let Some(index) = interface_index(alias) else {
-        return false;
-    };
+fn tun_default_route(alias: &str, family: u16) -> Option<MIB_IPFORWARD_ROW2> {
+    let index = interface_index(alias)?;
     let mut table = ptr::null_mut();
     unsafe {
-        if GetIpForwardTable2(AF_INET as u16, &mut table) != 0 || table.is_null() {
-            return false;
+        if GetIpForwardTable2(family, &mut table) != 0 || table.is_null() {
+            return None;
         }
         // Windows allocates NumEntries rows after the header, including SDK alignment padding.
         let rows = std::slice::from_raw_parts(
             ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>(),
             (*table).NumEntries as usize,
         );
-        let ready = rows
+        let route = rows
             .iter()
-            .any(|row| row.InterfaceIndex == index && row.DestinationPrefix.PrefixLength == 0);
+            .find(|row| row.InterfaceIndex == index && row.DestinationPrefix.PrefixLength == 0)
+            .copied();
         FreeMibTable(table.cast());
-        ready
+        route
+    }
+}
+
+fn restore_tun_default_route(alias: &str, family: u16, saved: &MIB_IPFORWARD_ROW2) -> bool {
+    let mut current = *saved;
+    match unsafe { GetIpForwardEntry2(&mut current) } {
+        0 => true,
+        ERROR_NOT_FOUND if interface_index(alias) == Some(saved.InterfaceIndex) => {
+            // A replacement default route on the same interface is already sufficient.
+            tun_default_route(alias, family).is_some()
+                || matches!(
+                    unsafe { CreateIpForwardEntry2(saved) },
+                    0 | ERROR_OBJECT_ALREADY_EXISTS
+                )
+        }
+        _ => false,
     }
 }
 
@@ -1269,7 +1287,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         .write_all(&config)
         .map_err(|_| "内核拒绝代理配置")?;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    loop {
+    let tun_route = loop {
         if stop.signaled(0)
             || parent.signaled(0)
             || dependency.as_ref().is_some_and(|policy| policy.signaled(0))
@@ -1283,19 +1301,23 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             let _ = child.wait();
             return Err("本地代理入口未就绪".into());
         }
-        let tun_ready = mode != "tun"
-            || (UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_ok()
-                && tun_route_ready(&interface));
+        let route = if mode == "tun"
+            && UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_ok()
+        {
+            tun_default_route(&interface, AF_INET as u16)
+        } else {
+            None
+        };
         let dns_ready = policy_dns.is_none_or(|dns| UdpSocket::bind(("127.0.0.1", dns)).is_err());
-        if tun_ready
+        if (mode != "tun" || route.is_some())
             && dns_ready
             && TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
             && (core == Core::Bridge || controller.ready())
         {
-            break;
+            break route;
         }
         thread::sleep(Duration::from_millis(70));
-    }
+    };
     if core == Core::Mihomo && !selections.is_empty() {
         let budget = deadline
             .saturating_duration_since(Instant::now())
@@ -1318,14 +1340,41 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     if mode == "system" {
         system_proxy::enable(&journal, port).map_err(|_| "无法设置系统代理")?;
     }
+    let tun_routes = [
+        (AF_INET as u16, tun_route),
+        (
+            AF_INET6 as u16,
+            tun_route.and_then(|_| tun_default_route(&interface, AF_INET6 as u16)),
+        ),
+    ];
+    let mut next_route_check = tun_route.map(|_| Instant::now() + TUN_ROUTE_CHECK_INTERVAL);
     unsafe {
         SetEvent(ready.0);
     }
+    let mut failed_route_checks = 0;
+    let mut route_failed = false;
     while !stop.signaled(150)
         && !parent.signaled(0)
         && dependency.as_ref().is_none_or(|policy| !policy.signaled(0))
         && matches!(child.try_wait(), Ok(None))
-    {}
+    {
+        let now = Instant::now();
+        if next_route_check.is_some_and(|check| now >= check) {
+            next_route_check = Some(now + TUN_ROUTE_CHECK_INTERVAL);
+            let ready = tun_routes.map(|(family, route)| {
+                route.is_none_or(|saved| restore_tun_default_route(&interface, family, &saved))
+            });
+            if ready.into_iter().all(|restored| restored) {
+                failed_route_checks = 0;
+            } else {
+                failed_route_checks += 1;
+                if failed_route_checks >= TUN_ROUTE_RECOVERY_ATTEMPTS {
+                    route_failed = true;
+                    break;
+                }
+            }
+        }
+    }
     let restored = if mode == "policy" {
         Ok(())
     } else {
@@ -1333,7 +1382,11 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     };
     let _ = child.kill();
     let _ = child.wait();
-    restored.map_err(|_| "无法恢复系统代理".into())
+    restored.map_err(|_| "无法恢复系统代理")?;
+    if route_failed {
+        return Err("TUN 无法恢复 Windows 默认路由".into());
+    }
+    Ok(())
 }
 
 pub fn cli() -> Option<i32> {
