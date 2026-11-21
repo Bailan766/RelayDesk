@@ -286,12 +286,19 @@ async fn proxy_telemetry(
         return Ok(None);
     };
     let snapshot = active.controller.snapshot().await;
-    if !state.live()?.is_some_and(|current| current.id == active.id) {
+    if !state
+        .live()?
+        .is_some_and(|current| current.id == active.id && current.generation == active.generation)
+    {
         return Ok(None);
     }
     snapshot.map(|snapshot| {
         Some(telemetry::SessionSnapshot {
-            session_id: active.id,
+            session_id: if active.generation == 0 {
+                active.id
+            } else {
+                format!("{}:{}", active.id, active.generation)
+            },
             snapshot,
         })
     })
@@ -386,7 +393,9 @@ async fn measure_download(
         .ok_or("代理内核未运行")?;
     let measurement = probes::measure_download(port).await?;
     if !state.live()?.is_some_and(|current| {
-        current.id == active.id && current.route_revision == active.route_revision
+        current.id == active.id
+            && current.generation == active.generation
+            && current.route_revision == active.route_revision
     }) {
         return Err("测试期间代理线路已变化，请重新测试".into());
     }

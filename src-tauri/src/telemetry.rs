@@ -86,6 +86,8 @@ impl Controller {
                 reqwest::Client::builder()
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
+                    // A replacement core can bind the same port while old connections are still pooled.
+                    .pool_max_idle_per_host(0)
                     .timeout(Duration::from_secs(2))
                     .build()
             })

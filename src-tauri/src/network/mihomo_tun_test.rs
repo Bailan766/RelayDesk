@@ -262,6 +262,7 @@ fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     wait_until(|| session.recovering_tun(), Duration::from_secs(3));
     assert!(session.running() && !session.ready());
     wait_until(|| session.ready(), Duration::from_secs(24));
+    assert_eq!(session.generation(), 1);
     assert!(session.controller.ready());
     assert_http_through_tun(&session, address);
 
@@ -344,6 +345,11 @@ fn installed_node_tun_keeps_the_selected_node_and_mode_and_can_cancel_recovery()
     stop_fixture_tun_core(&session);
     wait_until(|| session.recovering_tun(), Duration::from_secs(3));
     wait_until(|| session.ready(), Duration::from_secs(24));
+    assert_eq!(session.generation(), 1);
+    assert!(
+        session.controller.ready(),
+        "The replacement node core did not answer a fresh controller request"
+    );
     runtime.block_on(async {
         let groups = session.controller.groups().await.unwrap();
         assert!(groups
@@ -356,8 +362,9 @@ fn installed_node_tun_keeps_the_selected_node_and_mode_and_can_cancel_recovery()
             .unwrap()
             .eq_ignore_ascii_case("direct"));
     });
-    session.configure_tun_recovery(false);
     stop_fixture_tun_core(&session);
+    wait_until(|| session.recovering_tun(), Duration::from_secs(3));
+    session.configure_tun_recovery(false);
     assert!(
         session.worker.signaled(6500),
         "TUN recovered after recovery was disabled"

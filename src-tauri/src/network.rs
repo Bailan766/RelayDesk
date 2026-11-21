@@ -1032,6 +1032,10 @@ impl Session {
         self.running() && !self.recovering_tun()
     }
 
+    pub fn generation(&self) -> u32 {
+        self.tun_control.as_ref().map_or(0, TunControl::generation)
+    }
+
     pub fn configure_tun_recovery(&self, enabled: bool) {
         if let Some(control) = &self.tun_control {
             control.set_recovery(enabled);
@@ -1203,10 +1207,14 @@ fn await_core(
     child: &mut Child,
     lifetime: &WorkerLifetime<'_>,
     deadline: Instant,
+    recovery: Option<&TunControl>,
     mut is_ready: impl FnMut() -> bool,
 ) -> Result<(), String> {
     loop {
-        if lifetime.ended(0) || !matches!(child.try_wait(), Ok(None)) || Instant::now() >= deadline
+        if lifetime.ended(0)
+            || recovery.is_some_and(|control| !control.enabled())
+            || !matches!(child.try_wait(), Ok(None))
+            || Instant::now() >= deadline
         {
             stop_core(child);
             return Err("本地代理入口未就绪".into());
@@ -1219,6 +1227,20 @@ fn await_core(
             return Err("本地代理入口已停止".into());
         }
     }
+}
+
+fn wait_tun_retry(lifetime: &WorkerLifetime<'_>, control: &TunControl, delay: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(u64::from(delay));
+    while control.enabled() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return !lifetime.ended(0);
+        }
+        if lifetime.ended(remaining.as_millis().clamp(1, 150) as u32) {
+            return false;
+        }
+    }
+    false
 }
 
 fn supervise_core(
@@ -1418,10 +1440,10 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         }
     }
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let launch = |config: &[u8], deadline, interface: &str| {
+    let launch = |config: &[u8], deadline, interface: &str, recovery: Option<&TunControl>| {
         let mut child = start_core(&mut config_command(false), &job, config)?;
         let mut route = None;
-        await_core(&mut child, &lifetime, deadline, || {
+        await_core(&mut child, &lifetime, deadline, recovery, || {
             if mode == "tun" {
                 if UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_err() {
                     return false;
@@ -1437,7 +1459,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         })?;
         Ok::<_, String>((child, route))
     };
-    let (mut child, mut route) = launch(&initial, initial_deadline, &interface)?;
+    let (mut child, mut route) = launch(&initial, initial_deadline, &interface, None)?;
     if core == Core::Mihomo && !selections.is_empty() {
         let budget = initial_deadline
             .saturating_duration_since(Instant::now())
@@ -1469,7 +1491,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         let lost = supervise_core(&mut child, &lifetime, &interface, route);
         if lost {
             if let Some(control) = &control {
-                control.set_recovering(true);
+                control.begin_recovery();
             }
         }
         stop_core(&mut child);
@@ -1484,7 +1506,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             retries = 0;
         }
         while let Some(delay) = TUN_RETRY_DELAYS_MS.get(retries) {
-            if !control.enabled() || lifetime.ended(*delay) || !control.enabled() {
+            if !wait_tun_retry(&lifetime, control, *delay) {
                 break 'session;
             }
             retries += 1;
@@ -1498,13 +1520,16 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                 control.restore_routing(&mut config);
             }
             let replacement = serde_json::to_vec(&config).map_err(|_| "恢复 TUN 配置失败")?;
-            if let Ok((next, replacement_route)) =
-                launch(&replacement, Instant::now() + timeout, &interface)
-            {
+            if let Ok((next, replacement_route)) = launch(
+                &replacement,
+                Instant::now() + timeout,
+                &interface,
+                Some(control),
+            ) {
                 child = next;
                 route = replacement_route;
                 started = Instant::now();
-                control.set_recovering(false);
+                control.finish_recovery();
                 failed = false;
                 continue 'session;
             }

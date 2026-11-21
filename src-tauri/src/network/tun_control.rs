@@ -19,7 +19,7 @@ use winapi::{
 struct TunControlValues {
     recover: AtomicU32,
     routing: AtomicU32,
-    recovering: AtomicU32,
+    phase: AtomicU32,
 }
 
 pub(super) struct TunControl {
@@ -135,14 +135,20 @@ impl TunControl {
         }
     }
 
-    pub(super) fn set_recovering(&self, recovering: bool) {
-        self.values()
-            .recovering
-            .store(u32::from(recovering), Ordering::Release);
+    pub(super) fn begin_recovery(&self) {
+        self.values().phase.fetch_or(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn finish_recovery(&self) {
+        self.values().phase.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(super) fn recovering(&self) -> bool {
-        self.values().recovering.load(Ordering::Acquire) == 1
+        self.values().phase.load(Ordering::Acquire) & 1 != 0
+    }
+
+    pub(super) fn generation(&self) -> u32 {
+        self.values().phase.load(Ordering::Acquire) >> 1
     }
 }
 

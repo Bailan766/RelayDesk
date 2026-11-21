@@ -89,6 +89,7 @@ fn valid_tag(tag: &str) -> bool {
 
 struct Running {
     session: network::Session,
+    generation: u32,
     plan: Plan,
     since: Instant,
     failures: usize,
@@ -164,6 +165,7 @@ pub struct Status {
 
 struct NodeCheck {
     session: String,
+    generation: u32,
     revision: u64,
     tag: String,
     controller: Controller,
@@ -172,6 +174,7 @@ struct NodeCheck {
 impl NodeCheck {
     fn is_current(&self, active: &Running) -> bool {
         active.session.id == self.session
+            && active.session.generation() == self.generation
             && active.session.ready()
             && active.plan.monitors_node()
             && active.health.revision == self.revision
@@ -180,6 +183,7 @@ impl NodeCheck {
 
 pub struct Link {
     pub id: String,
+    pub generation: u32,
     pub port: u16,
     pub controller: Controller,
     pub route_revision: u64,
@@ -216,6 +220,7 @@ impl Supervisor {
         };
         slot.active = Some(Running {
             session,
+            generation: 0,
             plan,
             since: Instant::now(),
             failures: 0,
@@ -297,6 +302,7 @@ impl Supervisor {
             .filter(|active| active.session.ready())
             .map(|active| Link {
                 id: active.session.id.clone(),
+                generation: active.session.generation(),
                 port: active.session.port,
                 controller: active.session.controller.clone(),
                 route_revision: active.health.revision,
@@ -483,6 +489,7 @@ impl Supervisor {
         }
         Some(NodeCheck {
             session: active.session.id.clone(),
+            generation: active.session.generation(),
             revision: active.health.revision,
             tag: active.plan.selected_node().unwrap_or("proxy").to_owned(),
             controller: active.session.controller.clone(),
@@ -656,6 +663,14 @@ impl Supervisor {
             return;
         };
         if active.session.running() {
+            let generation = active.session.generation();
+            if generation != active.generation {
+                active.generation = generation;
+                active.health.reset();
+                slot.message = Some("TUN 已自动恢复");
+                slot.record("info", "TUN 接管内核已恢复，原节点和路由设置保持生效");
+                return;
+            }
             if active.since.elapsed() >= HEALTHY_INTERVAL {
                 active.failures = 0;
             }
@@ -691,6 +706,7 @@ impl Supervisor {
         match launch(&active.plan) {
             Ok(session) => {
                 active.session = session;
+                active.generation = 0;
                 active.since = Instant::now();
                 active.health.reset();
                 slot.message = Some("代理已自动恢复");
