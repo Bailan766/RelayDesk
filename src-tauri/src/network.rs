@@ -1853,6 +1853,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         let core_logs = attach_core_logger(&mut child, "core");
         let mut route = None;
         let mut ipv4_ready_at: Option<Instant> = None;
+        let mut mihomo_ready_since: Option<Instant> = None;
         let (mut ip_ok, mut v4_ok, mut v6_ok, mut tcp_ok, mut ctrl_ok) =
             (false, false, false, false, false);
         if let Err(err) = await_core(&mut child, &lifetime, deadline, recovery, || {
@@ -1864,12 +1865,14 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             if mode == "tun" {
                 ip_ok = UdpSocket::bind((tun_ipv4, 0)).is_ok();
                 if !ip_ok {
+                    mihomo_ready_since = None;
                     return false;
                 }
                 route = tun_default_route(interface, AF_INET as u16);
                 v4_ok = route.is_some();
                 if !v4_ok {
                     ipv4_ready_at = None;
+                    mihomo_ready_since = None;
                     return false;
                 }
                 if tun_ipv6 {
@@ -1877,6 +1880,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                     if !v6_ok {
                         let since = *ipv4_ready_at.get_or_insert_with(Instant::now);
                         if since.elapsed() < Duration::from_millis(800) {
+                            mihomo_ready_since = None;
                             return false;
                         }
                     }
@@ -1884,7 +1888,17 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             }
             tcp_ok = TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok();
             ctrl_ok = tcp_ok && controller.ready();
-            ctrl_ok
+            if !ctrl_ok {
+                mihomo_ready_since = None;
+                return false;
+            }
+            if core == Core::Mihomo {
+                let since = *mihomo_ready_since.get_or_insert_with(Instant::now);
+                if since.elapsed() < Duration::from_millis(350) {
+                    return false;
+                }
+            }
+            true
         }) {
             crate::logs::append(
                 "worker",
