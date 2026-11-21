@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildConfig } from './config';
+import { buildConfig, buildSessionConfig, normalizeRuleValue } from './config';
 import { parseSubscription } from './subscription';
 
 describe('sing-box configuration', () => {
@@ -35,5 +35,38 @@ describe('sing-box configuration', () => {
     expect(() => buildConfig(vless, 12345)).toThrow('加密');
     const hy = parseSubscription('hysteria2://password@host.test:443?mport=3000-2000#Test').nodes[0];
     expect(() => buildConfig(hy, 12345)).toThrow('端口');
+  });
+  it('preserves legacy Shadowsocks credentials and percent-encoded modern credentials', () => {
+    for (const uri of [`ss://${btoa('aes-128-gcm:a:@b@host.test:8388')}#legacy`,
+      'ss://aes-128-gcm:a%3A%40b@host.test:8388#sip002']) {
+      const outbound = buildConfig(parseSubscription(uri).nodes[0], 12345).outbounds[0];
+      expect(outbound).toMatchObject({ type: 'shadowsocks', method: 'aes-128-gcm', password: 'a:@b', server: 'host.test' });
+    }
+  });
+  it('preserves structured TLS hostname and transport, and flags certificate semantics it cannot preserve', () => {
+    const source = 'proxies:\n- {name: test, type: vless, server: example.org, port: 443, uuid: id, tls: true, servername: tls.test, network: ws, ws-opts: {path: /a, headers: {Host: edge.test}}}';
+    const node = parseSubscription(source).nodes[0];
+    expect(buildConfig(node, 12345).outbounds[0]).toMatchObject({
+      uuid: 'id', tls: { enabled: true, server_name: 'tls.test' },
+      transport: { type: 'ws', path: '/a', headers: { Host: 'edge.test' } },
+    });
+    const outbound = { type: 'trojan', server: 'test.example.org', server_port: 443, password: 'fixture',
+      tls: { enabled: true, certificate_path: 'fixture.pem' } };
+    expect(() => buildConfig(parseSubscription(JSON.stringify([outbound])).nodes[0], 12345)).toThrow('certificate_path');
+  });
+  it('pins matching destinations to a loaded outbound and rejects rather than falling back when unavailable', () => {
+    const nodes = parseSubscription('trojan://password@a.test:443#A\ntrojan://password@b.test:443#B').nodes;
+    const rules = [
+      { type: 'ip_cidr', value: '192.0.2.3', action: 'proxy', target: nodes[1].id },
+      { type: 'process_name', value: 'Example (Test).EXE', action: 'direct' },
+    ] as const;
+    expect(buildSessionConfig(nodes[0], nodes, 12345, [...rules]).config.route.rules).toEqual([
+      { ip_cidr: ['192.0.2.3/32'], outbound: 'node-1' },
+      { process_path_regex: ['(?i)(?:^|[\\\\/])Example \\(Test\\)\\.EXE$'], outbound: 'direct' },
+    ]);
+    expect(buildConfig(nodes[0], 12345, [...rules]).route.rules[0]).toEqual({ ip_cidr: ['192.0.2.3/32'], action: 'reject' });
+    expect(normalizeRuleValue('ip_cidr', '2001:db8:0::/48')).toBe('2001:db8::/48');
+    expect(() => normalizeRuleValue('ip_cidr', '255.1.1.256/24')).toThrow('IP');
+    expect(() => normalizeRuleValue('ip_cidr', '2001:db8::/129')).toThrow('IP');
   });
 });

@@ -1,53 +1,101 @@
-import type { NodeProfile } from './subscription';
+import { nodeRevision, type Fields, type NodeProfile } from './subscription';
+import { compileOutbound } from './outbound';
+import { normalizeIpCidr } from './ip';
 
-export type RouteRule = { type: 'domain' | 'domain_suffix'; value: string; action: 'direct' | 'proxy' | 'reject' };
+export type RuleType = 'domain' | 'domain_suffix' | 'ip_cidr' | 'process_name';
+export type RouteRule = { type: RuleType; value: string; action: 'direct' | 'proxy' | 'reject'; target?: string };
+export const ruleTypes: { value: RuleType; label: string; example: string }[] = [
+  { value: 'domain', label: '域名', example: 'example.com' },
+  { value: 'domain_suffix', label: '域名后缀', example: 'example.com' },
+  { value: 'ip_cidr', label: 'IP 地址或网段', example: '192.0.2.0/24' },
+  { value: 'process_name', label: 'Windows 进程', example: 'chrome.exe' },
+];
 
-export function buildConfig(node: NodeProfile, port: number, rules: RouteRule[] = []): object {
-  if (!node.uri || !['vless', 'hysteria2'].includes(node.protocol)) throw new Error('此节点类型尚不支持连接');
-  const uri = new URL(node.uri);
-  const query = uri.searchParams;
-  const credential = decodeURIComponent(uri.username);
-  if (!credential) throw new Error('节点缺少认证信息');
-  const outbound: Record<string, unknown> = { type: node.protocol, tag: 'proxy', server: node.server, server_port: node.port };
-  const security = query.get('security') || (node.protocol === 'hysteria2' ? 'tls' : 'none');
-  const tls: Record<string, unknown> = { enabled: security !== 'none' };
-  const serverName = query.get('sni') || query.get('servername') || query.get('peer');
-  if (serverName) tls.server_name = serverName;
-  if (query.get('insecure') === '1' || query.get('allowInsecure') === '1') tls.insecure = true;
-  const alpn = query.get('alpn'); if (alpn) tls.alpn = alpn.split(',');
-  const fingerprint = query.get('fp'); if (fingerprint) tls.utls = { enabled: true, fingerprint };
-  if (security === 'reality') {
-    const publicKey = query.get('pbk'); if (!publicKey) throw new Error('Reality 节点缺少公钥');
-    tls.reality = { enabled: true, public_key: publicKey, short_id: query.get('sid') || '' };
+export function normalizeRuleDomain(input: string): string {
+  const domain = input.trim().toLowerCase().replace(/\.$/, '');
+  if (!domain || domain.length > 253 || !domain.split('.').every(label =>
+    /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) throw new Error('域名规则无效');
+  return domain;
+}
+
+export function normalizeRuleValue(type: RuleType, input: string): string {
+  if (type === 'domain' || type === 'domain_suffix') return normalizeRuleDomain(type === 'domain_suffix' ? input.replace(/^\s*\./, '') : input);
+  const value = input.trim();
+  if (type === 'process_name') {
+    if (!/^[^<>:"/\\|?*\u0000-\u001f]{1,128}\.exe$/i.test(value)) throw new Error('请填写 .exe 文件名');
+    return value;
   }
-  if (node.protocol === 'vless') {
-    if (query.get('encryption') && query.get('encryption') !== 'none') throw new Error('暂不支持此 VLESS 加密方式');
-    outbound.uuid = credential;
-    const flow = query.get('flow'); if (flow) outbound.flow = flow;
-    const type = query.get('type') || 'tcp';
-    if (type === 'ws') {
-      const transport: Record<string, unknown> = { type: 'ws', path: query.get('path') || '/' };
-      const host = query.get('host'); if (host) transport.headers = { Host: host };
-      outbound.transport = transport;
-    } else if (type === 'grpc') outbound.transport = { type: 'grpc', service_name: query.get('serviceName') || '' };
-    else if (type !== 'tcp') throw new Error(`暂不支持 ${type} 传输`);
-  } else {
-    outbound.password = credential;
-    const multiPort = query.get('mport');
-    if (multiPort) {
-      const ports = multiPort.split(',').map(value => value.trim().replace('-', ':'));
-      if (ports.some(value => !/^\d{1,5}(:\d{1,5})?$/.test(value) || value.split(':').some(port => +port < 1 || +port > 65535) || (value.includes(':') && +value.split(':')[0] > +value.split(':')[1]))) throw new Error('Hysteria2 端口范围无效');
-      delete outbound.server_port;
-      outbound.server_ports = ports;
-    }
-  }
-  if (tls.enabled) outbound.tls = tls;
+  return normalizeIpCidr(value);
+}
+
+type LoadedOutbounds = ReadonlyMap<string, { tag: string }>;
+
+function compileConfig(outbounds: Fields[], port: number, rules: RouteRule[], loaded: LoadedOutbounds) {
   const compiledRules = rules.map(rule => {
-    const value = rule.value.trim();
-    if (!value || value.length > 253 || !/^(?!-)[a-z0-9-]+(?:\.[a-z0-9-]+)*$/i.test(value)) throw new Error('域名规则无效');
-    return rule.action === 'reject' ? { [rule.type]: [value], action: 'reject' } : { [rule.type]: [value], outbound: rule.action };
+    const value = normalizeRuleValue(rule.type, rule.value);
+    const match = rule.type === 'process_name'
+      ? { process_path_regex: [`(?i)(?:^|[\\\\/])${value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`] }
+      : { [rule.type]: [value] };
+    const outbound = rule.action === 'proxy' && rule.target ? loaded.get(rule.target)?.tag : rule.action;
+    return !outbound || outbound === 'reject' ? { ...match, action: 'reject' } : { ...match, outbound };
   });
-  return { log: { level: 'warn' }, inbounds: [{ type: 'mixed', tag: 'local', listen: '127.0.0.1', listen_port: port }], outbounds: [outbound, { type: 'direct', tag: 'direct' }], route: { rules: compiledRules, final: 'proxy', auto_detect_interface: true } };
+  const endpoints = outbounds.filter(outbound => outbound.type === 'wireguard');
+  const wireguard = endpoints.length > 0;
+  return {
+    log: { level: 'warn' },
+    inbounds: [{ type: 'mixed', tag: 'local', listen: '127.0.0.1', listen_port: port }],
+    outbounds: [
+      ...outbounds.filter(outbound => outbound.type !== 'wireguard'),
+      ...(wireguard ? [{ type: 'direct', tag: 'wireguard-uplink', connect_timeout: '5s' }] : []),
+      { type: 'direct', tag: 'direct' },
+    ],
+    ...(wireguard ? { endpoints, dns: { servers: [{ type: 'local', tag: 'bootstrap' }], final: 'bootstrap' } } : {}),
+    route: {
+      rules: wireguard
+        ? [{ inbound: endpoints.map(endpoint => endpoint.tag), action: 'reject' }, ...compiledRules]
+        : compiledRules,
+      final: 'proxy', auto_detect_interface: true,
+      ...(wireguard ? { default_domain_resolver: 'bootstrap' } : {}),
+    },
+  };
+}
+
+export function buildConfig(node: NodeProfile, port: number, rules: RouteRule[] = []) {
+  if (node.protocol === 'wireguard') return buildSessionConfig(node, [], port, rules).config;
+  return compileConfig([compileOutbound(node, 'proxy')], port, rules, new Map([[node.id, { tag: 'proxy' }]]));
+}
+
+export type SessionPlan = {
+  config: ReturnType<typeof compileConfig>;
+  loaded: Map<string, { tag: string; revision: string; node: NodeProfile }>;
+};
+
+export function buildSessionConfig(selected: NodeProfile, candidates: NodeProfile[], port: number, rules: RouteRule[]): SessionPlan {
+  const outbounds = [compileOutbound(selected, 'node-0')];
+  const loaded = new Map([[selected.id, { tag: 'node-0', revision: nodeRevision(selected), node: selected }]]);
+  let wireguardCount = selected.protocol === 'wireguard' ? 1 : 0;
+  for (const candidate of candidates) {
+    if (loaded.has(candidate.id) || outbounds.length >= 2048) continue;
+    if (candidate.protocol === 'wireguard' && wireguardCount >= 32) continue;
+    const tag = `node-${outbounds.length}`;
+    try {
+      outbounds.push(compileOutbound(candidate, tag));
+      loaded.set(candidate.id, { tag, revision: nodeRevision(candidate), node: candidate });
+      if (candidate.protocol === 'wireguard') wireguardCount++;
+    } catch { /* Unsupported nodes remain visible in the node list. */ }
+  }
+  return {
+    config: compileConfig([{
+      type: 'selector', tag: 'proxy', outbounds: outbounds.map(outbound => outbound.tag),
+      default: 'node-0', interrupt_exist_connections: false,
+    }, ...outbounds], port, rules, loaded),
+    loaded,
+  };
+}
+
+export function withSelectedOutbound(plan: SessionPlan, tag: string): SessionPlan {
+  const [selector, ...outbounds] = plan.config.outbounds;
+  return { ...plan, config: { ...plan.config, outbounds: [{ ...selector, default: tag }, ...outbounds] } };
 }
 
 export function connectionSupport(node: NodeProfile): string | null {

@@ -6,4 +6,10 @@ The Windows build distributes sing-box 1.14.4 as a separate executable.
 - License: GNU General Public License, version 3. The complete license is included in the build artifact as `THIRD-PARTY-SING-BOX-LICENSE.txt`.
 - Release: https://github.com/SagerNet/sing-box/releases/tag/v1.14.4
 
-RelayDesk's own source code is licensed under the MIT license. sing-box is a separate program and retains its own license.
+The Windows build also distributes the upstream Mihomo 1.19.34 Windows amd64 v1 executable.
+
+- Project and source: https://github.com/MetaCubeX/mihomo/tree/v1.19.34
+- License: GNU General Public License, version 3. The complete license is included as `THIRD-PARTY-MIHOMO-LICENSE.txt`.
+- Release, source archives, vendor dependencies and toolchain: https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.34
+
+RelayDesk's own source code is licensed under the MIT license. Both proxy cores run as separate programs under their respective licenses.

@@ -12,7 +12,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 url = "2"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["time", "net"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["time", "net", "sync", "macros", "process", "io-util"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-winapi = { version = "0.3", features = ["dpapi", "wincrypt", "winbase", "minwinbase", "winerror", "handleapi", "processthreadsapi", "synchapi", "shellapi", "jobapi2", "winnt", "consoleapi", "wincon", "minwindef", "errhandlingapi"] }
+winapi = { version = "0.3", features = ["dpapi", "wincrypt", "winbase", "minwinbase", "winerror", "handleapi", "processthreadsapi", "synchapi", "shellapi", "jobapi2", "winnt", "consoleapi", "wincon", "minwindef", "errhandlingapi", "netioapi", "iphlpapi", "memoryapi", "tlhelp32"] }

@@ -3,6 +3,7 @@ use std::{ffi::c_void, fs, io::Write, mem, path::Path, ptr};
 use winapi::um::winbase::GlobalFree;
 
 const PER_CONNECTION: u32 = 75;
+const PROXY_FLAGS: u32 = 0x0f;
 
 #[repr(C)]
 union Value {
@@ -171,9 +172,8 @@ pub fn recover(path: &Path) -> Result<(), ()> {
         if current.pac == journal.active.pac {
             current.pac = journal.previous.pac;
         }
-        if current.flags & 15 == journal.active.flags {
-            current.flags = journal.previous.flags;
-        }
+        let unchanged = PROXY_FLAGS & !(current.flags ^ journal.active.flags);
+        current.flags = (current.flags & !unchanged) | (journal.previous.flags & unchanged);
         current.server = journal.previous.server;
         apply(&current)?;
     }
@@ -200,7 +200,8 @@ pub fn enable(path: &Path, port: u16) -> Result<(), ()> {
     fs::rename(&temporary, path).map_err(|_| ())?;
     if apply(&journal.active).is_err()
         || !query().is_ok_and(|actual| {
-            actual.flags & 15 == journal.active.flags && actual.server == journal.active.server
+            actual.flags & PROXY_FLAGS == journal.active.flags
+                && actual.server == journal.active.server
         })
     {
         if apply(&journal.previous).is_ok() {
@@ -209,4 +210,80 @@ pub fn enable(path: &Path, port: u16) -> Result<(), ()> {
         return Err(());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn windows_restores_pac_and_keeps_user_changes_to_auto_detection() {
+        if std::env::var_os("RELAYDESK_WINDOWS_PROXY_SMOKE").is_none() {
+            return;
+        }
+        struct Restore(Settings, PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = apply(&self.0);
+                let _ = fs::remove_file(&self.1);
+                let _ = fs::remove_file(self.1.with_extension("tmp"));
+            }
+        }
+        let journal = std::env::temp_dir().join(format!(
+            "relaydesk-proxy-fixture-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let restore = Restore(query().unwrap(), journal);
+        let path = &restore.1;
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<_>>();
+
+        let initial = Settings {
+            flags: 1 | 4 | 8,
+            server: wide("127.0.0.1:9"),
+            bypass: wide("*.fixture.test;<local>"),
+            pac: wide("https://fixture.invalid/settings.pac"),
+        };
+        apply(&initial).unwrap();
+        let baseline = query().unwrap();
+        assert_eq!(baseline.flags & PROXY_FLAGS, initial.flags);
+        assert_eq!(baseline.pac, initial.pac);
+        assert_eq!(baseline.bypass, initial.bypass);
+        enable(path, 19371).unwrap();
+        assert_eq!(query().unwrap().flags & PROXY_FLAGS, 3);
+        recover(path).unwrap();
+        assert_eq!(query().unwrap(), baseline);
+
+        let initial = Settings {
+            flags: 1,
+            server: Vec::new(),
+            bypass: Vec::new(),
+            pac: Vec::new(),
+        };
+        apply(&initial).unwrap();
+        let baseline = query().unwrap();
+        enable(path, 19371).unwrap();
+        let mut edited = query().unwrap();
+        edited.flags |= 8;
+        apply(&edited).unwrap();
+        assert_eq!(query().unwrap().flags & PROXY_FLAGS, 11);
+        recover(path).unwrap();
+        let restored = query().unwrap();
+        assert_eq!(restored.flags & PROXY_FLAGS, 9);
+        assert_eq!(restored.server, baseline.server);
+
+        enable(path, 19371).unwrap();
+        let external = Settings {
+            flags: 3,
+            server: wide("127.0.0.1:9"),
+            ..initial
+        };
+        apply(&external).unwrap();
+        let external = query().unwrap();
+        recover(path).unwrap();
+        assert_eq!(query().unwrap(), external);
+        assert!(!path.exists());
+        apply(&restore.0).unwrap();
+        assert_eq!(query().unwrap(), restore.0);
+    }
 }

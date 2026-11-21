@@ -1,10 +1,9 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   Activity,
   Boxes,
-  CircleHelp,
   Cat,
   Link2,
   List,
@@ -16,26 +15,60 @@ import {
   Search,
   Settings2,
   Shield,
+  Star,
   Upload,
   X,
 } from "lucide-react";
+import { nodeRevision, type NodeProfile } from "./subscription";
+import { buildConfig, buildSessionConfig, connectionSupport, normalizeRuleValue, ruleTypes, withSelectedOutbound, type RouteRule, type SessionPlan } from "./config";
+import { ConnectionMonitor, TrafficDashboard, TrafficSidebar, useTelemetry } from "./telemetry";
+import { SubscriptionCard, SubscriptionRequestFields } from "./SubscriptionCard";
+import { WebsiteChecks } from "./WebsiteChecks";
+import { DownloadCheck } from "./DownloadCheck";
+import { MihomoGroups } from "./MihomoGroups";
+import { EventLog } from "./EventLog";
+import { useWorkspace } from "./useWorkspace";
 import {
-  parseSubscription,
-  type ImportResult,
-  type NodeProfile,
-} from "./subscription";
-import { buildConfig, connectionSupport, type RouteRule } from "./config";
+  defaultSubscriptionRequest, parseRefreshHours, preferredNode, refreshOptions,
+  type EntryMode, type RoutingMode, type SubscriptionRequest, type Workspace,
+} from "./workspace";
 import "./style.css";
 import "./accessibility.css";
 import "./rules.css";
 import "./dashboard.css";
 
 type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "日志" | "测试" | "诊断" | "设置";
-type EntryMode = "system" | "tun" | "local";
+type Probe = { revision: string; label: string; milliseconds?: number };
+const nodeHealthLabels = {
+  checking: "正在确认节点连通性",
+  healthy: "节点探测成功",
+  unreachable: "节点连续两次探测失败",
+  unavailable: "暂时无法检测节点",
+};
+type ProxyStatus = {
+  phase: "running" | "recovering" | "stopped" | "busy";
+  message: string | null;
+  session_id: string | null;
+  node_tag?: string | null;
+  node_health?: keyof typeof nodeHealthLabels | null;
+};
+
+function fallbackGroups(plan: SessionPlan | undefined, subscriptions: Workspace["subscriptions"], favorites: Set<string>) {
+  if (!plan) return [];
+  return subscriptions.map(profile => [...profile.parsed.nodes]
+    .sort((first, second) => Number(favorites.has(second.id)) - Number(favorites.has(first.id)))
+    .flatMap(node => plan.loaded.get(node.id)?.tag ?? []))
+    .filter(group => group.length > 1);
+}
 const entryModes: { value: EntryMode; label: string }[] = [
   { value: "system", label: "系统代理" },
   { value: "tun", label: "TUN" },
   { value: "local", label: "本地端口" },
+];
+const routingModes: { value: RoutingMode; label: string }[] = [
+  { value: "rule", label: "规则" },
+  { value: "global", label: "全局" },
+  { value: "direct", label: "直连" },
 ];
 const nav: { name: Page; icon: typeof Activity }[] = [
   { name: "概览", icon: LayoutDashboard },
@@ -50,183 +83,257 @@ const nav: { name: Page; icon: typeof Activity }[] = [
 ];
 function App() {
   const [page, setPage] = useState<Page>("概览");
-  const [nodes, setNodes] = useState<NodeProfile[]>([]);
-  const [selected, setSelected] = useState<string>();
+  const work = useWorkspace();
+  const { subscriptions, rules, selected, favorites, autoReconnect, autoFailover, proxyPort, entryMode: mode } = work.workspace;
+  const starred = useMemo(() => new Set(favorites), [favorites]);
+  const nodes = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes), [subscriptions]);
+  const unavailableNodes = useMemo(() => new Map(nodes.map(node => [node.id, connectionSupport(node)])), [nodes]);
+  const ruleTargets = useMemo(() => subscriptions.flatMap(profile => profile.parsed.nodes
+    .filter(node => !unavailableNodes.get(node.id))
+    .map(node => ({ id: node.id, label: `${profile.name} · #${node.sourceIndex} ${node.name}` }))), [subscriptions, unavailableNodes]);
+  const [subscriptionFilter, setSubscriptionFilter] = useState("");
+  const [nodeSort, setNodeSort] = useState("source");
+  const [onlyFavorites, setOnlyFavorites] = useState(false);
   const [dialog, setDialog] = useState(false);
   const [text, setText] = useState("");
+  const [importRequest, setImportRequest] = useState<SubscriptionRequest>();
   const [error, setError] = useState("");
+  const [importing, setImporting] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<ImportResult>();
+  const [settingsError, setSettingsError] = useState("");
   const [search, setSearch] = useState("");
   const file = useRef<HTMLInputElement>(null);
   const [running, setRunning] = useState(false);
-  const [mode, setMode] = useState<EntryMode>("system");
+  const [recovering, setRecovering] = useState(false);
+  const [recoveryMessage, setRecoveryMessage] = useState("");
+  const [nodeHealth, setNodeHealth] = useState<ProxyStatus["node_health"]>(null);
+  const [runningNode, setRunningNode] = useState<NodeProfile>();
+  const [runningOriginal, setRunningOriginal] = useState<{ id: string; name: string; content: string }>();
+  const [liveRouting, setLiveRouting] = useState<RoutingMode>();
+  const routingMode = running ? liveRouting ?? work.workspace.routingMode : work.workspace.routingMode;
+  const session = useRef<SessionPlan>();
+  const telemetry = useTelemetry(running && !recovering);
   const [port, setPort] = useState<number>();
   const [connectionError, setConnectionError] = useState("");
   const [checkResult, setCheckResult] = useState("");
   const [checking, setChecking] = useState(false);
-  const [rules, setRules] = useState<RouteRule[]>([]);
-  const [latencies, setLatencies] = useState<Record<string, string>>({});
+  const diagnosticsEpoch = useRef(0);
+  const [diagnosticsVersion, setDiagnosticsVersion] = useState(0);
+  const confirmedSession = useRef<string | null>(null);
+  const [latencies, setLatencies] = useState<Record<string, Probe>>({});
   const [testing, setTesting] = useState(false);
   const [exitIp, setExitIp] = useState("");
   const [localTcp, setLocalTcp] = useState("尚未测试");
   const [localTcpBusy, setLocalTcpBusy] = useState(false);
   const cancelTesting = useRef(false);
-  const [savedContent, setSavedContent] = useState("");
-  const [savedSource, setSavedSource] = useState("");
-  const [storageError, setStorageError] = useState("");
-  const [storageReady, setStorageReady] = useState(!isTauri());
-  const saveQueue = useRef<Promise<void>>(Promise.resolve());
-  function persist(data: string) {
-    const next = saveQueue.current
-      .catch(() => {})
-      .then(() => invoke<void>("save_subscription", { data }));
-    saveQueue.current = next;
-    return next;
+  const probeBatch = useRef<string>();
+  async function saveSettings(edit: (previous: Workspace) => Workspace) {
+    setSettingsError("");
+    try {
+      await work.commit(edit);
+    } catch (error) {
+      setSettingsError(typeof error === "string" ? error : error instanceof Error ? error.message : "设置保存失败");
+    }
+  }
+  function resetDiagnostics() {
+    diagnosticsEpoch.current += 1;
+    setDiagnosticsVersion(diagnosticsEpoch.current);
+    setChecking(false);
+    setExitIp("");
+    setCheckResult("");
+  }
+  function clearSession() {
+    session.current = undefined;
+    confirmedSession.current = null;
+    setRunning(false);
+    setRecovering(false);
+    setRecoveryMessage("");
+    setNodeHealth(null);
+    setRunningNode(undefined);
+    setRunningOriginal(undefined);
+    setLiveRouting(undefined);
+    setPort(undefined);
+    resetDiagnostics();
   }
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || busy || !running) return;
     let cancelled = false;
-    invoke<string | null>("load_subscription")
-      .then((raw) => {
-        if (!raw || cancelled) return;
-        const saved = JSON.parse(raw) as {
-          content: string;
-          source?: string;
-          selected: number;
-        };
-        const parsed = parseSubscription(saved.content);
-        setNodes(parsed.nodes);
-        setResult(parsed);
-        setSavedContent(saved.content);
-        setSavedSource(saved.source || "");
-        setSelected(
-          parsed.nodes[saved.selected]?.id ||
-            parsed.nodes.find((n) => !connectionSupport(n))?.id,
-        );
-      })
-      .catch(() => {
-        if (!cancelled) setStorageError("已保存的订阅读取失败，原数据仍保留。");
-      })
-      .finally(() => {
-        if (!cancelled) setStorageReady(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  useEffect(() => {
-    if (!isTauri() || busy) return;
-    let cancelled = false;
-    const timer = window.setInterval(() => {
-      invoke<boolean>("proxy_running")
-        .then((active) => {
-          if (cancelled) return;
-          setRunning(active);
-          if (!active) setPort(undefined);
-        })
-        .catch(() => {
-          if (cancelled) return;
-          setRunning(false);
-          setPort(undefined);
-        });
-    }, 2000);
+    let timer: number;
+    async function poll() {
+      try {
+        const status = await invoke<ProxyStatus>("proxy_status");
+        if (cancelled || status.phase === "busy") return;
+        if (status.phase === "stopped") clearSession();
+        if (status.phase === "running" && status.session_id) {
+          if (confirmedSession.current && confirmedSession.current !== status.session_id) resetDiagnostics();
+          confirmedSession.current = status.session_id;
+          const plan = session.current;
+          if (plan && status.node_tag && plan.config.outbounds[0].default !== status.node_tag) {
+            const standby = Array.from(plan.loaded.values()).find(node => node.tag === status.node_tag);
+            if (standby) {
+              session.current = withSelectedOutbound(plan, standby.tag);
+              setRunningNode(standby.node);
+              resetDiagnostics();
+            }
+          }
+        }
+        setRecovering(status.phase === "recovering");
+        setRecoveryMessage(status.message ?? "");
+        setNodeHealth(status.node_health ?? null);
+        if (status.phase === "recovering" && confirmedSession.current) {
+          confirmedSession.current = null;
+          resetDiagnostics();
+        }
+      } catch {
+        // A transient IPC failure leaves the last confirmed status visible.
+      } finally {
+        if (!cancelled) timer = window.setTimeout(poll, 1000);
+      }
+    }
+    timer = window.setTimeout(poll, 600);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [busy]);
-  const filtered = nodes.filter((n) =>
-    `#${n.sourceIndex ?? ""} ${n.name} ${n.protocol} ${n.server}`
+  }, [busy, running]);
+  useEffect(() => {
+    if (!isTauri() || !work.ready) return;
+    void invoke("configure_recovery", { enabled: autoReconnect }).catch(() =>
+      setSettingsError("无法更新当前会话的自动恢复设置"));
+  }, [autoReconnect, work.ready]);
+  useEffect(() => {
+    if (!isTauri() || !running || runningOriginal || !work.ready) return;
+    void invoke("configure_failover", { enabled: autoFailover, fallbackGroups: fallbackGroups(session.current, subscriptions, starred) })
+      .catch(() => setSettingsError("无法更新当前会话的自动换线设置"));
+  }, [autoFailover, running, runningOriginal, starred, subscriptions, work.ready]);
+  const activeFilter = subscriptions.find(profile => profile.id === subscriptionFilter);
+  function probe(node: NodeProfile) {
+    const value = latencies[node.id];
+    return value?.revision === nodeRevision(node) ? value : undefined;
+  }
+  const filtered = (activeFilter?.parsed.nodes ?? nodes).filter((n) =>
+    (!onlyFavorites || starred.has(n.id)) && `#${n.sourceIndex ?? ""} ${n.name} ${n.protocol} ${n.server}`
       .toLowerCase()
       .includes(search.trim().toLowerCase()),
   );
+  if (nodeSort === "latency") {
+    filtered.sort((a, b) => (probe(a)?.milliseconds ?? Number.MAX_SAFE_INTEGER)
+      - (probe(b)?.milliseconds ?? Number.MAX_SAFE_INTEGER));
+  }
   async function add() {
-    setBusy(true);
+    setImporting(true);
     setError("");
     try {
-      if (!storageReady) throw new Error("正在读取本地订阅，请稍候");
-      if (running) throw new Error("请先停止当前代理");
-      let content = text.trim();
-      const source = /^https?:\/\//i.test(content) ? content : "";
-      if (source) {
-        if (!isTauri()) throw new Error("订阅地址需要在桌面应用中下载");
-        content = await invoke<string>("fetch_subscription", {
-          address: source,
-        });
-      }
-      const parsed = parseSubscription(content);
-      const index = parsed.nodes.findIndex((n) => !connectionSupport(n));
-      if (isTauri())
-        await persist(JSON.stringify({ content, source, selected: index }));
-      setNodes(parsed.nodes);
-      setSelected(parsed.nodes[index]?.id);
-      setResult(parsed);
-      setSavedContent(content);
-      setSavedSource(source);
-      setStorageError("");
+      const request = importRequest && { ...importRequest, userAgent: importRequest.userAgent.trim() };
+      const original = await work.add(text, request);
+      setSubscriptionFilter("");
       setText("");
+      setImportRequest(undefined);
       setDialog(false);
-      setPage("节点");
+      setPage(original ? "订阅" : "节点");
     } catch (e) {
       setError(
         typeof e === "string" ? e : e instanceof Error ? e.message : "导入失败",
       );
     } finally {
-      setBusy(false);
+      setImporting(false);
     }
   }
-  const current = nodes.find((n) => n.id === selected);
-  useEffect(() => {
-    if (!isTauri() || !savedContent || !selected) return;
-    const index = nodes.findIndex((n) => n.id === selected);
-    if (index < 0) return;
-    persist(
-      JSON.stringify({
-        content: savedContent,
-        source: savedSource,
-        selected: index,
-      }),
-    ).catch(() => setStorageError("节点选择保存失败"));
-  }, [selected, savedContent, savedSource, nodes]);
+  const preferred = nodes.find(n => n.id === selected);
+  const current = running ? runningNode ?? preferred : preferred;
+  const originalProfile = subscriptions.find(profile => profile.id === work.workspace.mihomoProfile && profile.parsed.mihomo);
+  const liveOriginalProfile = runningOriginal && subscriptions.find(profile => profile.id === runningOriginal.id);
+  const originalName = running ? (liveOriginalProfile?.name ?? runningOriginal?.name) : originalProfile?.name;
+  const originalUpdated = runningOriginal && liveOriginalProfile && runningOriginal.content !== liveOriginalProfile.content;
+  const isSelected = (node: NodeProfile) => !originalName && (running
+    ? runningNode?.id === node.id && nodeRevision(runningNode) === nodeRevision(node)
+    : node.id === selected);
   async function checkProxy() {
-    if (!port) return;
+    if (!port || busy || recovering) return;
+    const epoch = diagnosticsEpoch.current;
     setChecking(true);
     setCheckResult("");
     try {
       const ms = await invoke<number>("check_connection", { port });
-      setCheckResult(`网络验证成功 · ${ms} ms`);
+      if (epoch === diagnosticsEpoch.current) setCheckResult(`当前路由可达 · ${ms} ms`);
     } catch (e) {
-      setCheckResult(typeof e === "string" ? e : "网络验证失败");
+      if (epoch === diagnosticsEpoch.current) setCheckResult(typeof e === "string" ? e : "网络验证失败");
     } finally {
-      setChecking(false);
+      if (epoch === diagnosticsEpoch.current) setChecking(false);
+    }
+  }
+  async function prepareSession(node: NodeProfile, localPort: number): Promise<SessionPlan> {
+    const candidate = buildSessionConfig(node, nodes, localPort, rules);
+    if (await invoke<boolean>("validate_proxy_config", { config: candidate.config })) return candidate;
+    const single = buildConfig(node, localPort, rules);
+    if (!await invoke<boolean>("validate_proxy_config", { config: single })) {
+      throw new Error("所选节点或规则未通过内核配置检查");
+    }
+    return { config: single, loaded: new Map() };
+  }
+  function startProxy(plan: SessionPlan) {
+    return invoke("start_proxy", {
+      config: plan.config, mode, routingMode, autoReconnect, autoFailover,
+      fallbackGroups: fallbackGroups(plan, subscriptions, starred),
+    });
+  }
+  async function changeRouting(value: RoutingMode) {
+    if (busy || recovering || value === routingMode) return;
+    setBusy(true);
+    setConnectionError("");
+    try {
+      if (running) {
+        await invoke("set_routing_mode", { mode: value });
+        setLiveRouting(value);
+        resetDiagnostics();
+      }
+      await saveSettings(state => runningOriginal ? { ...state, subscriptions: state.subscriptions.map(profile =>
+        profile.id === runningOriginal.id ? { ...profile, mihomoMode: value } : profile,
+      ) } : { ...state, routingMode: value });
+    } catch (error) {
+      setConnectionError(typeof error === "string" ? error : "路由模式切换失败");
+    } finally {
+      setBusy(false);
     }
   }
   async function selectNode(node: NodeProfile) {
-    if (busy || testing || node.id === selected) return;
-    if (!running || !port || !current) {
-      setSelected(node.id);
+    if (busy || recovering || runningOriginal || testing || isSelected(node)) return;
+    const remember = () => saveSettings(state => ({ ...state,
+      selected: preferredNode(state.subscriptions, node.id),
+      mihomoProfile: undefined,
+    }));
+    const previous = session.current;
+    if (!running || !port || !previous) {
+      await remember();
       return;
     }
     setBusy(true);
     setConnectionError("");
-    setCheckResult("");
-    setExitIp("");
+    resetDiagnostics();
     try {
-      const next = buildConfig(node, port, rules);
-      const previous = buildConfig(current, port, rules);
+      const loaded = previous.loaded.get(node.id);
+      if (loaded && loaded.revision === nodeRevision(node)) {
+        await invoke("switch_proxy_node", { tag: loaded.tag });
+        session.current = withSelectedOutbound(previous, loaded.tag);
+        setRunningNode(node);
+        await remember();
+        return;
+      }
+      const next = await prepareSession(node, port);
+      confirmedSession.current = null;
       await invoke("stop_proxy");
       try {
-        await invoke("start_proxy", { config: next, mode });
-        setSelected(node.id);
+        await startProxy(next);
+        session.current = next;
+        setRunningNode(node);
         setRunning(true);
+        await remember();
       } catch (failure) {
         try {
-          await invoke("start_proxy", { config: previous, mode });
+          await startProxy(previous);
           setRunning(true);
         } catch {
-          setRunning(false);
-          setPort(undefined);
+          clearSession();
         }
         throw failure;
       }
@@ -243,44 +350,61 @@ function App() {
     cancelTesting.current = false;
     setTesting(true);
     try {
-      const queue = items.filter((node) => !connectionSupport(node));
+      const batch = await invoke<string>("begin_probe_batch");
+      probeBatch.current = batch;
+      const queue = items.filter(node => !unavailableNodes.get(node.id));
       let next = 0;
       async function testQueue() {
         while (next < queue.length && !cancelTesting.current) {
           const node = queue[next++];
-          setLatencies((previous) => ({ ...previous, [node.id]: "测试中" }));
-          let result: string;
+          setLatencies((previous) => ({ ...previous, [node.id]: { revision: nodeRevision(node), label: "测试中" } }));
+          let label: string;
+          let milliseconds: number | undefined;
           try {
             const localPort = await invoke<number>("allocate_port");
-            const ms = await invoke<number>("probe_node", {
-              config: buildConfig(node, localPort),
-              port: localPort,
-            });
-            result = `${ms} ms`;
+            if (cancelTesting.current) {
+              label = "已取消";
+            } else {
+              const ms = await invoke<number>("probe_node", { config: buildConfig(node, localPort), port: localPort, batch });
+              milliseconds = ms;
+              label = `${ms} ms`;
+            }
           } catch (e) {
-            result = typeof e === "string" ? e : "代理请求失败";
+            label = typeof e === "string" ? e : "代理请求失败";
           }
           setLatencies((previous) => ({
             ...previous,
-            [node.id]: `${result} · ${new Date().toLocaleTimeString()}`,
+            [node.id]: { revision: nodeRevision(node), label: `${label} · ${new Date().toLocaleTimeString()}`, milliseconds },
           }));
         }
       }
       await Promise.all(Array.from({ length: Math.min(4, queue.length) }, testQueue));
+    } catch (error) {
+      setConnectionError(typeof error === "string" ? error : "启动测速失败");
     } finally {
+      const batch = probeBatch.current;
+      probeBatch.current = undefined;
+      if (batch) await invoke("cancel_probe_batch", { batch }).catch(() => {});
       setTesting(false);
     }
   }
+  function stopNodeTests() {
+    cancelTesting.current = true;
+    const batch = probeBatch.current;
+    if (batch) void invoke("cancel_probe_batch", { batch }).catch(() => setConnectionError("无法取消正在运行的测速"));
+  }
   async function showExitIp() {
-    if (!port) return;
+    if (!port || busy || recovering) return;
+    const epoch = diagnosticsEpoch.current;
     setChecking(true);
     setExitIp("查询中");
     try {
-      setExitIp(await invoke<string>("check_exit_ip", { port }));
+      const result = await invoke<string>("check_exit_ip", { port });
+      if (epoch === diagnosticsEpoch.current) setExitIp(result);
     } catch (e) {
-      setExitIp(typeof e === "string" ? e : "查询失败");
+      if (epoch === diagnosticsEpoch.current) setExitIp(typeof e === "string" ? e : "查询失败");
     } finally {
-      setChecking(false);
+      if (epoch === diagnosticsEpoch.current) setChecking(false);
     }
   }
   async function testLocalTcp() {
@@ -294,24 +418,49 @@ function App() {
       setLocalTcpBusy(false);
     }
   }
+  async function applyOriginalUpdate() {
+    const next = liveOriginalProfile;
+    if (busy || recovering || !runningOriginal || !next?.parsed.mihomo) return;
+    setBusy(true);
+    setConnectionError("");
+    try {
+      await invoke("reload_mihomo", { config: next.parsed.mihomo });
+      setRunningOriginal({ id: next.id, name: next.name, content: next.content });
+      resetDiagnostics();
+    } catch (failure) {
+      setConnectionError(typeof failure === "string" ? failure : "配置更新失败");
+    } finally {
+      setBusy(false);
+    }
+  }
   async function toggleProxy() {
     setBusy(true);
     setConnectionError("");
-    setCheckResult("");
+    resetDiagnostics();
+    setRecoveryMessage("");
     try {
       if (!isTauri()) throw new Error("请在桌面应用中连接");
       if (running) {
         await invoke("stop_proxy");
-        setRunning(false);
-        setPort(undefined);
-        setExitIp("");
+        clearSession();
       } else {
-        if (!current) throw new Error("请先导入并选择节点");
-        const localPort = await invoke<number>("allocate_port");
-        await invoke("start_proxy", {
-          config: buildConfig(current, localPort, rules),
-          mode,
-        });
+        const original = originalProfile?.parsed.mihomo;
+        if (!original && !preferred) throw new Error("请先导入并选择节点或原配置");
+        const localPort = proxyPort ?? await invoke<number>("allocate_port");
+        if (original && originalProfile) {
+          const originalMode = originalProfile.mihomoMode ??
+            (original.mode === "global" || original.mode === "direct" ? original.mode : "rule");
+          await invoke("start_mihomo", { config: original, port: localPort, mode, routingMode: originalMode, autoReconnect,
+            selections: originalProfile.mihomoSelections });
+          setRunningOriginal({ id: originalProfile.id, name: originalProfile.name, content: originalProfile.content });
+          setLiveRouting(originalMode);
+        } else if (preferred) {
+          const next = await prepareSession(preferred, localPort);
+          await startProxy(next);
+          session.current = next;
+          setRunningNode(preferred);
+          setLiveRouting(routingMode);
+        }
         setPort(localPort);
         setRunning(true);
       }
@@ -346,17 +495,14 @@ function App() {
             </button>
           ))}
         </nav>
-        <div className="side-bottom">
-          <CircleHelp size={16} />
-          <div>实时流量未接入<small>↑ —　↓ —</small></div>
-        </div>
+        <TrafficSidebar telemetry={telemetry} />
       </aside>
       <div className="workspace">
         <header>
           <span>个人工作区</span>
           <span className="header-right">
             <span className="dot" />
-            {running ? "内核运行中" : "内核未运行"}
+            {recovering ? "正在恢复代理" : running ? "内核运行中" : "内核未运行"}
           </span>
         </header>
         <main>
@@ -378,12 +524,13 @@ function App() {
               </p>
             </div>
             {["概览", "节点", "订阅"].includes(page) && (
-              <button className="primary" onClick={() => setDialog(true)}>
+              <button className="primary" disabled={!work.ready} onClick={() => setDialog(true)}>
                 <Plus size={16} />
                 导入订阅
               </button>
             )}
           </div>
+          {(work.storageError || settingsError) && <p className="notice" role="alert">{work.storageError || settingsError}</p>}
           {page === "概览" && (
             <>
               <section className="connection">
@@ -391,20 +538,20 @@ function App() {
                   <div className="section-label">连接状态</div>
                   <div className="status">
                     <span className="status-dot" />
-                    {running ? "内核运行中" : "未连接"}
+                    {recovering ? "正在恢复代理" : running ? "内核运行中" : "未连接"}
                   </div>
                   <p>
-                    {connectionError ||
+                    {connectionError || recoveryMessage ||
                       (running
                         ? `本地 HTTP / SOCKS5：127.0.0.1:${port}`
                         : "代理未运行")}
-                    {running && (
+                    {running && !recovering && (
                       <>
                         <br />
                         {checkResult || "尚未验证远程连接"}{" "}
                         <button
                           className="link"
-                          disabled={checking}
+                          disabled={checking || busy}
                           onClick={checkProxy}
                         >
                           {checking ? "检查中…" : "检查连接"}
@@ -416,54 +563,64 @@ function App() {
                 <div className="connection-actions">
                   <label>
                     <span>接管方式</span>
-                    <select value={mode} disabled={busy || running} onChange={(e) => setMode(e.target.value as EntryMode)}>
+                    <select value={mode} disabled={busy || running || !work.ready} onChange={(e) => {
+                      const entryMode = e.target.value as EntryMode;
+                      void saveSettings(state => ({ ...state, entryMode }));
+                    }}>
                       {entryModes.map(({ value, label }) => <option key={value} value={value}>{label}</option>)}
                     </select>
                   </label>
                   {mode === "tun" && !running && <small>启动时需要管理员授权</small>}
                   <button
                     className="connect"
-                    disabled={busy || (!running && (!current || testing)) || !isTauri()}
+                    disabled={busy || (!running && ((!current && !originalName) || testing)) || !isTauri()}
                     onClick={toggleProxy}
                   >
                     {busy ? "处理中…" : running ? "停止" : "连接"}
                   </button>
                 </div>
               </section>
-              <TrafficDashboard />
+              {originalName && mode === "tun" && <div className="notice">
+                TUN 转发后，Mihomo 的进程、来源地址、来源端口和入口名称规则按内部连接匹配。
+              </div>}
+              {originalUpdated && <div className="notice" role="status">
+                订阅配置已更新。
+                <button className="link inline-action" disabled={busy || recovering}
+                  onClick={() => void applyOriginalUpdate()}>应用到当前连接</button>
+              </div>}
+              {runningOriginal && <MihomoGroups mode={routingMode} disabled={busy || recovering}
+                onMode={value => void changeRouting(value)} onChange={async (group, choice) => {
+                  resetDiagnostics();
+                  await saveSettings(state => ({ ...state, subscriptions: state.subscriptions.map(profile =>
+                    profile.id === runningOriginal.id
+                      ? { ...profile, mihomoSelections: { ...profile.mihomoSelections, [group]: choice } }
+                      : profile,
+                  ) }));
+                }} />}
+              <TrafficDashboard telemetry={telemetry} />
               <div className="stats">
                 <div>
-                  <span>当前节点</span>
-                  <strong>{current?.name || "尚未选择"}</strong>
+                  <span>{originalName ? "当前配置" : "当前节点"}</span>
+                  <strong>{originalName || current?.name || "尚未选择"}</strong>
                   <small>
-                    {current
+                    {originalName ? "Mihomo 原配置" : current
                       ? current.protocol.toUpperCase()
                       : "导入订阅后选择节点"}
                   </small>
+                  {originalName && !running && <button className="link" disabled={busy}
+                    onClick={() => void saveSettings(state => ({ ...state, mihomoProfile: undefined }))}>切回节点模式</button>}
+                  {nodeHealth && <small role="status">{nodeHealthLabels[nodeHealth]}</small>}
                 </div>
                 <div>
                   <span>代理模式</span>
                   <strong>{entryModes.find((entry) => entry.value === mode)?.label}</strong>
-                  <small>HTTP / SOCKS5</small>
-                </div>
-                <div>
-                  <span>本次上传</span>
-                  <strong>—</strong>
-                  <small>暂无流量数据</small>
-                </div>
-                <div>
-                  <span>本次下载</span>
-                  <strong>—</strong>
-                  <small>暂无流量数据</small>
+                  <small>{routingModes.find(entry => entry.value === routingMode)?.label}路由</small>
                 </div>
               </div>
               <div className="columns">
+                <WebsiteChecks key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
                 <section className="panel">
-                  <div className="panel-head"><h2>网站测试</h2></div>
-                  <div className="site-grid">{["Apple", "GitHub", "Google", "YouTube"].map(site => <div key={site}><strong>{site}</strong><span>测试未接入</span></div>)}</div>
-                </section>
-                <section className="panel">
-                  <div className="panel-head"><h2>IP 信息</h2><button className="link" disabled={!running || checking} onClick={showExitIp}>刷新</button></div>
+                  <div className="panel-head"><h2>当前路由出口 IP</h2><button className="link" disabled={!running || recovering || checking || busy} onClick={showExitIp}>刷新</button></div>
                   <div className="empty">{exitIp || (running ? "尚未检查出口 IP" : "连接后可检查出口 IP")}</div>
                 </section>
                 <section className="panel">
@@ -504,14 +661,10 @@ function App() {
                     <h2>运行环境</h2>
                   </div>
                   <div className="env-row">
-                    <span>sing-box</span>
+                    <span>代理内核</span>
                     <span className="muted">
-                      {running ? "运行中" : "未运行"}
+                      {running ? (runningOriginal ? "Mihomo" : "sing-box") : "未运行"}
                     </span>
-                  </div>
-                  <div className="env-row">
-                    <span>Mihomo</span>
-                    <span className="muted">未接入</span>
                   </div>
                   <div className="env-row">
                     <span>接管方式</span>
@@ -535,18 +688,34 @@ function App() {
                     onChange={(e) => setSearch(e.target.value)}
                   />
                 </label>
+                {subscriptions.length > 1 && <select className="toolbar-select" aria-label="筛选订阅来源" value={activeFilter?.id ?? ""} onChange={event => setSubscriptionFilter(event.target.value)}>
+                  <option value="">全部订阅</option>
+                  {subscriptions.map(profile => <option key={profile.id} value={profile.id}>{profile.name}</option>)}
+                </select>}
+                <select className="toolbar-select" aria-label="排序节点" value={nodeSort} onChange={event => setNodeSort(event.target.value)}>
+                  <option value="source">订阅顺序</option>
+                  <option value="latency">延迟优先</option>
+                </select>
+                <button className="link" aria-pressed={onlyFavorites} onClick={() => setOnlyFavorites(value => !value)}>
+                  {onlyFavorites ? "显示全部" : "仅看收藏"}
+                </button>
                 <button
                   className="link"
-                  disabled={busy || !filtered.length || !isTauri()}
+                  disabled={busy || (!testing && !filtered.length) || !isTauri()}
                   onClick={() =>
                     testing
-                      ? (cancelTesting.current = true)
+                      ? stopNodeTests()
                       : testNodes(filtered)
                   }
                 >
                   {testing ? "取消测速" : "一键测试延迟"}
                 </button>
                 <span>{filtered.length} 个节点</span>
+                <div className="mode-switch" role="group" aria-label="路由模式">
+                  {routingModes.map(option => <button className="link" key={option.value}
+                    aria-pressed={routingMode === option.value} disabled={busy || recovering || !work.ready}
+                    onClick={() => void changeRouting(option.value)}>{option.label}</button>)}
+                </div>
               </div>
               <div className="group-heading"><strong>已导入节点</strong><span>手动选择 · {filtered.length} 个节点</span></div>
               {connectionError && (
@@ -556,24 +725,24 @@ function App() {
               )}
               {running && (
                 <div className="notice">
-                  当前出口 IP：{exitIp || "尚未检查"}{" "}
+                  当前路由出口 IP：{exitIp || "尚未检查"}{" "}
                   <button
                     className="link"
-                    disabled={checking}
+                    disabled={checking || busy || recovering}
                     onClick={showExitIp}
                   >
                     检查出口 IP
                   </button>
                 </div>
               )}
-              {result?.warnings.length ? (
+              {activeFilter?.parsed.warnings.length ? (
                 <div className="notice">
-                  {result.warnings.length} 项未导入，请检查订阅格式。
+                  {activeFilter.parsed.warnings.length} 项未导入，请检查订阅格式。
                 </div>
               ) : null}
               <div className="node-grid">
                 {filtered.map((n) => (
-                  <div className={`node-card ${selected === n.id ? "selected" : ""}`} key={n.id}>
+                  <div className={`node-card ${isSelected(n) ? "selected" : ""}`} key={n.id}>
                     <div className="node-name">
                       <span className="node-icon">
                         <Globe2 size={17} />
@@ -588,28 +757,40 @@ function App() {
                     <span>
                       {n.protocol.toUpperCase()} · {n.transport}
                     </span>
-                    <span className="probe-result" title={connectionSupport(n) || latencies[n.id]}>
-                      {connectionSupport(n)
+                    <span className="probe-result" title={unavailableNodes.get(n.id) || probe(n)?.label}>
+                      {unavailableNodes.get(n.id)
                         ? "暂不支持"
-                        : latencies[n.id] || "未测试"}
+                        : probe(n)?.label || "未测试"}
                     </span>
-                    <button
+                    <div className="node-actions">
+                      <button
                       className="link"
                       disabled={
                         busy ||
+                        recovering ||
+                        !!runningOriginal ||
                         testing ||
-                        !!connectionSupport(n) ||
-                        selected === n.id
+                        !!unavailableNodes.get(n.id) ||
+                        isSelected(n)
                       }
-                      title={connectionSupport(n) || undefined}
+                      title={unavailableNodes.get(n.id) || undefined}
                       onClick={() => selectNode(n)}
                     >
-                      {selected === n.id
+                      {isSelected(n)
                         ? "已选择"
-                        : connectionSupport(n)
+                        : unavailableNodes.get(n.id)
                           ? "不可用"
-                          : "切换"}
-                    </button>
+                          : runningNode?.id === n.id ? "应用更新" : "切换"}
+                      </button>
+                      <button className="link node-favorite" aria-pressed={starred.has(n.id)}
+                        aria-label={starred.has(n.id) ? `取消收藏 ${n.name}` : `收藏 ${n.name}`}
+                        onClick={() => void saveSettings(state => ({
+                          ...state,
+                          favorites: state.favorites.includes(n.id) ? state.favorites.filter(id => id !== n.id) : [...state.favorites, n.id],
+                        }))}>
+                        <Star size={16} aria-hidden />
+                      </button>
+                    </div>
                   </div>
                 ))}
                 {!filtered.length && (
@@ -626,26 +807,53 @@ function App() {
             </section>
           )}
           {page === "订阅" && (
-            <><section className="panel">
+            <section className="panel">
               <div className="panel-head">
                 <h2>订阅来源</h2>
+                <label className="refresh-setting">默认自动更新
+                  <select value={work.workspace.refreshHours} disabled={!work.ready || !isTauri()} onChange={event => {
+                    const refreshHours = parseRefreshHours(Number(event.target.value)) ?? 0;
+                    void saveSettings(state => ({ ...state, refreshHours }));
+                  }}>
+                    {refreshOptions.map(([hours, label]) => <option key={hours} value={hours}>{label}</option>)}
+                  </select>
+                </label>
               </div>
-              <div className="empty">
-                {storageError ||
-                  (result
-                    ? `已从 ${result.format} 导入 ${nodes.length} 个节点。订阅已加密保存在本机。`
-                    : "尚未导入订阅。")}
-                <button className="link" onClick={() => setDialog(true)}>
-                  导入订阅 →
-                </button>
-              </div>
-            </section><div className="extension-grid"><section className="panel"><h2>全局扩展覆写配置</h2><p>尚未接入</p></section><section className="panel"><h2>全局扩展脚本</h2><p>尚未接入</p></section></div></>
+              {subscriptions.length ? <div className="subscription-grid">
+                {subscriptions.map(profile => <SubscriptionCard key={profile.id} profile={profile}
+                  pending={work.refreshStatus[profile.id]?.pending ?? false}
+                  error={work.refreshStatus[profile.id]?.error}
+                  refreshable={isTauri()}
+                  originalSelected={originalProfile?.id === profile.id}
+                  canSelectOriginal={isTauri() && !running && !busy && !testing}
+                  onSelectOriginal={async () => {
+                    await saveSettings(state => ({ ...state, mihomoProfile: profile.id }));
+                    setPage("概览");
+                  }}
+                  onRefresh={() => void work.refresh(profile.id).catch(() => {})}
+                  onConfigure={(request, refreshHours) => work.configureSubscription(profile.id, { request, refreshHours })}
+                  onBrowse={() => { setSubscriptionFilter(profile.id); setSearch(""); setOnlyFavorites(false); setPage("节点"); }}
+                  onRename={name => void saveSettings(state => ({ ...state, subscriptions:
+                    state.subscriptions.map(item => item.id === profile.id ? { ...item, name } : item) }))}
+                  onRemove={() => void saveSettings(state => {
+                    const remaining = state.subscriptions.filter(item => item.id !== profile.id);
+                    const nodeIds = new Set(profile.parsed.nodes.map(node => node.id));
+                    return { ...state, subscriptions: remaining, selected: preferredNode(remaining, state.selected),
+                      mihomoProfile: state.mihomoProfile === profile.id ? undefined : state.mihomoProfile,
+                      favorites: state.favorites.filter(id => !nodeIds.has(id)) };
+                  })}
+                />)}
+              </div> : <p className="empty">{work.ready ? "尚未导入订阅" : "等待本地订阅读取"}</p>}
+            </section>
           )}
-          {page === "测试" && <UnlockTests />}
-          {page === "连接" && <section className="panel"><h2>连接监控</h2><p className="empty">连接列表尚未接入。</p></section>}
-          {page === "日志" && <section className="panel"><h2>内核日志</h2><p className="empty">日志查看尚未接入。</p></section>}
+          {page === "测试" && <>
+            <DownloadCheck key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
+            <UnlockTests />
+          </>}
+          {page === "连接" && <ConnectionMonitor telemetry={telemetry} running={running} />}
+          {page === "日志" && <EventLog />}
           {page === "规则" && (
-            <RulesEditor rules={rules} onChange={setRules} running={running} />
+            <RulesEditor rules={rules} targets={ruleTargets} onChange={edit => void saveSettings(state => ({ ...state, rules: edit(state.rules) }))} running={running} />
           )}
           {page === "诊断" && (
             <section className="panel">
@@ -677,12 +885,34 @@ function App() {
               <div className="empty">
                 系统代理适用于遵循 Windows 代理设置的应用。TUN 接管 TCP/UDP 和 DNS，启动时需要管理员授权。本地端口模式需要在目标应用中手动填写代理地址。
               </div>
+              <div className="env-row">
+                <label>
+                  <input type="checkbox" checked={autoReconnect} disabled={!work.ready} onChange={event => {
+                    const enabled = event.target.checked;
+                    void saveSettings(state => ({ ...state, autoReconnect: enabled }));
+                  }} />
+                  内核意外退出时自动恢复
+                </label>
+              </div>
+              <p className="rule-hint">TUN 可在本次授权内恢复接管内核。手动重新连接仍需授权。</p>
+              <div className="env-row">
+                <label>
+                  <input type="checkbox" checked={autoFailover} disabled={!work.ready} onChange={event => {
+                    const enabled = event.target.checked;
+                    void saveSettings(state => ({ ...state, autoFailover: enabled }));
+                  }} />
+                  节点失联时自动换线
+                </label>
+              </div>
+              <p className="rule-hint">后台检查两个网站。连续失败后尝试同订阅的其他节点，优先选择收藏。</p>
+              <FixedPortSetting key={String(proxyPort)} value={proxyPort} disabled={!work.ready || busy || running}
+                onChange={changed => saveSettings(state => ({ ...state, proxyPort: changed }))} />
             </section>
           )}
         </main>
       </div>
       {dialog && (
-        <div className="overlay" onMouseDown={() => !busy && setDialog(false)}>
+        <div className="overlay" onMouseDown={() => !importing && setDialog(false)}>
           <div
             className="modal"
             role="dialog"
@@ -701,7 +931,7 @@ function App() {
               <button
                 className="icon-button"
                 aria-label="关闭"
-                disabled={busy}
+                disabled={importing}
                 onClick={() => setDialog(false)}
               >
                 <X size={18} />
@@ -713,6 +943,13 @@ function App() {
               onChange={(e) => setText(e.target.value)}
               placeholder="粘贴订阅地址、内容或节点链接"
             />
+            {/^https?:\/\//i.test(text.trim()) && (
+              <details className="subscription-request-details">
+                <summary>请求设置</summary>
+                <SubscriptionRequestFields value={importRequest ?? defaultSubscriptionRequest}
+                  disabled={importing} onChange={setImportRequest} />
+              </details>
+            )}
             <input
               hidden
               ref={file}
@@ -724,13 +961,13 @@ function App() {
               }}
             />
             <div className="modal-actions">
-              <button disabled={busy} onClick={() => file.current?.click()}>
+              <button disabled={importing} onClick={() => file.current?.click()}>
                 <Upload size={16} />
                 选择文件
               </button>
               <span className="error">{error}</span>
-              <button className="primary" disabled={busy} onClick={add}>
-                {busy ? "正在导入…" : "解析并导入"}
+              <button className="primary" disabled={importing || !work.ready} onClick={add}>
+                {importing ? "正在导入…" : "解析并导入"}
               </button>
             </div>
             <p className="privacy">
@@ -743,9 +980,36 @@ function App() {
     </div>
   );
 }
-function TrafficDashboard() {
-  const metrics = ["上传速度", "下载速度", "活跃连接", "上传量", "下载量", "内核占用"];
-  return <section className="panel traffic-panel"><div className="panel-head"><h2>流量统计</h2><span className="muted">上传 / 下载</span></div><div className="traffic-empty"><span>实时流量数据尚未接入</span></div><div className="metric-grid">{metrics.map(label => <div className="metric" key={label}><span>{label}</span><strong>—</strong></div>)}</div></section>;
+
+function FixedPortSetting({ value, disabled, onChange }: {
+  value: number | null;
+  disabled: boolean;
+  onChange: (port: number | null) => Promise<void>;
+}) {
+  const [port, setPort] = useState(value == null ? "" : String(value));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const isUnchanged = port.trim() === (value == null ? "" : String(value));
+  return <form className="rule-form" onSubmit={event => {
+    event.preventDefault();
+    const input = port.trim();
+    const number = input ? Number(input) : null;
+    if (number != null && (!/^\d{1,5}$/.test(input) || number < 1024 || number > 65535)) {
+      setError("端口须为 1024 至 65535 的整数");
+      return;
+    }
+    setError("");
+    setSaving(true);
+    void onChange(number).finally(() => setSaving(false));
+  }}>
+    <label className="port-setting"><span>本地 HTTP / SOCKS5 端口</span>
+      <input inputMode="numeric" value={port} disabled={disabled || saving} placeholder="自动分配"
+        aria-describedby="proxy-port-note" onChange={event => { setPort(event.target.value); setError(""); }} />
+    </label>
+    <button disabled={disabled || saving || isUnchanged}>保存端口</button>
+    <p className="rule-hint port-setting-note" id="proxy-port-note">留空自动分配。停止代理后可更改。</p>
+    {error && <span className="error" role="alert">{error}</span>}
+  </form>;
 }
 function UnlockTests() {
   const services = ["哔哩哔哩大陆", "哔哩哔哩港澳台", "Bahamut Anime", "ChatGPT iOS", "ChatGPT Web", "Claude", "Disney+", "Gemini", "Netflix", "Prime Video", "Spotify", "TikTok", "YouTube Premium"];
@@ -756,39 +1020,52 @@ function TestCard({serviceName}:{serviceName:string}) {
 }
 function RulesEditor({
   rules,
+  targets,
   onChange,
   running,
 }: {
   rules: RouteRule[];
-  onChange: (rules: RouteRule[]) => void;
+  targets: { id: string; label: string }[];
+  onChange: (edit: (rules: RouteRule[]) => RouteRule[]) => void;
   running: boolean;
 }) {
   const [type, setType] = useState<RouteRule["type"]>("domain_suffix");
   const [action, setAction] = useState<RouteRule["action"]>("direct");
+  const [target, setTarget] = useState("");
   const [value, setValue] = useState("");
+  const [validationError, setValidationError] = useState("");
+  function move(rule: RouteRule, offset: number) {
+    onChange(current => {
+      const index = current.indexOf(rule);
+      const destination = index + offset;
+      if (index < 0 || destination < 0 || destination >= current.length) return current;
+      const reordered = [...current];
+      [reordered[destination], reordered[index]] = [reordered[index], reordered[destination]];
+      return reordered;
+    });
+  }
   return (
     <section className="panel">
       <div className="panel-head">
         <h2>路由规则</h2>
       </div>
       <p className="rule-hint">
-        按顺序匹配，未命中时使用当前节点。
-        {running ? "修改将在重新连接后生效。" : ""}规则仅保留到应用退出。
+        规则模式按顺序匹配，未命中时使用当前节点。指定的节点无法加载时，匹配该规则的流量会被拦截。
+        {running ? "修改将在重新连接后生效。" : ""}
       </p>
       <div className="rule-form">
         <select
           aria-label="规则类型"
           value={type}
-          onChange={(e) => setType(e.target.value as RouteRule["type"])}
+          onChange={(e) => { setType(e.target.value as RouteRule["type"]); setValidationError(""); }}
         >
-          <option value="domain">域名</option>
-          <option value="domain_suffix">域名后缀</option>
+          {ruleTypes.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
         </select>
         <input
           aria-label="规则内容"
-          placeholder="example.com"
+          placeholder={ruleTypes.find(option => option.value === type)?.example}
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => { setValue(e.target.value); setValidationError(""); }}
         />
         <select
           aria-label="规则动作"
@@ -799,29 +1076,42 @@ function RulesEditor({
           <option value="proxy">代理</option>
           <option value="reject">拦截</option>
         </select>
+        {action === "proxy" && <select aria-label="规则使用的节点" className="rule-target" value={target}
+          onChange={event => setTarget(event.target.value)}>
+          <option value="">当前节点</option>
+          {targets.map(node => <option key={node.id} value={node.id}>{node.label}</option>)}
+        </select>}
         <button
           disabled={!value.trim()}
           onClick={() => {
-            onChange([...rules, { type, value: value.trim(), action }]);
-            setValue("");
+            try {
+              const match = normalizeRuleValue(type, value);
+              if (action === "proxy" && target && !targets.some(node => node.id === target)) throw new Error("请选择可用节点");
+              onChange(current => [...current, { type, value: match, action, target: action === "proxy" && target ? target : undefined }]);
+              setValue("");
+              setValidationError("");
+            } catch (error) {
+              setValidationError(error instanceof Error ? error.message : "规则格式有误");
+            }
           }}
         >
           添加
         </button>
       </div>
-      {rules.map((rule, index) => (
-        <div className="env-row" key={index}>
-          <span>
-            {rule.type} · {rule.value} · {rule.action}
-          </span>
-          <button
-            className="link"
-            onClick={() => onChange(rules.filter((_, i) => i !== index))}
-          >
-            删除
-          </button>
-        </div>
-      ))}
+      {validationError && <p className="error" role="alert">{validationError}</p>}
+      {rules.map((rule, index) => {
+        const label = ruleTypes.find(option => option.value === rule.type)?.label;
+        const route = rule.action === "direct" ? "直连" : rule.action === "reject" ? "拦截"
+          : rule.target ? targets.find(node => node.id === rule.target)?.label ?? "指定节点已不可用" : "当前节点";
+        return <div className="env-row rule-row" key={index}>
+          <span>{label} · {rule.value} · {route}</span>
+          <div className="rule-actions">
+            <button className="link" disabled={index === 0} onClick={() => move(rule, -1)} aria-label={`上移规则 ${rule.value}`}>上移</button>
+            <button className="link" disabled={index === rules.length - 1} onClick={() => move(rule, 1)} aria-label={`下移规则 ${rule.value}`}>下移</button>
+            <button className="link" onClick={() => onChange(current => current.filter(item => item !== rule))}>删除</button>
+          </div>
+        </div>;
+      })}
     </section>
   );
 }
