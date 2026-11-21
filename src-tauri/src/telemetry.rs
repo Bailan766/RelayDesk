@@ -326,6 +326,25 @@ impl Controller {
         self.read_json("/connections").await
     }
 
+    async fn read_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let mut response = self
+            .request(reqwest::Method::GET, path)?
+            .send()
+            .await
+            .map_err(|_| "内核监控暂时不可用")?
+            .error_for_status()
+            .map_err(|_| "内核监控返回异常")?;
+        const LIMIT: usize = 8 * 1024 * 1024;
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| "读取内核监控失败")? {
+            if data.len() + chunk.len() > LIMIT {
+                return Err("内核监控响应过大".into());
+            }
+            data.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&data).map_err(|_| "内核监控数据格式无效".into())
+    }
+
     pub async fn query_dns(&self, name: &str, qtype: &str) -> Result<Value, String> {
         let response = self
             .request(reqwest::Method::GET, "/dns/query")?
