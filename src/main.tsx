@@ -50,6 +50,7 @@ import { SettingsPage } from "./components/SettingsPage";
 import { ImportModal } from "./components/ImportModal";
 import { useWorkspace } from "./useWorkspace";
 import {
+  isInfoNodeName,
   parseRefreshHours,
   preferredNode,
   refreshOptions,
@@ -459,6 +460,50 @@ function App() {
     } catch (e) {
       if (epoch !== diagnosticsEpoch.current) return;
       const loaded = session.current?.loaded;
+      if (automatic && runningOriginal && routingMode !== "direct") {
+        setCheckResult("当前 Mihomo 出口无响应，正在自动测速并切线…");
+        try {
+          type MGroup = { name: string; kind: string; selected: string; choices: string[]; manual: boolean };
+          const groups = await invoke<MGroup[]>("mihomo_groups");
+          if (epoch !== diagnosticsEpoch.current) return;
+          const skipNames = new Set(["DIRECT", "REJECT", "REJECT-DROP", "PASS"]);
+          const primary = groups.find(g => g.manual && g.name !== "GLOBAL" && g.choices.some(c => !skipNames.has(c)))
+            ?? groups.find(g => g.manual && g.choices.some(c => !skipNames.has(c)));
+          if (primary) {
+            const delays = await invoke<Record<string, number>>("probe_mihomo_group", {
+              group: primary.name,
+              probeUrl,
+              timeoutMs: 4200,
+            });
+            if (epoch !== diagnosticsEpoch.current) return;
+            setMihomoDelays(prev => ({ ...prev, ...delays }));
+            const ranked = primary.choices
+              .filter(c => !skipNames.has(c) && !isInfoNodeName(c) && typeof delays[c] === "number" && delays[c] > 0)
+              .sort((a, b) => delays[a] - delays[b]);
+            const bestChoice = ranked[0];
+            if (bestChoice && bestChoice !== primary.selected) {
+              await invoke("switch_mihomo_group", { group: primary.name, choice: bestChoice });
+              await saveSettings(state => ({
+                ...state,
+                subscriptions: state.subscriptions.map(profile =>
+                  profile.id === runningOriginal.id
+                    ? { ...profile, mihomoSelections: { ...profile.mihomoSelections, [primary.name]: bestChoice } }
+                    : profile,
+                ),
+              }));
+              const verifiedMs = await invoke<number>("check_connection", { port: targetPort, probeUrl });
+              if (epoch === diagnosticsEpoch.current) {
+                setCheckResult(`已自动在「${primary.name}」切至「${bestChoice}」· ${verifiedMs} ms`);
+              }
+              return;
+            }
+          }
+        } catch { /* fall through to error status */ }
+        if (epoch === diagnosticsEpoch.current) {
+          setCheckResult("Mihomo 当前出口无法访问外网，请在策略组切换可用节点");
+        }
+        return;
+      }
       if (automatic && !runningOriginal && routingMode !== "direct" && loaded && loaded.size > 1) {
         setCheckResult("当前节点无响应，正在自动匹配可用节点…");
         const candidates = Array.from(loaded.values())
@@ -1363,21 +1408,13 @@ function App() {
 
               <TrafficDashboard telemetry={telemetry} />
 
-              <div className="columns">
-                <WebsiteChecks key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
-                <section className="panel">
+              {!originalName && (
+                <section className="panel" style={{ marginTop: 14 }}>
                   <div className="panel-head">
                     <h2>快捷切换节点</h2>
                     <button className="link" onClick={() => setPage("节点")}>全部节点 ({nodes.length})</button>
                   </div>
-                  {originalName ? (
-                    <div className="empty">
-                      当前正在使用 Mihomo 原配置「{originalName}」，请在上方「Mihomo 策略组」切换节点，或
-                      <button type="button" className="link inline-action" onClick={() => void switchBackToNodeMode()}>
-                        切回节点模式
-                      </button>
-                    </div>
-                  ) : quickNodes.length ? (
+                  {quickNodes.length ? (
                     quickNodes.map(n => {
                       const p = probe(n);
                       const active = isSelected(n);
@@ -1426,7 +1463,7 @@ function App() {
                     </div>
                   )}
                 </section>
-              </div>
+              )}
             </>
           )}
 

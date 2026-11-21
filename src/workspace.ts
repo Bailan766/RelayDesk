@@ -199,6 +199,10 @@ export function receiveSubscription(
 
 const infoNodePattern = /^(?:.*(?:剩余流量|距离下次重置|套餐到期|过期时间|官方网址|最新官网|域名防走失|TG群组|官方频道|邀请返利|使用说明|重置流量|账号到期))|\s*(?:剩余|到期|官网)[:：]/i;
 
+export function isInfoNodeName(name: string): boolean {
+  return infoNodePattern.test(name);
+}
+
 export function preferredNode(subscriptions: Subscription[], selected?: string): string | undefined {
   const nodes = subscriptions.flatMap(profile => profile.parsed.nodes);
   const retained = nodes.find(node => node.id === selected);
