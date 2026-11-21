@@ -127,8 +127,11 @@ describe("encrypted workspace data", () => {
       closeAction: "exit" as const,
       allowLan: true,
       systemProxyBypass: "localhost;<local>",
+      systemProxyGuard: false,
       probeUrl: "https://cp.cloudflare.com/generate_204",
       tunIpv6: false,
+      tunStack: "gvisor" as const,
+      tunStrictRoute: false,
       ruleDefaultAction: "direct" as const,
       nodeLatencies: {
         [firstId]: { revision: primary, label: "42 ms", milliseconds: 42, testedAt: 1700000000000 },
@@ -218,5 +221,17 @@ describe("encrypted workspace data", () => {
     const next = replaceSubscription(emptyWorkspace, sub);
     expect(next.mihomoProfile).toBe(sub.id);
     expect(next.selected).toBe(sub.parsed.nodes[0].id);
+    expect(emptyWorkspace.systemProxyGuard).toBe(true);
+    expect(emptyWorkspace.tunStack).toBe("mixed");
+    expect(emptyWorkspace.tunStrictRoute).toBe(true);
+    const invalidFallback = deserializeWorkspace(JSON.stringify({
+      ...JSON.parse(serializeWorkspace(emptyWorkspace)),
+      tunStack: "weird",
+      systemProxyGuard: "nope",
+      tunStrictRoute: "nope",
+    }));
+    expect(invalidFallback.tunStack).toBe("mixed");
+    expect(invalidFallback.systemProxyGuard).toBe(true);
+    expect(invalidFallback.tunStrictRoute).toBe(true);
   });
 });

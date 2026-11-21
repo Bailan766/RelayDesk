@@ -105,8 +105,11 @@ function App() {
     closeAction,
     allowLan,
     systemProxyBypass,
+    systemProxyGuard,
     probeUrl,
     tunIpv6,
+    tunStack,
+    tunStrictRoute,
     ruleDefaultAction,
     nodeLatencies,
   } = work.workspace;
@@ -237,6 +240,11 @@ function App() {
     void refreshServiceStatus();
     void invoke("set_close_action", { exitOnClose: closeAction === "exit" }).catch(() => {});
   }, [closeAction, work.ready]);
+
+  useEffect(() => {
+    if (!isTauri() || !work.ready) return;
+    void invoke("set_system_proxy_guard", { enabled: systemProxyGuard }).catch(() => {});
+  }, [systemProxyGuard, work.ready]);
 
   useEffect(() => {
     if (!isTauri() || !work.ready) return;
@@ -393,8 +401,9 @@ function App() {
   }, [autoReconnect, work.ready]);
 
   useEffect(() => {
-    if (!isTauri() || !running || runningOriginal || !work.ready) return;
-    void invoke("configure_failover", { enabled: autoFailover, fallbackGroups: fallbackGroups(session.current, subscriptions, starred, latencies) })
+    if (!isTauri() || !running || !work.ready) return;
+    const groups = runningOriginal ? [] : fallbackGroups(session.current, subscriptions, starred, latencies);
+    void invoke("configure_failover", { enabled: autoFailover, fallbackGroups: groups })
       .catch(() => setSettingsError("无法更新当前会话的自动换线设置"));
   }, [autoFailover, running, runningOriginal, starred, subscriptions, work.ready]);
 
@@ -716,6 +725,8 @@ function App() {
       allowLan,
       bypass: systemProxyBypass,
       tunIpv6,
+      tunStack,
+      tunStrictRoute,
     });
   }
 
@@ -821,6 +832,8 @@ function App() {
         allowLan,
         bypass: systemProxyBypass,
         tunIpv6,
+        tunStack,
+        tunStrictRoute,
       });
       session.current = next;
       setRunningNode(node);
@@ -876,10 +889,13 @@ function App() {
         mode,
         routingMode: originalMode,
         autoReconnect,
+        autoFailover,
         selections: profile.mihomoSelections,
         allowLan,
         bypass: systemProxyBypass,
         tunIpv6,
+        tunStack,
+        tunStrictRoute,
       });
       setRunningOriginal({ id: profile.id, name: profile.name, content: profile.content });
       setLiveRouting(originalMode);
@@ -1135,10 +1151,13 @@ function App() {
         mode: targetMode,
         routingMode: originalMode,
         autoReconnect,
+        autoFailover,
         selections: originalProfile.mihomoSelections,
         allowLan,
         bypass: systemProxyBypass,
         tunIpv6,
+        tunStack,
+        tunStrictRoute,
       });
       setRunningOriginal({ id: originalProfile.id, name: originalProfile.name, content: originalProfile.content });
       setLiveRouting(originalMode);
@@ -1155,6 +1174,8 @@ function App() {
         allowLan,
         bypass: systemProxyBypass,
         tunIpv6,
+        tunStack,
+        tunStrictRoute,
       });
       session.current = next;
       setRunningNode(preferred);
@@ -1248,6 +1269,7 @@ function App() {
     let unlistenTray: (() => void) | undefined;
     let unlistenHotkey: (() => void) | undefined;
     let unlistenNetWatch: (() => void) | undefined;
+    let unlistenProxyGuard: (() => void) | undefined;
 
     void listen<string>("tray-action", event => {
       const action = event.payload;
@@ -1290,10 +1312,19 @@ function App() {
       }
     }).then(fn => { unlistenNetWatch = fn; });
 
+    void listen<{ status: string }>("system-proxy-guard", event => {
+      if (event.payload.status === "tampered") {
+        setProxyTampered(true);
+      } else if (event.payload.status === "repaired") {
+        setProxyTampered(false);
+      }
+    }).then(fn => { unlistenProxyGuard = fn; });
+
     return () => {
       unlistenTray?.();
       unlistenHotkey?.();
       unlistenNetWatch?.();
+      unlistenProxyGuard?.();
     };
   }, []);
 
@@ -1374,7 +1405,7 @@ function App() {
           <div className="brand-mark"><Cat size={18} /></div>
           <div>
             <strong>RelayDesk</strong>
-            <small>v1.5.0</small>
+            <small>v1.6.0</small>
           </div>
         </div>
         <nav>

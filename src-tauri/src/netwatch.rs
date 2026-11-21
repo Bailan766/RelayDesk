@@ -76,6 +76,30 @@ unsafe extern "system" fn interface_change_cb(
     LAST_IF_EVENT_MS.store(now_ms(), Ordering::Release);
 }
 
+fn cleanup_on_network_change(
+    app: &tauri::AppHandle,
+    target: Option<(crate::network::Core, crate::telemetry::Controller)>,
+) {
+    let Some((core, controller)) = target else {
+        return;
+    };
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let closed = controller.close_all_connections().await.is_ok();
+        let flushed = core == crate::network::Core::Mihomo
+            && controller.flush_fakeip_cache().await.is_ok();
+        if closed || flushed {
+            let msg = match (closed, flushed) {
+                (true, true) => "已清理休眠/切网残留连接并刷新 Fake-IP 缓存",
+                (true, false) => "已清理休眠/切网残留连接，加速建立新链路",
+                (false, true) => "已刷新 Fake-IP DNS 缓存",
+                (false, false) => unreachable!(),
+            };
+            handle.state::<Supervisor>().record_notice("info", msg);
+        }
+    });
+}
+
 unsafe extern "system" fn power_wnd_proc(
     hwnd: HWND,
     msg: UINT,
@@ -93,7 +117,8 @@ unsafe extern "system" fn power_wnd_proc(
                     let now = now_ms();
                     let prev = LAST_POWER_RESUME_MS.swap(now, Ordering::AcqRel);
                     if now.saturating_sub(prev) >= 2000 {
-                        app.state::<Supervisor>().on_network_change("system-resumed");
+                        let target = app.state::<Supervisor>().on_network_change("system-resumed");
+                        cleanup_on_network_change(app, target);
                         let _ = app.emit("network-watch", NetworkWatchEvent { kind: "resume" });
                     }
                 }
@@ -164,7 +189,8 @@ pub fn start(app: tauri::AppHandle) {
             {
                 continue;
             }
-            state.on_network_change("interface-changed");
+            let target = state.on_network_change("interface-changed");
+            cleanup_on_network_change(&if_app, target);
             let _ = if_app.emit("network-watch", NetworkWatchEvent { kind: "interface" });
         }
     });

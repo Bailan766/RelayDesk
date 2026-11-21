@@ -233,6 +233,101 @@ pub fn enable_with_bypass(path: &Path, port: u16, bypass: &str) -> Result<(), ()
     Ok(())
 }
 
+pub fn watch_internet_settings(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_change: impl Fn() + Send + 'static,
+) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::atomic::Ordering;
+    use winapi::{
+        shared::minwindef::FALSE,
+        um::{
+            handleapi::CloseHandle,
+            synchapi::{CreateEventW, WaitForSingleObject},
+            winbase::WAIT_OBJECT_0,
+            winnt::HANDLE,
+        },
+    };
+
+    type Hkey = *mut c_void;
+    const HKEY_CURRENT_USER: Hkey = 0x8000_0001usize as Hkey;
+    const KEY_NOTIFY: u32 = 0x0010;
+    const REG_NOTIFY_CHANGE_LAST_SET: u32 = 0x0000_0004;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hkey: Hkey,
+            sub_key: *const u16,
+            options: u32,
+            sam: u32,
+            result: *mut Hkey,
+        ) -> i32;
+        fn RegNotifyChangeKeyValue(
+            hkey: Hkey,
+            watch_subtree: i32,
+            notify_filter: u32,
+            event: HANDLE,
+            asynchronous: i32,
+        ) -> i32;
+        fn RegCloseKey(hkey: Hkey) -> i32;
+    }
+
+    struct RegKeyGuard(Hkey);
+    impl Drop for RegKeyGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { RegCloseKey(self.0); }
+            }
+        }
+    }
+
+    struct EventGuard(HANDLE);
+    impl Drop for EventGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CloseHandle(self.0); }
+            }
+        }
+    }
+
+    let subkey: Vec<u16> = std::ffi::OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+        .encode_wide()
+        .chain([0])
+        .collect();
+
+    std::thread::spawn(move || {
+        let mut raw_key: Hkey = ptr::null_mut();
+        if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_NOTIFY, &mut raw_key) } != 0
+            || raw_key.is_null()
+        {
+            return;
+        }
+        let _key = RegKeyGuard(raw_key);
+        let raw_event = unsafe { CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null()) };
+        if raw_event.is_null() {
+            return;
+        }
+        let _event = EventGuard(raw_event);
+
+        while !stop.load(Ordering::Acquire) {
+            let status = unsafe {
+                RegNotifyChangeKeyValue(raw_key, 0, REG_NOTIFY_CHANGE_LAST_SET, raw_event, 1)
+            };
+            if status != 0 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
+            while !stop.load(Ordering::Acquire) {
+                if unsafe { WaitForSingleObject(raw_event, 250) } == WAIT_OBJECT_0 {
+                    on_change();
+                    break;
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

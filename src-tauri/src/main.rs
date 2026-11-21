@@ -148,6 +148,8 @@ async fn start_proxy(
     allow_lan: Option<bool>,
     bypass: Option<String>,
     tun_ipv6: Option<bool>,
+    tun_stack: Option<String>,
+    tun_strict_route: Option<bool>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -178,6 +180,9 @@ async fn start_proxy(
                 allow_lan: allow_lan.unwrap_or(false),
                 bypass,
                 tun_ipv6: tun_ipv6.unwrap_or(true),
+                tun_stack: mihomo::normalize_tun_stack(tun_stack.as_deref().unwrap_or("mixed"))
+                    .to_owned(),
+                tun_strict_route: tun_strict_route.unwrap_or(true),
             },
         })
     })
@@ -192,10 +197,13 @@ async fn start_mihomo(
     mode: String,
     routing_mode: network::RoutingMode,
     auto_reconnect: bool,
+    auto_failover: Option<bool>,
     selections: Option<std::collections::BTreeMap<String, String>>,
     allow_lan: Option<bool>,
     bypass: Option<String>,
     tun_ipv6: Option<bool>,
+    tun_stack: Option<String>,
+    tun_strict_route: Option<bool>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     if port < 1024 {
@@ -226,12 +234,15 @@ async fn start_mihomo(
             mode,
             routing_mode,
             recover: auto_reconnect,
-            failover: false,
+            failover: auto_failover.unwrap_or(false),
             fallback_groups: Vec::new(),
             options: network::SessionOptions {
                 allow_lan: allow_lan.unwrap_or(false),
                 bypass,
                 tun_ipv6: tun_ipv6.unwrap_or(true),
+                tun_stack: mihomo::normalize_tun_stack(tun_stack.as_deref().unwrap_or("mixed"))
+                    .to_owned(),
+                tun_strict_route: tun_strict_route.unwrap_or(true),
             },
         })
     })
@@ -627,6 +638,17 @@ fn check_system_proxy_active(port: u16, state: tauri::State<'_, ProxyState>) -> 
     running_port(&state) == Some(port) && system_proxy::is_port_active(port)
 }
 
+fn apply_system_proxy_entry(port: u16, bypass: Option<&str>) -> Result<(), String> {
+    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("无法定位本地数据目录")?)
+        .join("RelayDesk")
+        .join("network-state");
+    let _ = fs::create_dir_all(&dir);
+    let journal = dir.join("proxy.json");
+    let bypass_text = bypass.unwrap_or_default();
+    system_proxy::enable_with_bypass(&journal, port, bypass_text)
+        .map_err(|_| "无法重新写入 Windows 系统代理".into())
+}
+
 #[tauri::command]
 fn repair_system_proxy(
     port: u16,
@@ -636,14 +658,7 @@ fn repair_system_proxy(
     if running_port(&state) != Some(port) {
         return Err("代理未在当前端口运行".into());
     }
-    let dir = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("无法定位本地数据目录")?)
-        .join("RelayDesk")
-        .join("network-state");
-    let _ = fs::create_dir_all(&dir);
-    let journal = dir.join("proxy.json");
-    let bypass_text = bypass.unwrap_or_default();
-    system_proxy::enable_with_bypass(&journal, port, &bypass_text)
-        .map_err(|_| "无法重新写入 Windows 系统代理".into())
+    apply_system_proxy_entry(port, bypass.as_deref())
 }
 
 #[derive(serde::Serialize)]
@@ -1075,6 +1090,7 @@ fn relaunch_elevated(app: tauri::AppHandle) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use winapi::um::shellapi::{ShellExecuteExW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
     let _ = app.state::<ProxyState>().shutdown();
+    release_single_instance();
     let exe = std::env::current_exe().map_err(|_| "无法定位当前程序")?;
     let wide = |s: &std::ffi::OsStr| s.encode_wide().chain([0]).collect::<Vec<u16>>();
     let file = wide(exe.as_os_str());
@@ -1120,6 +1136,11 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
 #[tauri::command]
 fn set_close_action(exit_on_close: bool, prefs: tauri::State<'_, AppPreferences>) {
     prefs.exit_on_close.store(exit_on_close, Ordering::Release);
+}
+
+#[tauri::command]
+fn set_system_proxy_guard(enabled: bool, prefs: tauri::State<'_, AppPreferences>) {
+    prefs.system_proxy_guard.store(enabled, Ordering::Release);
 }
 
 #[derive(serde::Deserialize)]
@@ -1606,9 +1627,94 @@ mod subscription_tests {
     }
 }
 
-#[derive(Default)]
 struct AppPreferences {
     exit_on_close: AtomicBool,
+    system_proxy_guard: AtomicBool,
+    proxy_guard_stop: std::sync::Arc<AtomicBool>,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            exit_on_close: AtomicBool::new(false),
+            system_proxy_guard: AtomicBool::new(true),
+            proxy_guard_stop: std::sync::Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemProxyGuardEvent {
+    status: &'static str,
+}
+
+#[cfg(windows)]
+mod single_instance {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr, sync::Mutex};
+    use winapi::{
+        shared::winerror::ERROR_ALREADY_EXISTS,
+        um::{
+            errhandlingapi::GetLastError,
+            handleapi::CloseHandle,
+            synchapi::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+            winbase::{WAIT_ABANDONED, WAIT_OBJECT_0},
+            winuser::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE},
+        },
+    };
+
+    static HOLDER: Mutex<usize> = Mutex::new(0);
+
+    fn wide(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value).encode_wide().chain([0]).collect()
+    }
+
+    pub fn acquire_or_exit() {
+        let name = wide("Local\\RelayDesk.SingleInstance.v1");
+        let handle = unsafe { CreateMutexW(ptr::null_mut(), 1, name.as_ptr()) };
+        if handle.is_null() {
+            return;
+        }
+        let already = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        if already {
+            let waited = unsafe { WaitForSingleObject(handle, 800) };
+            if !matches!(waited, WAIT_OBJECT_0 | WAIT_ABANDONED) {
+                let title = wide("RelayDesk");
+                let hwnd = unsafe { FindWindowW(ptr::null(), title.as_ptr()) };
+                if !hwnd.is_null() {
+                    unsafe {
+                        ShowWindow(hwnd, SW_RESTORE);
+                        SetForegroundWindow(hwnd);
+                    }
+                }
+                unsafe {
+                    CloseHandle(handle);
+                }
+                std::process::exit(0);
+            }
+        }
+        if let Ok(mut guard) = HOLDER.lock() {
+            *guard = handle as usize;
+        }
+    }
+
+    pub fn release() {
+        if let Ok(mut guard) = HOLDER.lock() {
+            let raw = std::mem::take(&mut *guard);
+            if raw != 0 {
+                let handle = raw as *mut c_void;
+                unsafe {
+                    ReleaseMutex(handle);
+                    CloseHandle(handle);
+                }
+            }
+        }
+    }
+}
+
+fn release_single_instance() {
+    #[cfg(windows)]
+    single_instance::release();
 }
 
 struct TrayUi {
@@ -1744,6 +1850,8 @@ fn main() {
     if let Some(code) = network::cli() {
         std::process::exit(code);
     }
+    #[cfg(windows)]
+    single_instance::acquire_or_exit();
     let _ = network::recover();
     let app = tauri::Builder::default()
         .manage(ProxyState::default())
@@ -1852,6 +1960,70 @@ fn main() {
             netwatch::start(app.handle().clone());
             let handle = app.handle().clone();
             std::thread::spawn(move || ProxyState::run(handle));
+            let guard_app = app.handle().clone();
+            let guard_stop = std::sync::Arc::clone(&app.state::<AppPreferences>().proxy_guard_stop);
+            let repair_times = std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::<std::time::Instant>::new(),
+            ));
+            let warned_ratelimit = std::sync::Arc::new(AtomicBool::new(false));
+            system_proxy::watch_internet_settings(guard_stop, move || {
+                let state = guard_app.state::<ProxyState>();
+                let Some((port, _, uptime)) = state.active_system_proxy() else {
+                    return;
+                };
+                if uptime < Duration::from_secs(2) || system_proxy::is_port_active(port) {
+                    warned_ratelimit.store(false, Ordering::Release);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                let Some((rechecked_port, bypass, _)) = state.active_system_proxy() else {
+                    return;
+                };
+                if rechecked_port != port || system_proxy::is_port_active(rechecked_port) {
+                    return;
+                }
+                if guard_app
+                    .state::<AppPreferences>()
+                    .system_proxy_guard
+                    .load(Ordering::Acquire)
+                {
+                    let allow_repair = repair_times
+                        .lock()
+                        .map(|mut times| {
+                            let now = std::time::Instant::now();
+                            while times
+                                .front()
+                                .is_some_and(|t| now.saturating_duration_since(*t) > Duration::from_secs(30))
+                            {
+                                times.pop_front();
+                            }
+                            if times.len() < 3 {
+                                times.push_back(now);
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if allow_repair {
+                        if apply_system_proxy_entry(rechecked_port, bypass.as_deref()).is_ok() {
+                            warned_ratelimit.store(false, Ordering::Release);
+                            state.record_notice("info", "检测到系统代理被外部程序修改，已自动写回守护");
+                            let _ = guard_app.emit(
+                                "system-proxy-guard",
+                                SystemProxyGuardEvent { status: "repaired" },
+                            );
+                            return;
+                        }
+                    } else if !warned_ratelimit.swap(true, Ordering::AcqRel) {
+                        state.record_notice("warn", "检测到其他程序反复篡改系统代理，已暂停自动写回并转为提醒");
+                    }
+                }
+                let _ = guard_app.emit(
+                    "system-proxy-guard",
+                    SystemProxyGuardEvent { status: "tampered" },
+                );
+            });
             tauri::async_runtime::spawn(ProxyState::watch_core_logs(app.handle().clone()));
             tauri::async_runtime::spawn(ProxyState::watch_dns_logs(app.handle().clone()));
             tauri::async_runtime::spawn(ProxyState::watch_nodes(app.handle().clone()));
@@ -1927,6 +2099,7 @@ fn main() {
             get_autostart,
             set_autostart,
             set_close_action,
+            set_system_proxy_guard,
             update_tray_state,
             storage::save_subscription,
             storage::load_subscription
@@ -1935,11 +2108,15 @@ fn main() {
         .expect("failed to build RelayDesk");
     app.run(|handle, event| {
         if let tauri::RunEvent::Exit = event {
+            if let Some(prefs) = handle.try_state::<AppPreferences>() {
+                prefs.proxy_guard_stop.store(true, Ordering::Release);
+            }
             if let Some(hk) = handle.try_state::<hotkeys::HotkeyManager>() {
                 hk.shutdown();
             }
             let state = handle.state::<ProxyState>();
             let _ = state.shutdown();
+            release_single_instance();
         }
     });
 }

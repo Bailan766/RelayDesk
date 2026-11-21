@@ -12,6 +12,7 @@ import { nodeRevision, parseSubscription, type ImportResult, type NodeProfile } 
 
 export type EntryMode = "system" | "tun" | "local";
 export type RoutingMode = "rule" | "global" | "direct";
+export type TunStack = "mixed" | "gvisor" | "system";
 export type ThemeMode = "system" | "light" | "dark";
 export type CloseAction = "tray" | "exit";
 export type GlobalHotkeys = { toggleProxy: string; cycleRouting: string; showWindow: string };
@@ -61,8 +62,11 @@ export type Workspace = {
   closeAction: CloseAction;
   allowLan: boolean;
   systemProxyBypass: string;
+  systemProxyGuard: boolean;
   probeUrl: string;
   tunIpv6: boolean;
+  tunStack: TunStack;
+  tunStrictRoute: boolean;
   ruleDefaultAction: RuleDefaultAction;
   nodeLatencies: Record<string, LatencyRecord>;
 };
@@ -90,8 +94,11 @@ export const emptyWorkspace: Workspace = {
   closeAction: "tray",
   allowLan: false,
   systemProxyBypass: defaultSystemProxyBypass,
+  systemProxyGuard: true,
   probeUrl: defaultProbeUrl,
   tunIpv6: true,
+  tunStack: "mixed",
+  tunStrictRoute: true,
   ruleDefaultAction: "proxy",
   nodeLatencies: {},
 };
@@ -349,8 +356,11 @@ export function deserializeWorkspace(raw: string): Workspace {
     allowLan: saved.allowLan === true,
     systemProxyBypass: typeof saved.systemProxyBypass === "string" && saved.systemProxyBypass.length <= 2048
       ? saved.systemProxyBypass : defaultSystemProxyBypass,
+    systemProxyGuard: saved.systemProxyGuard !== false,
     probeUrl: validProbeUrl(saved.probeUrl),
     tunIpv6: saved.tunIpv6 !== false,
+    tunStack: saved.tunStack === "gvisor" || saved.tunStack === "system" ? saved.tunStack : "mixed",
+    tunStrictRoute: saved.tunStrictRoute !== false,
     ruleDefaultAction: saved.ruleDefaultAction === "direct" ? "direct" : "proxy",
     nodeLatencies: validLatencies(saved.nodeLatencies, known, recoverId),
   };

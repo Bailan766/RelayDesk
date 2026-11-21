@@ -292,6 +292,45 @@ impl Controller {
         }
     }
 
+    pub async fn flush_fakeip_cache(&self) -> Result<(), String> {
+        let response = self
+            .request(reqwest::Method::POST, "/cache/fakeip/flush")?
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map_err(|_| "刷新 Fake-IP 缓存失败")?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err("内核未接受 Fake-IP 缓存清理请求".into())
+        }
+    }
+
+    pub async fn close_connections_for_chain(&self, outbound: &str) -> usize {
+        if outbound.is_empty() {
+            return 0;
+        }
+        let Ok(snapshot) = self.snapshot().await else {
+            return 0;
+        };
+        let mut closed = 0usize;
+        for conn in snapshot
+            .connections
+            .into_iter()
+            .filter(|conn| {
+                conn.chains
+                    .as_deref()
+                    .is_some_and(|chains| chains.iter().any(|chain| chain == outbound))
+            })
+            .take(64)
+        {
+            if self.close_connection(&conn.id).await.is_ok() {
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     pub async fn routing_mode(&self, mode: &str) -> Result<(), String> {
         let response = self
             .request(reqwest::Method::PATCH, "/configs")?

@@ -14,10 +14,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const RETRY_DELAYS: [Duration; 3] = [
+const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
     Duration::from_secs(4),
-    Duration::from_secs(12),
+    Duration::from_secs(10),
+    Duration::from_secs(20),
+    Duration::from_secs(30),
 ];
 const HEALTHY_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -77,6 +79,12 @@ impl Plan {
 
     fn monitors_node(&self) -> bool {
         self.settings.core == network::Core::Singbox
+            && self.failover
+            && !matches!(self.routing_mode, network::RoutingMode::Direct)
+    }
+
+    fn monitors_mihomo(&self) -> bool {
+        self.settings.core == network::Core::Mihomo
             && self.failover
             && !matches!(self.routing_mode, network::RoutingMode::Direct)
     }
@@ -190,6 +198,41 @@ struct NodeCheck {
     revision: u64,
     tag: String,
     controller: Controller,
+}
+
+struct MihomoCheck {
+    session: String,
+    generation: u32,
+    revision: u64,
+    controller: Controller,
+}
+
+impl MihomoCheck {
+    fn is_current(&self, active: &Running) -> bool {
+        active.session.id == self.session
+            && active.session.generation() == self.generation
+            && active.session.ready()
+            && active.plan.monitors_mihomo()
+            && active.health.revision == self.revision
+    }
+}
+
+fn is_usable_mihomo_choice(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || matches!(trimmed, "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS")
+    {
+        return false;
+    }
+    const INFO_KEYWORDS: &[&str] = &[
+        "剩余流量",
+        "过期时间",
+        "套餐到期",
+        "距离下次重置",
+        "官网",
+        "网址",
+    ];
+    !INFO_KEYWORDS.iter().any(|kw| trimmed.contains(kw))
 }
 
 impl NodeCheck {
@@ -310,7 +353,7 @@ impl Supervisor {
                 .and_then(|active| active.plan.selected_node())
                 .map(str::to_owned),
             node_health: running
-                .filter(|active| active.plan.monitors_node())
+                .filter(|active| active.plan.monitors_node() || active.plan.monitors_mihomo())
                 .map(|active| active.health.state.name()),
         }
     }
@@ -347,9 +390,31 @@ impl Supervisor {
         slot.active.as_ref().map(|active| active.since.elapsed())
     }
 
-    pub fn on_network_change(&self, reason: &str) {
+    pub fn active_system_proxy(&self) -> Option<(u16, Option<String>, Duration)> {
+        if self.closing.load(Ordering::Acquire) {
+            return None;
+        }
+        let slot = self.slot.try_lock().ok()?;
+        let active = slot
+            .active
+            .as_ref()
+            .filter(|active| active.session.ready() && active.plan.mode == "system")?;
+        Some((
+            active.session.port,
+            active.plan.options.bypass.clone(),
+            active.since.elapsed(),
+        ))
+    }
+
+    pub fn record_notice(&self, level: &'static str, message: impl Into<String>) {
+        if let Ok(mut slot) = self.slot.lock() {
+            slot.record(level, message);
+        }
+    }
+
+    pub fn on_network_change(&self, reason: &str) -> Option<(network::Core, Controller)> {
         let Ok(mut slot) = self.slot.lock() else {
-            return;
+            return None;
         };
         let label = match reason {
             "system-resumed" => "系统已从睡眠/休眠唤醒，正在加速刷新链路状态",
@@ -357,11 +422,22 @@ impl Supervisor {
             _ => "检测到网络环境变更",
         };
         slot.record("info", label);
-        if let Some(active) = slot.active.as_mut() {
-            if active.plan.monitors_node() {
+        let active = slot.active.as_mut()?;
+        if active.session.ready() {
+            if active.plan.monitors_node() || active.plan.monitors_mihomo() {
                 active.health.next_check = Instant::now() + Duration::from_secs(2);
             }
+            return Some((
+                active.plan.settings.core,
+                active.session.controller.clone(),
+            ));
         }
+        if !active.session.running() {
+            active.failures = 0;
+            active.retry_at = Some(Instant::now());
+            slot.record("info", "检测到网络恢复，立即重新尝试拉起代理内核");
+        }
+        None
     }
 
     pub fn set_dns_capture(&self, enabled: bool) {
@@ -431,11 +507,13 @@ impl Supervisor {
         }
     }
 
-    fn update_plan(
+    fn update_plan_inner(
         &self,
         id: &str,
         event: &'static str,
         notice: Option<&'static str>,
+        failed_tag: Option<&str>,
+        keep_cooldowns: bool,
         update: impl FnOnce(&mut Plan),
     ) -> bool {
         if let Ok(mut slot) = self.slot.lock() {
@@ -454,13 +532,30 @@ impl Supervisor {
                         &active.plan.settings.selections,
                     );
                 }
-                active.health.reset();
+                if let Some(tag) = failed_tag {
+                    active.health.mark_failed(tag);
+                }
+                if keep_cooldowns {
+                    active.health.reset_keeping_cooldowns();
+                } else {
+                    active.health.reset();
+                }
                 slot.message = notice;
                 slot.record("info", event);
                 return true;
             }
         }
         false
+    }
+
+    fn update_plan(
+        &self,
+        id: &str,
+        event: &'static str,
+        notice: Option<&'static str>,
+        update: impl FnOnce(&mut Plan),
+    ) -> bool {
+        self.update_plan_inner(id, event, notice, None, false, update)
     }
 
     pub async fn switch_node(&self, tag: String) -> Result<(), String> {
@@ -518,7 +613,19 @@ impl Supervisor {
 
     pub async fn reload_mihomo(&self, config: Value) -> Result<(), String> {
         let _guard = self.control.lock().await;
-        let (id, controller, old, port, tun_iface, tun_ipv6, allow_lan, mode, selections) = {
+        let (
+            id,
+            controller,
+            old,
+            port,
+            tun_iface,
+            tun_ipv6,
+            allow_lan,
+            tun_stack,
+            tun_strict_route,
+            mode,
+            selections,
+        ) = {
             let slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
             let active = slot
                 .active
@@ -535,18 +642,22 @@ impl Supervisor {
                 active.session.active_tun_interface(),
                 active.session.tun_ipv6,
                 active.session.allow_lan,
+                active.session.tun_stack.clone(),
+                active.session.tun_strict_route,
                 active.plan.routing_mode,
                 active.plan.settings.selections.clone(),
             )
         };
         let prepare = |profile: &Value| match tun_iface.as_deref() {
-            Some(interface) => crate::mihomo::prepare_native_tun_with_lan(
+            Some(interface) => crate::mihomo::prepare_native_tun_with_options(
                 profile,
                 port,
                 mode,
                 interface,
                 tun_ipv6,
                 allow_lan,
+                &tun_stack,
+                tun_strict_route,
             ),
             None => crate::mihomo::prepare_with_lan(profile, port, mode, allow_lan),
         };
@@ -659,7 +770,7 @@ impl Supervisor {
 
     async fn check_node(&self, check: NodeCheck) {
         self.check_node_using(check, |controller, tag| async move {
-            failover::probe(&controller, &tag).await
+            failover::probe_with_uplink_guard(&controller, &tag, "direct").await
         })
         .await;
     }
@@ -692,12 +803,137 @@ impl Supervisor {
                 .is_some_and(|active| check.is_current(active))
         });
         if current && check.controller.switch(&tag).await.is_ok() {
-            self.update_plan(
+            let _ = check.controller.close_connections_for_chain(&check.tag).await;
+            self.update_plan_inner(
                 &check.session,
                 "当前节点失联，已切换到同订阅的可用节点",
                 Some("原节点失联，已自动换线"),
+                Some(&check.tag),
+                true,
                 |plan| {
                     plan.settings.config["outbounds"][0]["default"] = tag.into();
+                },
+            );
+        }
+    }
+
+    fn mihomo_check(&self) -> Option<MihomoCheck> {
+        let slot = self.slot.try_lock().ok()?;
+        let active = slot.active.as_ref()?;
+        if !active.session.ready()
+            || !active.plan.monitors_mihomo()
+            || Instant::now() < active.health.next_check
+        {
+            return None;
+        }
+        Some(MihomoCheck {
+            session: active.session.id.clone(),
+            generation: active.session.generation(),
+            revision: active.health.revision,
+            controller: active.session.controller.clone(),
+        })
+    }
+
+    async fn check_mihomo(&self, check: MihomoCheck) {
+        let Ok(groups) = check.controller.groups().await else {
+            return;
+        };
+        let primary = groups
+            .iter()
+            .find(|g| g.manual && g.name != "GLOBAL" && g.choices.iter().any(|c| is_usable_mihomo_choice(c)))
+            .or_else(|| groups.iter().find(|g| g.manual && g.choices.iter().any(|c| is_usable_mihomo_choice(c))));
+        let Some(primary) = primary else {
+            return;
+        };
+        let selected = primary.selected.clone();
+        if !is_usable_mihomo_choice(&selected) {
+            return;
+        }
+        let result = failover::probe_with_uplink_guard(&check.controller, &selected, "DIRECT").await;
+        let confirmed_down = {
+            let Ok(mut slot) = self.slot.lock() else {
+                return;
+            };
+            let Some(active) = slot
+                .active
+                .as_mut()
+                .filter(|active| check.is_current(active))
+            else {
+                return;
+            };
+            let previous = active.health.state;
+            active.health.record(result);
+            let down = active.health.state == Reachability::Unreachable;
+            if down && previous != Reachability::Unreachable {
+                slot.record("warn", format!("Mihomo 当前节点「{selected}」连续两次探测失败"));
+            }
+            down
+        };
+        if !confirmed_down {
+            return;
+        }
+        let Ok(delays) = check
+            .controller
+            .probe_group_delays(&primary.name, "https://www.gstatic.com/generate_204", 4200)
+            .await
+        else {
+            return;
+        };
+        let cooled_down: std::collections::HashSet<String> = self
+            .slot
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.active.as_ref().map(|active| {
+                    primary
+                        .choices
+                        .iter()
+                        .filter(|c| active.health.is_cooled_down(c))
+                        .cloned()
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        let mut usable: Vec<(bool, u64, &String)> = primary
+            .choices
+            .iter()
+            .filter(|choice| *choice != &selected && is_usable_mihomo_choice(choice))
+            .filter_map(|choice| {
+                delays
+                    .get(choice.as_str())
+                    .copied()
+                    .filter(|ms| *ms > 0)
+                    .map(|ms| (cooled_down.contains(choice.as_str()), ms, choice))
+            })
+            .collect();
+        usable.sort_by_key(|(is_cooled, ms, _)| (*is_cooled, *ms));
+        let Some((_, _, best)) = usable.first() else {
+            return;
+        };
+        let best = (*best).clone();
+        let _guard = self.control.lock().await;
+        let current = self.slot.lock().ok().is_some_and(|slot| {
+            slot.active
+                .as_ref()
+                .is_some_and(|active| check.is_current(active))
+        });
+        if current
+            && check
+                .controller
+                .switch_group(&primary.name, &best)
+                .await
+                .is_ok()
+        {
+            let _ = check.controller.close_connections_for_chain(&selected).await;
+            let group_name = primary.name.clone();
+            self.update_plan_inner(
+                &check.session,
+                "Mihomo 主节点失联，已自动切换可用节点",
+                Some("Mihomo 主节点失联，已自动切线"),
+                Some(&selected),
+                true,
+                |plan| {
+                    plan.settings.selections.insert(group_name, best);
                 },
             );
         }
@@ -709,6 +945,9 @@ impl Supervisor {
         while !state.closing.load(Ordering::Acquire) {
             if let Some(check) = state.node_check() {
                 state.check_node(check).await;
+            }
+            if let Some(check) = state.mihomo_check() {
+                state.check_mihomo(check).await;
             }
             tokio::time::sleep(Duration::from_millis(700)).await;
         }
@@ -978,10 +1217,10 @@ mod tests {
             Some(Duration::from_secs(1))
         );
         assert_eq!(
-            recovery_delay(true, "local", 2),
-            Some(Duration::from_secs(12))
+            recovery_delay(true, "local", 4),
+            Some(Duration::from_secs(30))
         );
-        assert!(recovery_delay(true, "system", 3).is_none());
+        assert!(recovery_delay(true, "system", 5).is_none());
         assert!(recovery_delay(false, "local", 0).is_none());
         assert!(recovery_delay(true, "tun", 0).is_none());
     }

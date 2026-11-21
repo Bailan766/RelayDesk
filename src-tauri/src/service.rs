@@ -102,6 +102,14 @@ pub(crate) enum PipeCommand {
     Stop,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_tun_stack() -> String {
+    "mixed".into()
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum PipeEvent {
@@ -116,6 +124,10 @@ pub(crate) enum PipeEvent {
         tun_interface: Option<String>,
         tun_ipv6: bool,
         allow_lan: bool,
+        #[serde(default = "default_tun_stack")]
+        tun_stack: String,
+        #[serde(default = "default_true")]
+        tun_strict_route: bool,
     },
     State {
         running: bool,
@@ -146,6 +158,8 @@ pub struct ServiceSession {
     pub id: String,
     pub tun_ipv6: bool,
     pub allow_lan: bool,
+    pub tun_stack: String,
+    pub tun_strict_route: bool,
 }
 
 impl ServiceSession {
@@ -375,18 +389,30 @@ pub(crate) fn try_start_tun(
         Ok(event) => event,
         Err(_) => return Some(Err("后台服务返回无效响应".into())),
     };
-    let (id, ready_port, controller, tun_interface, tun_ipv6, allow_lan) = match event {
-        PipeEvent::Ready {
-            id,
-            port,
-            controller,
-            tun_interface,
-            tun_ipv6,
-            allow_lan,
-        } => (id, port, controller, tun_interface, tun_ipv6, allow_lan),
-        PipeEvent::Error { message } => return Some(Err(message)),
-        _ => return Some(Err("后台服务返回未预期的启动状态".into())),
-    };
+    let (id, ready_port, controller, tun_interface, tun_ipv6, allow_lan, tun_stack, tun_strict_route) =
+        match event {
+            PipeEvent::Ready {
+                id,
+                port,
+                controller,
+                tun_interface,
+                tun_ipv6,
+                allow_lan,
+                tun_stack,
+                tun_strict_route,
+            } => (
+                id,
+                port,
+                controller,
+                tun_interface,
+                tun_ipv6,
+                allow_lan,
+                tun_stack,
+                tun_strict_route,
+            ),
+            PipeEvent::Error { message } => return Some(Err(message)),
+            _ => return Some(Err("后台服务返回未预期的启动状态".into())),
+        };
     let state = Arc::new(ServiceRuntimeState {
         running: AtomicBool::new(true),
         recovering: AtomicBool::new(false),
@@ -465,6 +491,8 @@ pub(crate) fn try_start_tun(
         id,
         tun_ipv6,
         allow_lan,
+        tun_stack,
+        tun_strict_route,
     }))
 }
 
@@ -875,6 +903,8 @@ fn handle_pipe_client(mut pipe: File) {
                     tun_interface: session.active_tun_interface(),
                     tun_ipv6: session.tun_ipv6,
                     allow_lan: session.allow_lan,
+                    tun_stack: session.tun_stack.clone(),
+                    tun_strict_route: session.tun_strict_route,
                 },
             )
             .is_err()

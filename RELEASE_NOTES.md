@@ -1,20 +1,16 @@
-# RelayDesk 1.5.0
+# RelayDesk 1.6.0
 
-RelayDesk 1.5.0 全面补齐分流引擎、Mihomo 单核原生 TUN、DNS 可观测性与桌面系统集成：
+RelayDesk 1.6.0 专注于**内核长期连接稳定性、断网/休眠自愈与系统底层容错**：
 
-- **节点模式远程规则集（`sing-box` `rule_set`）**：
-  - 「规则」页新增远程规则集管理，内置 `geosite-cn`、`geoip-cn`、`geosite-geolocation-!cn`、`geosite-category-ads-all`、`geosite-openai` Preset，同时支持添加自定义 HTTPS `.srs`/`.json` 规则集，并在提权 TUN 配置校验中白名单放行。
-- **Mihomo 持久化覆写**：
-  - 「订阅」页新增「Mihomo 持久化覆写」弹窗，支持自定义 `dns.enable`、`enhanced-mode`、`nameserver`、`fallback`、`fake-ip-filter`、前置规则与高级 YAML 字段，订阅手动或定时刷新后仍自动保留。
-- **Mihomo 单核原生 TUN 架构**：
-  - 彻底移除旧版 `mihomo ← SOCKS5 → sing-box Bridge` 双内核桥接跳数，随包集成签名 `wintun.dll`（Wintun 0.14.1），由单一 `mihomo.exe` 进程原生接管 Wintun 虚拟网卡与 DNS，热重载与崩溃恢复同步保持单核状态。
-- **DNS 查询观测面板**：
-  - 「诊断 → DNS 观测」支持输入域名一键对照 **本机系统 DNS**、**Mihomo 内核 DNS（`/dns/query`）** 与 **远程 DoH（`1.1.1.1`）**（自动标记 Fake-IP），并支持按需实时抓包观测活跃 DNS 查询路径。
-- **Windows 原生网卡变更与休眠唤醒监听**：
-  - Rust 层注册 `NotifyIpInterfaceChange` 与 `WM_POWERBROADCAST` 电源事件，即使应用最小化到托盘，切换 Wi-Fi 或从睡眠/休眠唤醒后也能立即唤醒健康探测并校验系统代理状态。
-- **Windows 全局快捷键**：
-  - 「设置」页新增全局快捷键录制与冲突反馈（支持推荐组合 `Ctrl+Alt+P/M/R` 一键开关代理、循环切换路由模式、唤起主窗口）。
-- **加密配置备份**：
-  - 支持在「设置 → 备份与恢复」中输入密码，使用 Web Crypto `PBKDF2-SHA256 + AES-256-GCM` 加密导出 `.enc.json`（兼容原有明文 JSON 导入）。
-- **工程模块化重构**：
-  - 拆解精简 `src/main.tsx`，提取独立页面视图、节点工具库与覆写弹窗模块，保持清晰桌面风格与可维护性。
+- **休眠唤醒与切网秒级自愈**：
+  - 系统从睡眠/休眠唤醒或切换网卡（Wi-Fi / 热点）时，主动清理半开残留连接（`DELETE /connections`），并在 Mihomo 模式下刷新陈旧 Fake-IP DNS 缓存，同时支持在恢复退避期间检测到网络恢复即刻重试拉起内核。
+- **内核假死心跳看门狗**：
+  - `supervise_core` 除监控进程存活与 TUN 路由外，每 12 秒巡检本地控制接口与混合端口握手机制，连续 3 次无响应即判定假死并自动重启恢复。
+- **Mihomo 远程 Provider 缓存持久化**：
+  - 持久化缓存 `proxy-providers/*.cache` 与 `rule-providers/*.cache` 到本地缓存目录并做原子写入与容量修剪，重连、崩溃恢复或弱网启动无需重新从远端下载规则集/节点集。
+- **智能故障切换防误判与 Mihomo 策略组兜底**：
+  - 故障探测增加本机直连联网校验（防物理断网误切节点）与 180 秒失败节点冷却队列；确认换线后立即断开挂载在旧故障节点上的残留连接；新增 Mihomo 主策略组失联自动探测测速并切换可用节点。
+- **系统代理实时注册表守护 + TUN 栈与严格路由可配置**：
+  - 使用 `RegNotifyChangeKeyValue` 实时监听 `Internet Settings` 注册表变化，发现被外部程序篡改时支持防抖速率限制的自动写回恢复；「设置」页新增 TUN 协议栈（`mixed` / `gvisor` / `system`）与 `strict-route` 兼容开关。
+- **底层进程与数据加固**：
+  - 新增 Windows 单实例互斥锁（重复启动自动唤起主窗口）、SQLite `WAL` 模式 + `busy_timeout=5000` + 自动上一份有效配置热备回滚、拉长崩溃重连退避阶梯并清理启动遗留孤儿临时目录与文件。

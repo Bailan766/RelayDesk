@@ -171,6 +171,14 @@ pub fn tun_ipv4_address(config: &Value) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::new(198, 18, 0, 1)
 }
 
+pub fn normalize_tun_stack(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "gvisor" => "gvisor",
+        "system" => "system",
+        _ => "mixed",
+    }
+}
+
 pub fn prepare_native_tun_with_lan(
     config: &Value,
     port: u16,
@@ -178,6 +186,29 @@ pub fn prepare_native_tun_with_lan(
     interface: &str,
     tun_ipv6: bool,
     allow_lan: bool,
+) -> Result<Value, String> {
+    prepare_native_tun_with_options(
+        config,
+        port,
+        mode,
+        interface,
+        tun_ipv6,
+        allow_lan,
+        "mixed",
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_native_tun_with_options(
+    config: &Value,
+    port: u16,
+    mode: RoutingMode,
+    interface: &str,
+    tun_ipv6: bool,
+    allow_lan: bool,
+    tun_stack: &str,
+    tun_strict_route: bool,
 ) -> Result<Value, String> {
     let mut prepared = prepare_with_lan(config, port, mode, allow_lan)?;
     let dns = prepared["dns"].take();
@@ -214,9 +245,9 @@ pub fn prepare_native_tun_with_lan(
     let mut tun = Map::from_iter([
         ("enable".into(), json!(true)),
         ("device".into(), json!(interface)),
-        ("stack".into(), json!("mixed")),
+        ("stack".into(), json!(normalize_tun_stack(tun_stack))),
         ("auto-route".into(), json!(true)),
-        ("strict-route".into(), json!(true)),
+        ("strict-route".into(), json!(tun_strict_route)),
         ("auto-detect-interface".into(), json!(true)),
         ("dns-hijack".into(), json!(["any:53", "tcp://any:53"])),
     ]);
@@ -316,6 +347,33 @@ mod tests {
             );
             assert_eq!(prepared["dns"]["nameserver"], json!(["system"]));
         }
+
+        let gvisor = prepare_native_tun_with_options(
+            &configured,
+            17070,
+            RoutingMode::Rule,
+            "RelayDesk-gvisor",
+            false,
+            false,
+            "gvisor",
+            false,
+        )
+        .unwrap();
+        assert_eq!(gvisor["tun"]["stack"], "gvisor");
+        assert_eq!(gvisor["tun"]["strict-route"], false);
+        let fallback = prepare_native_tun_with_options(
+            &configured,
+            17070,
+            RoutingMode::Rule,
+            "RelayDesk-fb",
+            false,
+            false,
+            "unknown-stack",
+            true,
+        )
+        .unwrap();
+        assert_eq!(fallback["tun"]["stack"], "mixed");
+        assert_eq!(fallback["tun"]["strict-route"], true);
     }
 
     #[test]

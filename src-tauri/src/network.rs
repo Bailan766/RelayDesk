@@ -4,7 +4,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     os::windows::ffi::OsStrExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr, thread,
     time::{Duration, Instant},
 };
@@ -52,6 +52,8 @@ const TUN_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const MIHOMO_READY_TIMEOUT: Duration = Duration::from_secs(40);
 const TUN_ROUTE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const TUN_ROUTE_RECOVERY_ATTEMPTS: u8 = 12;
+const CORE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(12);
+const CORE_HEARTBEAT_FAILURE_THRESHOLD: u8 = 3;
 
 #[derive(Clone, Copy, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -69,10 +71,18 @@ pub struct SessionOptions {
     pub bypass: Option<String>,
     #[serde(default = "default_true")]
     pub tun_ipv6: bool,
+    #[serde(default = "default_tun_stack")]
+    pub tun_stack: String,
+    #[serde(default = "default_true")]
+    pub tun_strict_route: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_tun_stack() -> String {
+    "mixed".into()
 }
 
 impl Default for SessionOptions {
@@ -81,6 +91,8 @@ impl Default for SessionOptions {
             allow_lan: false,
             bypass: None,
             tun_ipv6: true,
+            tun_stack: default_tun_stack(),
+            tun_strict_route: true,
         }
     }
 }
@@ -230,7 +242,7 @@ impl RoutingMode {
     }
 }
 
-const TUN_RETRY_DELAYS_MS: [u32; 3] = [1500, 4000, 10000];
+const TUN_RETRY_DELAYS_MS: [u32; 5] = [1500, 4000, 10000, 20000, 30000];
 const TUN_STABLE_TIME: Duration = Duration::from_secs(45);
 
 struct Handle(HANDLE);
@@ -309,15 +321,27 @@ pub fn recover() -> Result<(), String> {
     let directory = runtime_dir()?;
     for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
         let filename = entry.file_name();
-        if filename
-            .to_str()
-            .and_then(|name| name.strip_prefix("mihomo-"))
-            .is_some_and(|token| {
-                token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
+        let Some(name) = filename.to_str() else {
+            continue;
+        };
+        let is_hex_token = |token: &str| {
+            token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        };
+        if name
+            .strip_prefix("mihomo-")
+            .is_some_and(is_hex_token)
             && entry.file_type().is_ok_and(|kind| kind.is_dir())
         {
             let _ = fs::remove_dir_all(entry.path());
+            continue;
+        }
+        if name
+            .strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".tmp"))
+            .is_some_and(is_hex_token)
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+        {
+            let _ = fs::remove_file(entry.path());
         }
     }
     system_proxy::recover(&directory.join("proxy.json"))
@@ -919,6 +943,8 @@ pub struct Session {
     pub tun_interface: Option<String>,
     pub tun_ipv6: bool,
     pub allow_lan: bool,
+    pub tun_stack: String,
+    pub tun_strict_route: bool,
     tun_control: Option<TunControl>,
     staged_mihomo_recovery: Option<u32>,
     service: Option<crate::service::ServiceSession>,
@@ -997,6 +1023,99 @@ fn mihomo_cache_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+const MIHOMO_PROVIDER_SUBDIRS: &[&str] = &["proxy-providers", "rule-providers"];
+const MAX_PROVIDER_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PROVIDER_CACHE_FILES: usize = 128;
+const MAX_PROVIDER_CACHE_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+fn valid_provider_cache_entry(entry: &fs::DirEntry) -> Option<(PathBuf, String, std::time::SystemTime)> {
+    let meta = entry.metadata().ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_PROVIDER_CACHE_BYTES {
+        return None;
+    }
+    let name = entry.file_name().to_str()?.to_owned();
+    if !name.ends_with(".cache") || name.contains(['/', '\\']) {
+        return None;
+    }
+    let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    Some((entry.path(), name, modified))
+}
+
+fn prune_provider_cache_dir(dir: &Path) {
+    let cutoff = std::time::SystemTime::now().checked_sub(MAX_PROVIDER_CACHE_AGE);
+    let mut kept = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Some((path, _, modified)) = valid_provider_cache_entry(&entry) else {
+            let _ = fs::remove_file(entry.path());
+            continue;
+        };
+        if cutoff.is_some_and(|limit| modified < limit) {
+            let _ = fs::remove_file(path);
+            continue;
+        }
+        kept.push((modified, path));
+    }
+    if kept.len() > MAX_PROVIDER_CACHE_FILES {
+        kept.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in kept.into_iter().skip(MAX_PROVIDER_CACHE_FILES) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn copy_provider_cache_atomic(src: &Path, dst: &Path) {
+    let tmp = dst.with_extension("cache.tmp");
+    if fs::copy(src, &tmp).is_ok() {
+        if fs::rename(&tmp, dst).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+fn seed_mihomo_provider_cache(cache_dir: &Path, home: &Path) {
+    for subdir in MIHOMO_PROVIDER_SUBDIRS {
+        let src_dir = cache_dir.join(subdir);
+        if !src_dir.is_dir() {
+            continue;
+        }
+        let dst_dir = home.join(subdir);
+        if fs::create_dir_all(&dst_dir).is_err() {
+            continue;
+        }
+        for entry in fs::read_dir(&src_dir).into_iter().flatten().flatten() {
+            let Some((src, name, _)) = valid_provider_cache_entry(&entry) else {
+                continue;
+            };
+            let dst = dst_dir.join(name);
+            if !dst.exists() {
+                let _ = fs::copy(src, dst);
+            }
+        }
+    }
+}
+
+fn save_mihomo_provider_cache(home: &Path, cache_dir: &Path) {
+    for subdir in MIHOMO_PROVIDER_SUBDIRS {
+        let src_dir = home.join(subdir);
+        if !src_dir.is_dir() {
+            continue;
+        }
+        let dst_dir = cache_dir.join(subdir);
+        if fs::create_dir_all(&dst_dir).is_err() {
+            continue;
+        }
+        for entry in fs::read_dir(&src_dir).into_iter().flatten().flatten() {
+            let Some((src, name, _)) = valid_provider_cache_entry(&entry) else {
+                continue;
+            };
+            copy_provider_cache_atomic(&src, &dst_dir.join(name));
+        }
+        prune_provider_cache_dir(&dst_dir);
+    }
+}
+
 fn seed_mihomo_geodata(home: &std::path::Path) {
     let cache = mihomo_cache_dir();
     let exe_dir = env::current_exe()
@@ -1025,6 +1144,9 @@ fn seed_mihomo_geodata(home: &std::path::Path) {
             let _ = fs::copy(src, &dst);
         }
     }
+    if let Some(cache_dir) = &cache {
+        seed_mihomo_provider_cache(cache_dir, home);
+    }
 }
 
 fn save_mihomo_geodata(home: &std::path::Path) {
@@ -1043,6 +1165,7 @@ fn save_mihomo_geodata(home: &std::path::Path) {
             }
         }
     }
+    save_mihomo_provider_cache(home, &cache);
 }
 
 struct MihomoHome(PathBuf);
@@ -1077,6 +1200,8 @@ impl Session {
                     tun_interface: service.active_tun_interface(),
                     tun_ipv6: service.tun_ipv6,
                     allow_lan: service.allow_lan,
+                    tun_stack: service.tun_stack.clone(),
+                    tun_strict_route: service.tun_strict_route,
                     tun_control: None,
                     staged_mihomo_recovery: None,
                     service: Some(service),
@@ -1128,13 +1253,15 @@ impl Session {
         }
         if settings.core == Core::Mihomo {
             if mode == "tun" {
-                mihomo::prepare_native_tun_with_lan(
+                mihomo::prepare_native_tun_with_options(
                     &settings.config,
                     port,
                     routing_mode,
                     "RelayDesk-Check",
                     options.tun_ipv6,
                     options.allow_lan,
+                    &options.tun_stack,
+                    options.tun_strict_route,
                 )?;
             } else {
                 mihomo::prepare_with_lan(&settings.config, port, routing_mode, options.allow_lan)?;
@@ -1195,6 +1322,8 @@ impl Session {
         let controller = crate::telemetry::Controller::new(port)?;
         let allow_lan = options.allow_lan;
         let tun_ipv6 = options.tun_ipv6;
+        let tun_stack = mihomo::normalize_tun_stack(&options.tun_stack).to_owned();
+        let tun_strict_route = options.tun_strict_route;
         let input = WorkerInput {
             settings,
             controller: controller.clone(),
@@ -1241,6 +1370,8 @@ impl Session {
             tun_interface: initial_interface,
             tun_ipv6,
             allow_lan,
+            tun_stack,
+            tun_strict_route,
             tun_control,
             staged_mihomo_recovery: None,
             service: None,
@@ -1618,11 +1749,15 @@ fn supervise_core(
     lifetime: &WorkerLifetime<'_>,
     interface: &str,
     tun_route: Option<MIB_IPFORWARD_ROW2>,
+    address: SocketAddr,
+    controller: &crate::telemetry::Controller,
 ) -> bool {
     let ipv4_route = tun_route;
     let ipv6_route = tun_route.and_then(|_| tun_default_route(interface, AF_INET6 as u16));
     let mut next_route_check = ipv4_route.map(|_| Instant::now() + TUN_ROUTE_CHECK_INTERVAL);
     let mut failed_route_checks = 0;
+    let mut next_heartbeat = Instant::now() + CORE_HEARTBEAT_INTERVAL;
+    let mut failed_heartbeats: u8 = 0;
     while !lifetime.ended(150) {
         if let Ok(Some(status)) = child.try_wait() {
             crate::logs::append(
@@ -1649,6 +1784,30 @@ fn supervise_core(
                         "worker",
                         "warn",
                         "TUN IPv4 默认路由持续缺失 12 秒，触发内核重连恢复",
+                    );
+                    return true;
+                }
+            }
+        }
+        if now >= next_heartbeat {
+            next_heartbeat = now + CORE_HEARTBEAT_INTERVAL;
+            let alive = controller.ready()
+                && TcpStream::connect_timeout(&address, Duration::from_millis(150)).is_ok();
+            if alive {
+                failed_heartbeats = 0;
+            } else {
+                failed_heartbeats = failed_heartbeats.saturating_add(1);
+                if failed_heartbeats == 2 {
+                    crate::logs::append(
+                        "worker",
+                        "warn",
+                        "代理内核心跳检测连续 2 次无响应，继续确认",
+                    );
+                } else if failed_heartbeats >= CORE_HEARTBEAT_FAILURE_THRESHOLD {
+                    crate::logs::append(
+                        "worker",
+                        "warn",
+                        "代理内核连续 3 次心跳无响应（端口或控制接口假死），触发重启恢复",
                     );
                     return true;
                 }
@@ -1724,6 +1883,8 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     } = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
     let allow_lan = options.allow_lan;
     let tun_ipv6 = options.tun_ipv6;
+    let tun_stack = mihomo::normalize_tun_stack(&options.tun_stack).to_owned();
+    let tun_strict_route = options.tun_strict_route;
     let bypass = options.bypass;
     let mut interface = tun_interface(token);
     let control = if mode == "tun" {
@@ -1744,13 +1905,15 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let home = if core == Core::Mihomo {
         if mode == "tun" {
             crate::bundled_binary("wintun.dll")?;
-            config = mihomo::prepare_native_tun_with_lan(
+            config = mihomo::prepare_native_tun_with_options(
                 &config,
                 port,
                 routing_mode,
                 &interface,
                 tun_ipv6,
                 allow_lan,
+                &tun_stack,
+                tun_strict_route,
             )?;
         } else {
             config = mihomo::prepare_with_lan(&config, port, routing_mode, allow_lan)?;
@@ -1771,6 +1934,8 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             if !tun_ipv6 {
                 config["inbounds"][1]["address"] = json!(["172.28.254.1/30"]);
             }
+            config["inbounds"][1]["stack"] = json!(&tun_stack);
+            config["inbounds"][1]["strict_route"] = json!(tun_strict_route);
         }
         if allow_lan {
             config["inbounds"][0]["listen"] = json!("0.0.0.0");
@@ -1951,7 +2116,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let mut started = Instant::now();
     let mut failed = false;
     'session: loop {
-        let lost = supervise_core(&mut child, &lifetime, &interface, route);
+        let lost = supervise_core(&mut child, &lifetime, &interface, route, address, &controller);
         if lost {
             if let Some(control) = &control {
                 control.begin_recovery();
@@ -1978,6 +2143,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             if core == Core::Mihomo {
                 let mut next_routing = control.routing_mode();
                 if let Some(home) = &home {
+                    save_mihomo_geodata(&home.0);
                     if let Ok(Some(restart)) =
                         try_receive_mihomo_restart(&home.0, &lifetime, control)
                     {
@@ -1989,13 +2155,15 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                 let raw = raw_mihomo_profile
                     .as_ref()
                     .ok_or("恢复 Mihomo TUN 时缺少原始配置")?;
-                config = mihomo::prepare_native_tun_with_lan(
+                config = mihomo::prepare_native_tun_with_options(
                     raw,
                     port,
                     next_routing,
                     &interface,
                     tun_ipv6,
                     allow_lan,
+                    &tun_stack,
+                    tun_strict_route,
                 )?;
                 controller.configure_mihomo(&mut config);
                 if let Ok(level) = env::var("RELAYDESK_CORE_LOG_LEVEL") {
@@ -2202,5 +2370,32 @@ mod tests {
         config["endpoints"][0]["detour"] = json!("wireguard-uplink");
         config["endpoints"][0]["system"] = json!(true);
         assert!(tun_config(&config, 17771, "Fixture").is_none());
+    }
+
+    #[test]
+    fn provider_cache_roundtrips_valid_cache_files_and_skips_others() {
+        let base = env::temp_dir().join(format!("relaydesk-pcache-{}", uuid::Uuid::new_v4()));
+        let home_a = base.join("home-a");
+        let home_b = base.join("home-b");
+        let cache = base.join("cache");
+        fs::create_dir_all(home_a.join("rule-providers")).unwrap();
+        fs::create_dir_all(home_a.join("proxy-providers")).unwrap();
+        fs::create_dir_all(&home_b).unwrap();
+
+        fs::write(home_a.join("rule-providers").join("abc.cache"), b"payload:\n  - DOMAIN,example.com\n").unwrap();
+        fs::write(home_a.join("proxy-providers").join("empty.cache"), b"").unwrap();
+        fs::write(home_a.join("rule-providers").join("ignore.txt"), b"nope").unwrap();
+        fs::write(home_a.join("cache.db"), b"fakeip-db").unwrap();
+
+        save_mihomo_provider_cache(&home_a, &cache);
+        assert!(cache.join("rule-providers").join("abc.cache").is_file());
+        assert!(!cache.join("proxy-providers").join("empty.cache").exists());
+        assert!(!cache.join("rule-providers").join("ignore.txt").exists());
+        assert!(!cache.join("cache.db").exists());
+
+        seed_mihomo_provider_cache(&cache, &home_b);
+        let restored = fs::read_to_string(home_b.join("rule-providers").join("abc.cache")).unwrap();
+        assert!(restored.contains("example.com"));
+        let _ = fs::remove_dir_all(&base);
     }
 }

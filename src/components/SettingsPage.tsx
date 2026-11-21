@@ -11,6 +11,7 @@ import {
   type CloseAction,
   type GlobalHotkeys,
   type ThemeMode,
+  type TunStack,
   type Workspace,
 } from "../workspace";
 
@@ -319,6 +320,21 @@ export function SettingsPage({
             恢复默认
           </button>
         </form>
+        <div className="setting-item" style={{ marginTop: 12 }}>
+          <div className="setting-label">
+            <strong>系统代理实时守护（防外部篡改）</strong>
+            <small>基于 Windows 注册表实时监听，检测到系统代理被其他程序改写时自动写回</small>
+          </div>
+          <label className="checkbox-inline">
+            <input
+              type="checkbox"
+              checked={workspace.systemProxyGuard}
+              disabled={!ready}
+              onChange={e => void onSave(s => ({ ...s, systemProxyGuard: e.target.checked }))}
+            />
+            <span>{workspace.systemProxyGuard ? "自动写回守护" : "仅提醒"}</span>
+          </label>
+        </div>
       </section>
 
       <section className="panel">
@@ -403,6 +419,38 @@ export function SettingsPage({
             <span>{workspace.tunIpv6 ? "双栈" : "仅 IPv4"}</span>
           </label>
         </div>
+        <div className="setting-item">
+          <div className="setting-label">
+            <strong>TUN 协议栈（Stack）</strong>
+            <small>若遇到特定防火墙或虚拟网卡冲突导致断流，建议切换为 gVisor 兼容栈（重连生效）</small>
+          </div>
+          <select
+            aria-label="TUN 协议栈"
+            className="toolbar-select"
+            value={workspace.tunStack}
+            disabled={!ready || busy || running}
+            onChange={e => void onSave(s => ({ ...s, tunStack: e.target.value as TunStack }))}
+          >
+            <option value="mixed">Mixed 混合栈（推荐）</option>
+            <option value="gvisor">gVisor（兼容优先）</option>
+            <option value="system">System（系统原生栈）</option>
+          </select>
+        </div>
+        <div className="setting-item">
+          <div className="setting-label">
+            <strong>TUN 严格路由（strict-route）</strong>
+            <small>防止 Windows 多宿主 DNS 泄漏；如与 WSL、Hyper-V 或企业 VPN 冲突可关闭（重连生效）</small>
+          </div>
+          <label className="checkbox-inline">
+            <input
+              type="checkbox"
+              checked={workspace.tunStrictRoute}
+              disabled={!ready || busy || running}
+              onChange={e => void onSave(s => ({ ...s, tunStrictRoute: e.target.checked }))}
+            />
+            <span>{workspace.tunStrictRoute ? "严格收口" : "宽松兼容"}</span>
+          </label>
+        </div>
       </section>
 
       <section className="panel">
@@ -424,8 +472,8 @@ export function SettingsPage({
         </div>
         <div className="setting-item">
           <div className="setting-label">
-            <strong>节点失联时自动换线（节点模式）</strong>
-            <small>后台连续两次连通性探测失败后，自动尝试同订阅备用节点（收藏优先）</small>
+            <strong>节点失联时自动换线（节点模式 &amp; Mihomo）</strong>
+            <small>确认非本机物理断网且连续两次探测失败后，自动切换到可用线路并清理旧节点上的死连接</small>
           </div>
           <label className="checkbox-inline">
             <input
