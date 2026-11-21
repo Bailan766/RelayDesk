@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useState } from "react";
+import { Loader2 } from "lucide-react";
 
 type Measurement = { bytes: number; milliseconds: number; megabits_per_second: number };
 
@@ -26,6 +27,7 @@ export function DownloadCheck({ port, disabled }: { port?: number; disabled: boo
     <div className="panel-head">
       <h2>当前路由下载速度</h2>
       <button type="button" className="mini-btn is-primary" disabled={!port || disabled || pending} onClick={() => void measure()}>
+        {pending && <Loader2 size={13} className="spin" />}
         {pending ? "正在测速…" : "开始测速"}
       </button>
     </div>

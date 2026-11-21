@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDownUp, ChevronDown, ChevronRight, Gauge, Search } from "lucide-react";
+import { ArrowDownUp, ChevronDown, Gauge, Loader2, Search } from "lucide-react";
 import type { RoutingMode } from "./workspace";
 
 type Group = { name: string; kind: string; selected: string; choices: string[]; manual: boolean };
@@ -210,7 +210,7 @@ export function MihomoGroups({
                   aria-label={isCollapsed ? `展开 ${group.name}` : `折叠 ${group.name}`}
                   onClick={() => setCollapsed(prev => ({ ...prev, [group.name]: !isCollapsed }))}
                 >
-                  {isCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+                  <ChevronDown size={16} className={`chevron ${isCollapsed ? "is-collapsed" : ""}`} />
                 </button>
                 <strong>{group.name}</strong>
                 <span className="tag">{groupLabels[group.kind] ?? group.kind}</span>
@@ -227,7 +227,8 @@ export function MihomoGroups({
                 disabled={disabled || !!testingGroup}
                 onClick={() => void testGroup(group)}
               >
-                <Gauge size={13} /> {testingGroup === group.name ? "测速中…" : "组内测速"}
+                {testingGroup === group.name ? <Loader2 size={13} className="spin" /> : <Gauge size={13} />}
+                {testingGroup === group.name ? "测速中…" : "组内测速"}
               </button>
             </div>
             {!isCollapsed && (

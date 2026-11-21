@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { RefreshCw } from "lucide-react";
 import { connectionSupport } from "./config";
 import { formatBytes } from "./telemetry";
 import {
@@ -143,7 +144,10 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
         {profile.parsed.mihomo && <button className="mini-btn" disabled={!canSelectOriginal} onClick={onSelectOriginal}>
           {originalSelected ? "前往概览" : "选用原配置"}
         </button>}
-        {profile.source && <button className="mini-btn" disabled={pending || !refreshable} onClick={onRefresh}>{pending ? "更新中…" : "更新"}</button>}
+        {profile.source && <button className="mini-btn" disabled={pending || !refreshable} onClick={onRefresh}>
+          {pending && <RefreshCw size={12} className="spin" />}
+          {pending ? "更新中…" : "更新"}
+        </button>}
         {profile.source && <button className="link" disabled={!refreshable} onClick={() => {
           setRequestError("");
           setDraft({ request: profile.request, refreshHours: profile.refreshHours });

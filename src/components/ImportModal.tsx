@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { FileText, Upload, X } from "lucide-react";
+import { FileText, Loader2, Upload, X } from "lucide-react";
 import { SubscriptionRequestFields } from "../SubscriptionCard";
 import { defaultSubscriptionRequest, type SubscriptionRequest } from "../workspace";
 
@@ -97,6 +97,7 @@ export function ImportModal({
             disabled={importing || !ready || !text.trim()}
             onClick={() => void onImport(text, request && { ...request, userAgent: request.userAgent.trim() }, name)}
           >
+            {importing && <Loader2 size={14} className="spin" />}
             {importing ? "正在导入…" : "解析并导入"}
           </button>
         </div>

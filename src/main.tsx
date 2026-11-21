@@ -14,6 +14,7 @@ import {
   LayoutGrid,
   LayoutList,
   Link2,
+  Loader2,
   Moon,
   Plus,
   RefreshCw,
@@ -66,6 +67,7 @@ import "./style.css";
 import "./accessibility.css";
 import "./rules.css";
 import "./dashboard.css";
+import "./motion.css";
 
 type Page = "概览" | "节点" | "订阅" | "连接" | "规则" | "诊断" | "设置";
 type ExitIpDetail = { ip: string; country?: string | null; region?: string | null; city?: string | null; isp?: string | null };
@@ -1187,6 +1189,17 @@ function App() {
     }
   }, [autoConnect, busy, originalProfile?.parsed.mihomo, preferred, running, work.ready]);
 
+  useEffect(() => {
+    if (!dialog && !detailNode) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (detailNode) setDetailNode(undefined);
+      else if (dialog && !importing) setDialog(false);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [detailNode, dialog, importing]);
+
   function copyLocalEndpoint() {
     if (!port) return;
     void navigator.clipboard.writeText(`127.0.0.1:${port}`).then(() => {
@@ -1222,7 +1235,7 @@ function App() {
           <div className="brand-mark"><Cat size={18} /></div>
           <div>
             <strong>RelayDesk</strong>
-            <small>v1.2.0</small>
+            <small>v1.2.1</small>
           </div>
         </div>
         <nav>
@@ -1298,6 +1311,7 @@ function App() {
             <p className="notice is-error" role="alert">{work.storageError || settingsError}</p>
           )}
 
+          <div className="page-view" key={page}>
           {page === "概览" && (
             <>
               <section className="connection">
@@ -1362,6 +1376,7 @@ function App() {
                       disabled={busy || (!running && !current && !originalName) || !isTauri()}
                       onClick={() => void toggleProxy()}
                     >
+                      {busy && <Loader2 size={14} className="spin" />}
                       {busy ? "处理中…" : running ? "断开" : "连接"}
                     </button>
                   </div>
@@ -1463,6 +1478,7 @@ function App() {
                     <span>节点与延迟</span>
                     {!originalName && current && isTauri() && (
                       <button type="button" className="link" disabled={testing} onClick={() => void testNodes([current])}>
+                        {testing && <Loader2 size={12} className="spin" />}
                         {testing ? "测速中…" : "测速"}
                       </button>
                     )}
@@ -1470,7 +1486,7 @@ function App() {
                   <strong style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <span>{(!originalName && current && probe(current)?.label) || (running ? "运行中" : "待连接")}</span>
                     {nodeHealth && (
-                      <span className={`tag ${nodeHealth === "healthy" ? "is-good" : nodeHealth === "unreachable" ? "is-bad" : "is-warn"}`}>
+                      <span className={`tag ${nodeHealth === "healthy" ? "is-good" : nodeHealth === "unreachable" ? "is-bad" : nodeHealth === "checking" ? "is-warn is-busy" : "is-warn"}`}>
                         {nodeHealth === "healthy" ? "正常" : nodeHealth === "checking" ? "探测中" : nodeHealth === "unreachable" ? "失联" : "未检测"}
                       </span>
                     )}
@@ -1482,6 +1498,7 @@ function App() {
                   <div className="stat-card-head">
                     <span>出口 IP</span>
                     <button type="button" className="link" disabled={!running || recovering || checking || busy} onClick={() => void showExitIp()}>
+                      {checking && <Loader2 size={12} className="spin" />}
                       {checking ? "查询中…" : "查询"}
                     </button>
                   </div>
@@ -1599,6 +1616,7 @@ function App() {
                 </div>
               )}
 
+              <div className="tab-view" key={runningOriginal ? nodesTab : "nodes"}>
               {runningOriginal && nodesTab === "groups" ? (
                 <MihomoGroups
                   mode={routingMode}
@@ -1672,6 +1690,7 @@ function App() {
                       disabled={(!testing && !filtered.length) || !isTauri()}
                       onClick={() => (testing ? stopNodeTests() : void testNodes(filtered))}
                     >
+                      {testing && <Loader2 size={13} className="spin" />}
                       {testing ? `停止 (${probeProgress?.done ?? 0}/${probeProgress?.total ?? filtered.length})` : "一键测速"}
                     </button>
                     <button
@@ -1697,6 +1716,24 @@ function App() {
                       ))}
                     </div>
                   </div>
+
+                  {testing && probeProgress && probeProgress.total > 0 && (
+                    <div
+                      className="probe-progress"
+                      role="progressbar"
+                      aria-label="节点测速进度"
+                      aria-valuenow={probeProgress.done}
+                      aria-valuemin={0}
+                      aria-valuemax={probeProgress.total}
+                    >
+                      <div className="probe-progress-track">
+                        <div
+                          className="probe-progress-fill"
+                          style={{ width: `${Math.round((probeProgress.done / probeProgress.total) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
 
                   {regionCounts.length > 1 && (
                     <div className="region-bar" role="group" aria-label="按地区筛选">
@@ -1920,6 +1957,7 @@ function App() {
                   </p>
                 </>
               )}
+              </div>
             </section>
           )}
 
@@ -1935,7 +1973,7 @@ function App() {
                       disabled={!isTauri() || Object.values(work.refreshStatus).some(s => s?.pending)}
                       onClick={() => void refreshAllSubscriptions()}
                     >
-                      <RefreshCw size={13} /> 更新全部
+                      <RefreshCw size={13} className={Object.values(work.refreshStatus).some(s => s?.pending) ? "spin" : undefined} /> 更新全部
                     </button>
                   )}
                   <label className="refresh-setting">默认自动更新
@@ -2052,6 +2090,7 @@ function App() {
                 </div>
               </div>
 
+              <div className="tab-view" key={diagTab}>
               {diagTab === "checks" && (
                 <>
                   <DownloadCheck key={diagnosticsVersion} port={running && !recovering ? port : undefined} disabled={busy} />
@@ -2060,6 +2099,7 @@ function App() {
                     <div className="panel-head">
                       <h2>本机直连诊断</h2>
                       <button className="mini-btn" disabled={localTcpBusy || !isTauri()} onClick={() => void testLocalTcp()}>
+                        {localTcpBusy && <Loader2 size={12} className="spin" />}
                         {localTcpBusy ? "测试中…" : "测试 TCP 443"}
                       </button>
                     </div>
@@ -2077,6 +2117,7 @@ function App() {
               )}
 
               {diagTab === "logs" && <EventLog />}
+              </div>
             </>
           )}
 
@@ -2094,6 +2135,7 @@ function App() {
               onSave={saveSettings}
             />
           )}
+          </div>
         </main>
       </div>
 
@@ -2137,7 +2179,10 @@ function App() {
                   type="button"
                   className="btn"
                   onClick={() => {
-                    void navigator.clipboard.writeText(detailNode.uri!).then(() => setDetailCopied(true)).catch(() => {});
+                    void navigator.clipboard.writeText(detailNode.uri!).then(() => {
+                      setDetailCopied(true);
+                      window.setTimeout(() => setDetailCopied(false), 1600);
+                    }).catch(() => {});
                   }}
                 >
                   {detailCopied ? <><Check size={14} /> 已复制链接</> : <><Copy size={14} /> 复制分享链接</>}

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useRef, useState } from "react";
+import { Loader2 } from "lucide-react";
 
 const services = [
   "ChatGPT Web",
@@ -92,6 +93,7 @@ export function UnlockTests({ port, disabled }: { port?: number; disabled: boole
           disabled={!port || disabled}
           onClick={() => void testAll()}
         >
+          {runningAll && <Loader2 size={13} className="spin" />}
           {runningAll ? "停止检测" : "检测全部"}
         </button>
       </div>
@@ -113,11 +115,12 @@ export function UnlockTests({ port, disabled }: { port?: number; disabled: boole
                   disabled={!port || disabled || busy}
                   onClick={() => void testOne(serviceName)}
                 >
+                  {busy && <Loader2 size={12} className="spin" />}
                   {busy ? "检测中" : "检测"}
                 </button>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                <span className={`tag ${badge?.cls ?? ""}`}>
+                <span className={`tag ${busy ? "is-busy" : badge?.cls ?? ""}`}>
                   {busy ? "正在请求…" : badge?.text ?? "未检测"}
                 </span>
                 {res?.region && <span className="tag is-accent">{res.region}</span>}

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useState } from "react";
+import { Loader2 } from "lucide-react";
 
 const websites = [
   ["apple", "Apple"],
@@ -43,6 +44,7 @@ export function WebsiteChecks({ port, disabled }: { port?: number; disabled: boo
     <div className="panel-head">
       <h2>网站连通性</h2>
       <button type="button" className="mini-btn" disabled={!port || disabled || testingAll} onClick={() => void testAll()}>
+        {testingAll && <Loader2 size={13} className="spin" />}
         {testingAll ? "测试中…" : "测试全部"}
       </button>
     </div>
