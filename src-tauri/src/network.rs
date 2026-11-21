@@ -1756,6 +1756,11 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             config = mihomo::prepare_with_lan(&config, port, routing_mode, allow_lan)?;
         }
         controller.configure_mihomo(&mut config);
+        if let Ok(level) = env::var("RELAYDESK_CORE_LOG_LEVEL") {
+            if matches!(level.as_str(), "debug" | "info" | "warning" | "error") {
+                config["log-level"] = json!(level);
+            }
+        }
         let path = directory.join(format!("mihomo-{token}"));
         fs::create_dir(&path).map_err(|_| "无法创建 Mihomo 工作目录")?;
         seed_mihomo_geodata(&path);
@@ -1979,6 +1984,11 @@ fn run_worker(args: &[String]) -> Result<(), String> {
                     allow_lan,
                 )?;
                 controller.configure_mihomo(&mut config);
+                if let Ok(level) = env::var("RELAYDESK_CORE_LOG_LEVEL") {
+                    if matches!(level.as_str(), "debug" | "info" | "warning" | "error") {
+                        config["log-level"] = json!(level);
+                    }
+                }
             } else {
                 let tun = config["inbounds"]
                     .as_array_mut()

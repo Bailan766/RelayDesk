@@ -88,9 +88,19 @@ fn assert_http_through_tun(session: &Session, address: SocketAddr) {
         .unwrap();
     stream
         .write_all(b"GET /bridge HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "assert_http_through_tun({address}) write failed: {error}\nlogs:\n{}",
+                read_installed_log_tail(60)
+            )
+        });
     let mut body = String::new();
-    stream.read_to_string(&mut body).unwrap();
+    if let Err(error) = stream.read_to_string(&mut body) {
+        panic!(
+            "assert_http_through_tun({address}) read failed: {error}; partial body={body:?}\nlogs:\n{}",
+            read_installed_log_tail(60)
+        );
+    }
     assert!(body.ends_with("bridge"));
 }
 
@@ -154,11 +164,24 @@ fn read_installed_log_tail(max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
+struct LogDumpOnPanic;
+
+impl Drop for LogDumpOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("=== relaydesk.log tail ===\n{}", read_installed_log_tail(60));
+        }
+        env::remove_var("RELAYDESK_CORE_LOG_LEVEL");
+    }
+}
+
 #[test]
 fn installed_mihomo_profile_captures_tcp_udp_and_dns_then_releases_the_tun() {
     let Some(app) = env::var_os("RELAYDESK_INSTALLED_SMOKE_APP").map(PathBuf::from) else {
         return;
     };
+    let _log_guard = LogDumpOnPanic;
+    env::set_var("RELAYDESK_CORE_LOG_LEVEL", "debug");
     let connect_proxy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     connect_proxy.set_nonblocking(true).unwrap();
     let http_port = port(&connect_proxy);
