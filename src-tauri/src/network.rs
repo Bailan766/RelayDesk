@@ -932,7 +932,7 @@ fn capture_config(
             {"type":"local","tag":"system-dns","prefer_go":true}
         ],"rules":[
             {"inbound":"system-dns-in","action":"route","server":"system-dns"},
-            {"inbound":"tun","action":"route","server":"policy-dns"}
+            {"inbound":"tun","action":"route","server":"policy-dns","disable_cache":true}
         ],"final":"policy-dns"}
     })
 }
