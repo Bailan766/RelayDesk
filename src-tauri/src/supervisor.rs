@@ -230,8 +230,7 @@ impl Supervisor {
         let mut slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
         slot.message = None;
         let result = match slot.active.take() {
-            Some(active) if active.session.running() => active.session.stop(),
-            Some(_) => network::recover(),
+            Some(active) => active.session.stop().or_else(|_| network::recover()),
             None => return Ok(()),
         };
         if result.is_ok() {
@@ -374,7 +373,7 @@ impl Supervisor {
 
     pub async fn reload_mihomo(&self, config: Value) -> Result<(), String> {
         let _guard = self.control.lock().await;
-        let (id, controller, old, port, mode, selections) = {
+        let (id, controller, old, port, dns, mode, selections) = {
             let slot = self.slot.lock().map_err(|_| "代理状态不可用")?;
             let active = slot
                 .active
@@ -388,16 +387,21 @@ impl Supervisor {
                 active.session.controller.clone(),
                 active.plan.settings.config.clone(),
                 active.plan.port,
+                active.session.policy_dns,
                 active.plan.routing_mode,
                 active.plan.settings.selections.clone(),
             )
         };
-        let next = crate::mihomo::prepare(&config, port, mode)?;
+        let prepare = |profile: &Value| match dns {
+            Some(dns) => crate::mihomo::prepare_tun_policy(profile, port, mode, dns),
+            None => crate::mihomo::prepare(profile, port, mode),
+        };
+        let next = prepare(&config)?;
         match controller.reload_mihomo(next).await {
             Ok(true) => {}
             Ok(false) => return Err("Mihomo 拒绝了更新，连接继续使用原配置".into()),
             Err(error) => {
-                if let Ok(previous) = crate::mihomo::prepare(&old, port, mode) {
+                if let Ok(previous) = prepare(&old) {
                     if controller
                         .reload_mihomo(previous)
                         .await
@@ -645,9 +649,11 @@ impl Supervisor {
         let Some(delay) = active.retry_delay() else {
             let tun = active.plan.mode == "tun";
             let exhausted = active.failures >= RETRY_DELAYS.len();
-            slot.active.take();
+            if let Some(active) = slot.active.take() {
+                let _ = active.session.stop();
+            }
             let message = if network::recover().is_err() {
-                "内核已退出，系统代理恢复暂未确认，请重新检查 Windows 代理设置"
+                "内核已退出，暂未确认 Windows 网络设置已恢复"
             } else if tun {
                 "TUN 内核已退出，重新连接时需要管理员授权"
             } else if exhausted {

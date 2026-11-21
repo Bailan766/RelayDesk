@@ -568,16 +568,18 @@ function App() {
                     </select>
                   </label>
                   {mode === "tun" && !running && <small>启动时需要管理员授权</small>}
-                  {originalName && mode === "tun" && !running && <small>原配置模式请选择系统代理或本地端口。</small>}
                   <button
                     className="connect"
-                    disabled={busy || (!running && ((!current && !originalName) || testing || (!!originalName && mode === "tun"))) || !isTauri()}
+                    disabled={busy || (!running && ((!current && !originalName) || testing)) || !isTauri()}
                     onClick={toggleProxy}
                   >
                     {busy ? "处理中…" : running ? "停止" : "连接"}
                   </button>
                 </div>
               </section>
+              {originalName && mode === "tun" && <div className="notice">
+                TUN 转发后，Mihomo 的进程、来源地址、来源端口和入口名称规则按内部连接匹配。
+              </div>}
               {originalUpdated && <div className="notice" role="status">
                 订阅配置已更新。
                 <button className="link inline-action" disabled={busy || recovering}

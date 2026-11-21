@@ -112,6 +112,31 @@ pub fn prepare(config: &Value, port: u16, mode: RoutingMode) -> Result<Value, St
     Ok(Value::Object(config))
 }
 
+pub fn prepare_tun_policy(
+    config: &Value,
+    port: u16,
+    mode: RoutingMode,
+    dns_port: u16,
+) -> Result<Value, String> {
+    let mut prepared = prepare(config, port, mode)?;
+    let dns = prepared["dns"].take();
+    let mut dns = match dns {
+        Value::Object(dns) => dns,
+        Value::Null => Map::new(),
+        _ => return Err("原配置的 DNS 必须为对象".into()),
+    };
+    if dns.get("enable") != Some(&json!(true)) {
+        dns = Map::from_iter([
+            ("nameserver".into(), json!(["system"])),
+            ("use-hosts".into(), json!(true)),
+        ]);
+    }
+    dns.insert("enable".into(), json!(true));
+    dns.insert("listen".into(), json!(format!("127.0.0.1:{dns_port}")));
+    prepared["dns"] = Value::Object(dns);
+    Ok(prepared)
+}
+
 pub async fn restore_selections(
     controller: &Controller,
     selections: BTreeMap<String, String>,
@@ -144,6 +169,31 @@ pub async fn restore_selections(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tun_uses_the_profile_dns_or_the_system_resolver_on_a_private_port() {
+        let configured = json!({
+            "rules":["MATCH,DIRECT"],
+            "dns":{"enable":true,"listen":"0.0.0.0:53","nameserver":["https://dns.example/query"],
+                   "enhanced-mode":"fake-ip"}
+        });
+        let dns = prepare_tun_policy(&configured, 17070, RoutingMode::Rule, 17071).unwrap()["dns"]
+            .clone();
+        assert_eq!(dns["listen"], "127.0.0.1:17071");
+        assert_eq!(dns["nameserver"], configured["dns"]["nameserver"]);
+        assert_eq!(dns["enhanced-mode"], "fake-ip");
+
+        for config in [
+            json!({"rules":["MATCH,DIRECT"]}),
+            json!({"rules":["MATCH,DIRECT"],"dns":{"enable":false,"nameserver":["127.0.0.2"]}}),
+        ] {
+            let prepared = prepare_tun_policy(&config, 17070, RoutingMode::Rule, 17071).unwrap();
+            let dns = &prepared["dns"];
+            assert_eq!(dns["enable"], true);
+            assert_eq!(dns["listen"], "127.0.0.1:17071");
+            assert_eq!(dns["nameserver"], json!(["system"]));
+        }
+    }
 
     #[test]
     fn preserves_user_routing_and_owns_network_listeners_and_provider_paths() {

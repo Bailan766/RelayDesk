@@ -17,6 +17,7 @@
 | A01/A02 WireGuard | `v0.1.9-preview.1` 使用本机 WireGuard 对端跑通 IP 与域名握手和完整 HTTP 流量。由 Windows 安装包创建 TUN 后，未配置显式代理的 TCP 请求通过 WireGuard 对端，停止后清除 TUN 网卡地址。校验官方便携包哈希后在实机重跑通过。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44831533299) | 远程服务商的双栈、UDP 和多对端组合，及不同 Windows 版本。 |
 | A05/A09 节点自动换线 | `v0.1.10-preview.2` 通过安装后的进程验证。夹具模拟连续探测失败，确认同一会话切到可用备用节点，后续 HTTP 走备用出站，旧探测结果也未覆盖手动选择。真实内核的单节点探测另用两条 VLESS 路径验证，一条可达 HTTPS，另一条握手失败。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44833248433) | 长时间全链路自动探测、切网和休眠，以及跨内核策略组。 |
 | A02/A06/A09 Mihomo 原配置 | `v0.1.14-preview.2` 从仅含提供者的配置启动。已安装的 Windows 进程加载远程节点和规则、按原 DNS 查询，并改变策略组后实际转发或拒绝同一请求。重新启动前保存的提供者节点在入口就绪前恢复。 [Windows 安装验收](https://github.com/Bailan766/RelayDesk/actions/runs/44838304370) | TUN 原配置、文件型提供者、YAML 覆写、生产环境的大型远程规则集，以及其他桌面和移动平台。 |
+| A04/A06 Mihomo 原配置接入 TUN | Windows 实机的定向路由夹具中，未手动设置代理的 HTTP 请求和 DNS 查询经 TUN 交给 Mihomo。另将真实 HTTPS 上游临时纳入捕获范围，验证 Mihomo 自身的上游连接从物理网卡出去。安装验收定义还覆盖 UDP 回显、策略进程异常退出、网卡和 DNS 监听释放。 | 正式包验收、来源和进程规则的原始连接信息、切网和休眠唤醒、IPv6、应用自带加密 DNS。 |
 
 ## 优先解决的用户风险
 

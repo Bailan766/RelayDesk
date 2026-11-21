@@ -18,7 +18,7 @@ use winapi::{
     um::{
         handleapi::CloseHandle,
         jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject},
-        processthreadsapi::OpenProcess,
+        processthreadsapi::{GetProcessId, OpenProcess},
         shellapi::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
         synchapi::{
             CreateEventW, CreateMutexW, OpenEventW, ReleaseMutex, SetEvent, WaitForSingleObject,
@@ -41,6 +41,7 @@ pub enum Core {
     #[default]
     Singbox,
     Mihomo,
+    Bridge,
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -130,7 +131,15 @@ struct NetworkLock(Handle);
 
 impl NetworkLock {
     fn acquire() -> Result<Self, String> {
-        let name = wide("Local\\RelayDesk.Network");
+        Self::named("Local\\RelayDesk.Network")
+    }
+
+    fn policy() -> Result<Self, String> {
+        Self::named("Local\\RelayDesk.TunPolicy")
+    }
+
+    fn named(name: &str) -> Result<Self, String> {
+        let name = wide(name);
         let handle = Handle::new(unsafe { CreateMutexW(ptr::null_mut(), FALSE, name.as_ptr()) })?;
         match unsafe { WaitForSingleObject(handle.0, 0) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
@@ -150,17 +159,19 @@ impl Drop for NetworkLock {
 pub fn recover() -> Result<(), String> {
     let _lock = NetworkLock::acquire()?;
     let directory = runtime_dir()?;
-    for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
-        let filename = entry.file_name();
-        if filename
-            .to_str()
-            .and_then(|name| name.strip_prefix("mihomo-"))
-            .is_some_and(|token| {
-                token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
-            && entry.file_type().is_ok_and(|kind| kind.is_dir())
-        {
-            let _ = fs::remove_dir_all(entry.path());
+    if let Ok(_policy) = NetworkLock::policy() {
+        for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+            let filename = entry.file_name();
+            if filename
+                .to_str()
+                .and_then(|name| name.strip_prefix("mihomo-"))
+                .is_some_and(|token| {
+                    token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            {
+                let _ = fs::remove_dir_all(entry.path());
+            }
         }
     }
     system_proxy::recover(&directory.join("proxy.json"))
@@ -644,6 +655,8 @@ pub struct Session {
     pub port: u16,
     pub controller: crate::telemetry::Controller,
     pub id: String,
+    pub policy_dns: Option<u16>,
+    policy: Option<Box<Session>>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -653,6 +666,52 @@ struct WorkerInput {
     controller: crate::telemetry::Controller,
     #[serde(default)]
     routing_mode: RoutingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_dns: Option<u16>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureTarget {
+    mixed_port: u16,
+    dns_port: u16,
+    policy_pid: u32,
+}
+
+fn capture_config(
+    target: &CaptureTarget,
+    port: u16,
+    interface: &str,
+    program: &std::path::Path,
+) -> Value {
+    let path = program.to_string_lossy();
+    let path = path.strip_prefix(r"\\?\").unwrap_or(&path);
+    let mut expression = String::from("(?i)^");
+    for character in path.chars() {
+        if r"\.^$|?*+()[]{}".contains(character) {
+            expression.push('\\');
+        }
+        expression.push(character);
+    }
+    expression.push('$');
+    json!({
+        "log":{"level":"warn"},
+        "inbounds":[
+            {"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port},
+            {"type":"tun","tag":"tun","interface_name":interface,"address":["172.28.254.1/30","fdfe:dcba:9876::1/126"],
+             "auto_route":true,"strict_route":true,"stack":"mixed"}
+        ],
+        "outbounds":[
+            {"type":"socks","tag":"policy","server":"127.0.0.1","server_port":target.mixed_port,"version":"5"},
+            {"type":"direct","tag":"physical"}
+        ],
+        "route":{"auto_detect_interface":true,"final":"policy","rules":[
+            {"process_path_regex":[expression],"outbound":"physical"},
+            {"action":"sniff"},
+            {"protocol":"dns","action":"hijack-dns"}
+        ]},
+        "dns":{"servers":[{"type":"udp","tag":"policy-dns","server":"127.0.0.1","server_port":target.dns_port}],"final":"policy-dns"}
+    })
 }
 
 struct MihomoHome(PathBuf);
@@ -683,13 +742,61 @@ impl Session {
         if !matches!(mode, "local" | "system" | "tun") {
             return Err("代理入口模式无效".into());
         }
-        let core = settings.core;
-        if core == Core::Mihomo {
-            if mode == "tun" {
-                return Err("Mihomo 原配置模式目前使用系统代理或本地端口".into());
+        if settings.core == Core::Mihomo && mode == "tun" {
+            let dns_port = auxiliary_port(&[port])?;
+            mihomo::prepare_tun_policy(&settings.config, port, routing_mode, dns_port)?;
+            let policy = Self::start_worker(
+                settings,
+                port,
+                "policy",
+                routing_mode,
+                executable,
+                Some(dns_port),
+            )?;
+            let policy_pid = unsafe { GetProcessId(policy.worker.0) };
+            if policy_pid == 0 {
+                return Err("无法监视 Mihomo 网络进程".into());
             }
+            let local_port = auxiliary_port(&[port, dns_port])?;
+            let target = CaptureTarget {
+                mixed_port: port,
+                dns_port,
+                policy_pid,
+            };
+            let settings = CoreSettings {
+                core: Core::Bridge,
+                config: serde_json::to_value(target).map_err(|_| "TUN 转发设置无效")?,
+                selections: BTreeMap::new(),
+            };
+            let mut capture = Self::start_worker(
+                settings,
+                local_port,
+                "tun",
+                RoutingMode::Rule,
+                executable,
+                None,
+            )?;
+            capture.port = port;
+            capture.controller = policy.controller.clone();
+            capture.policy_dns = Some(dns_port);
+            capture.policy = Some(Box::new(policy));
+            return Ok(capture);
+        }
+        if settings.core == Core::Mihomo {
             mihomo::prepare(&settings.config, port, routing_mode)?;
         }
+        Self::start_worker(settings, port, mode, routing_mode, executable, None)
+    }
+
+    fn start_worker(
+        settings: CoreSettings,
+        port: u16,
+        mode: &str,
+        routing_mode: RoutingMode,
+        executable: &std::path::Path,
+        policy_dns: Option<u16>,
+    ) -> Result<Self, String> {
+        let core = settings.core;
         ensure_port_available(port)?;
         let directory = runtime_dir()?;
         let token = uuid::Uuid::new_v4().simple().to_string();
@@ -716,6 +823,7 @@ impl Session {
             settings,
             controller: controller.clone(),
             routing_mode,
+            policy_dns,
         };
         fs::write(
             &path,
@@ -749,6 +857,8 @@ impl Session {
             port,
             controller,
             id: token,
+            policy_dns,
+            policy: None,
         };
         let deadline = Instant::now()
             + if core == Core::Mihomo {
@@ -777,7 +887,7 @@ impl Session {
     }
 
     pub fn running(&self) -> bool {
-        !self.worker.signaled(0)
+        !self.worker.signaled(0) && self.policy.as_ref().is_none_or(|policy| policy.running())
     }
 
     #[cfg(test)]
@@ -787,7 +897,17 @@ impl Session {
         assert!(self.worker.signaled(5000));
     }
 
-    pub fn stop(self) -> Result<(), String> {
+    pub fn stop(mut self) -> Result<(), String> {
+        let capture = self.stop_worker();
+        let policy = self
+            .policy
+            .take()
+            .map(|policy| policy.stop_worker())
+            .unwrap_or(Ok(()));
+        capture.and(policy)
+    }
+
+    fn stop_worker(&self) -> Result<(), String> {
         unsafe {
             SetEvent(self.stop.0);
         }
@@ -803,6 +923,19 @@ impl Session {
         }
         Err("无法确认网络设置已恢复，请重开 RelayDesk 检查".into())
     }
+}
+
+fn auxiliary_port(excluded: &[u16]) -> Result<u16, String> {
+    for _ in 0..16 {
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|listener| listener.local_addr())
+            .map_err(|_| "无法分配内部 TUN 端口")?
+            .port();
+        if port >= 1024 && !excluded.contains(&port) && ensure_port_available(port).is_ok() {
+            return Ok(port);
+        }
+    }
+    Err("无法找到可用的内部 TUN 端口".into())
 }
 
 impl Drop for Session {
@@ -882,16 +1015,16 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     let [parent, token, port, mode] = args else {
         return Err("网络参数无效".into());
     };
-    let parent: u32 = parent.parse().map_err(|_| "父进程无效")?;
+    let parent_id: u32 = parent.parse().map_err(|_| "父进程无效")?;
     let port: u16 = port.parse().map_err(|_| "端口无效")?;
     if token.len() != 32
         || !token.bytes().all(|b| b.is_ascii_hexdigit())
         || port < 1024
-        || !matches!(mode.as_str(), "local" | "system" | "tun")
+        || !matches!(mode.as_str(), "local" | "system" | "tun" | "policy")
     {
         return Err("网络参数无效".into());
     }
-    let parent = Handle::new(unsafe { OpenProcess(SYNCHRONIZE, FALSE, parent) })?;
+    let parent = Handle::new(unsafe { OpenProcess(SYNCHRONIZE, FALSE, parent_id) })?;
     let stop =
         Handle::new(unsafe { OpenEventW(SYNCHRONIZE, FALSE, event_name(token, "stop").as_ptr()) })?;
     let ready = Handle::new(unsafe {
@@ -901,10 +1034,16 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             event_name(token, "ready").as_ptr(),
         )
     })?;
-    let _lock = NetworkLock::acquire()?;
+    let _lock = if mode == "policy" {
+        NetworkLock::policy()?
+    } else {
+        NetworkLock::acquire()?
+    };
     let directory = runtime_dir()?;
     let journal = directory.join("proxy.json");
-    system_proxy::recover(&journal).map_err(|_| "恢复系统代理失败")?;
+    if mode != "policy" {
+        system_proxy::recover(&journal).map_err(|_| "恢复系统代理失败")?;
+    }
     ensure_port_available(port)?;
     let input = directory.join(format!("{token}.json"));
     let config = fs::read(input).map_err(|_| "无法读取内核配置")?;
@@ -917,16 +1056,51 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             },
         controller,
         routing_mode,
+        policy_dns,
     } = serde_json::from_slice(&config).map_err(|_| "内核配置无效")?;
+    if (mode == "policy" && (core != Core::Mihomo || policy_dns.is_none()))
+        || (mode != "policy" && policy_dns.is_some())
+        || (core == Core::Bridge && mode != "tun")
+    {
+        return Err("TUN 转发参数不符合入口类型".into());
+    }
+    let mut dependency = None;
     let home = if core == Core::Mihomo {
         if mode == "tun" {
             return Err("Mihomo 原配置不能由 TUN 提权进程加载".into());
         }
-        config = mihomo::prepare(&config, port, routing_mode)?;
+        config = if let Some(dns) = policy_dns {
+            if dns < 1024 || dns == port {
+                return Err("Mihomo DNS 端口无效".into());
+            }
+            ensure_port_available(dns)?;
+            mihomo::prepare_tun_policy(&config, port, routing_mode, dns)?
+        } else {
+            mihomo::prepare(&config, port, routing_mode)?
+        };
         controller.configure_mihomo(&mut config);
         let path = directory.join(format!("mihomo-{token}"));
         fs::create_dir(&path).map_err(|_| "无法创建 Mihomo 工作目录")?;
         Some(MihomoHome(path))
+    } else if core == Core::Bridge {
+        let target: CaptureTarget =
+            serde_json::from_value(config).map_err(|_| "TUN 转发目标无效")?;
+        if target.mixed_port < 1024
+            || target.dns_port < 1024
+            || target.mixed_port == target.dns_port
+            || [target.mixed_port, target.dns_port].contains(&port)
+            || target.policy_pid == 0
+            || target.policy_pid == std::process::id()
+            || target.policy_pid == parent_id
+        {
+            return Err("TUN 转发端口或进程无效".into());
+        }
+        dependency = Some(Handle::new(unsafe {
+            OpenProcess(SYNCHRONIZE, FALSE, target.policy_pid)
+        })?);
+        let program = crate::bundled_binary("mihomo.exe")?;
+        config = capture_config(&target, port, &tun_interface(token), &program);
+        None
     } else {
         if mode == "tun" {
             config = tun_config(&config, port, &tun_interface(token)).ok_or("TUN 配置无效")?;
@@ -936,7 +1110,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         None
     };
     let binary = match core {
-        Core::Singbox => core_path()?,
+        Core::Singbox | Core::Bridge => core_path()?,
         Core::Mihomo => crate::bundled_binary("mihomo.exe")?,
     };
     let config = serde_json::to_vec(&config).map_err(|_| "内核配置无效")?;
@@ -991,7 +1165,11 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             }
             break;
         }
-        if stop.signaled(50) || parent.signaled(0) || Instant::now() >= deadline {
+        if stop.signaled(50)
+            || parent.signaled(0)
+            || dependency.as_ref().is_some_and(|policy| policy.signaled(0))
+            || Instant::now() >= deadline
+        {
             let _ = check.kill();
             let _ = check.wait();
             return Err("内核配置检查已停止或超时".into());
@@ -1011,6 +1189,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     loop {
         if stop.signaled(0)
             || parent.signaled(0)
+            || dependency.as_ref().is_some_and(|policy| policy.signaled(0))
             || child
                 .try_wait()
                 .map_err(|_| "无法读取内核进程状态")?
@@ -1023,9 +1202,11 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         }
         let tun_ready =
             mode != "tun" || UdpSocket::bind((std::net::Ipv4Addr::new(172, 28, 254, 1), 0)).is_ok();
+        let dns_ready = policy_dns.is_none_or(|dns| UdpSocket::bind(("127.0.0.1", dns)).is_err());
         if tun_ready
+            && dns_ready
             && TcpStream::connect_timeout(&address, Duration::from_millis(80)).is_ok()
-            && controller.ready()
+            && (core == Core::Bridge || controller.ready())
         {
             break;
         }
@@ -1056,8 +1237,16 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     unsafe {
         SetEvent(ready.0);
     }
-    while !stop.signaled(150) && !parent.signaled(0) && matches!(child.try_wait(), Ok(None)) {}
-    let restored = system_proxy::recover(&journal);
+    while !stop.signaled(150)
+        && !parent.signaled(0)
+        && dependency.as_ref().is_none_or(|policy| !policy.signaled(0))
+        && matches!(child.try_wait(), Ok(None))
+    {}
+    let restored = if mode == "policy" {
+        Ok(())
+    } else {
+        system_proxy::recover(&journal)
+    };
     let _ = child.kill();
     let _ = child.wait();
     restored.map_err(|_| "无法恢复系统代理".into())
@@ -1077,6 +1266,10 @@ pub fn cli() -> Option<i32> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "network/mihomo_tun_test.rs"]
+mod mihomo_tun_test;
 
 #[cfg(test)]
 mod tests {
