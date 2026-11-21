@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  deserializeWorkspace, emptyWorkspace, receiveSubscription, replaceSubscription,
+  deserializeWorkspace, emptyWorkspace, preferredNode, receiveSubscription, replaceSubscription,
   serializeWorkspace, subscriptionRefreshDue,
 } from "./workspace";
 
@@ -147,5 +147,13 @@ describe("encrypted workspace data", () => {
     const legacy = deserializeWorkspace(JSON.stringify({ source, selected: 1,
       content: [primary, primary.replace("security=tls", "security=tls&type=ws"), backup].join("\n") }));
     expect(legacy.subscriptions[0].parsed.nodes.find(node => node.id === legacy.selected)?.name).toBe("backup");
+  });
+
+  it("skips subscription info banner rows when picking an automatic fallback node", () => {
+    const infoNode = vless("127.0.0.1", "剩余流量：100GB");
+    const expiryNode = vless("127.0.0.1", "过期时间：2026-12-31");
+    const sub = receiveSubscription([infoNode, expiryNode, backup].join("\n"), source, null);
+    const chosen = preferredNode([sub]);
+    expect(sub.parsed.nodes.find(node => node.id === chosen)?.name).toBe("backup");
   });
 });

@@ -204,12 +204,12 @@ export function SettingsPage({
             <strong>当前进程权限</strong>
             <small>
               {elevated
-                ? "已以管理员身份运行：启动与自动恢复 TUN 不会再弹出 UAC 提示"
-                : "当前为普通权限：启动 TUN 时会按会话请求管理员授权"}
+                ? "已以管理员身份运行，TUN 模式无需再次授权"
+                : "普通权限：启动 TUN 时会弹出 UAC 授权"}
             </small>
           </div>
           {elevated ? (
-            <span className="badge is-good">管理员权限</span>
+            <span className="tag is-good">管理员权限</span>
           ) : (
             <button type="button" className="mini-btn is-primary" disabled={!isTauri() || busy} onClick={() => void elevate()}>
               以管理员身份重启

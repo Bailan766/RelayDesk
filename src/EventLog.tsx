@@ -103,6 +103,6 @@ export function EventLog() {
         <span>{item.message}</span>
       </li>)}
     </ul> : <p className="empty">{isTauri() ? "没有符合条件的日志或网络事件" : "请在桌面端查看运行日志"}</p>}
-    <p className="rule-hint" style={{ marginTop: 10 }}>已对订阅链接查询参数和认证信息自动脱敏，保留最近 160 条记录。</p>
+    <p className="rule-hint" style={{ marginTop: 10 }}>保留最近 160 条，查询参数与认证信息已脱敏。</p>
   </section>;
 }

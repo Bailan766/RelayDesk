@@ -34,7 +34,7 @@ export function ImportModal({
         <div className="modal-head">
           <div>
             <h2 id="dialog-title">导入订阅或节点</h2>
-            <p>粘贴订阅地址（支持 HTTPS 及本地/内网 HTTP）、节点分享链接、Base64、Clash YAML 或 sing-box JSON。</p>
+            <p>支持订阅 URL、分享链接、Base64、Clash YAML、sing-box JSON。</p>
           </div>
           <button
             className="icon-button"

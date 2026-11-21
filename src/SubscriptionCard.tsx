@@ -93,13 +93,13 @@ export function SubscriptionCard({ profile, pending, error, refreshable, origina
         <span>自动更新 · {refreshOptions.find(([hours]) => hours === profile.refreshHours)?.[1]}</span>}
     </div>
     {profile.parsed.mihomo && <p className="rule-hint">
-      <span className={`badge ${originalSelected ? "is-accent" : ""}`}>
+      <span className={`tag ${originalSelected ? "is-accent" : ""}`}>
         {originalSelected ? "当前选用 Mihomo 原配置" : "支持 Mihomo 原配置"}
       </span>
-      {!!profile.parsed.policySections?.length && ` · ${profile.parsed.policySections.join("、")}`}
+      {!!profile.parsed.policySections?.length && ` · ${profile.parsed.policySections.join(" / ")}`}
     </p>}
     {!profile.parsed.mihomo && !!profile.parsed.policySections?.length &&
-      <p className="rule-hint">原配置另含{profile.parsed.policySections.join("、")}。节点模式提取独立节点。</p>}
+      <p className="rule-hint">含 {profile.parsed.policySections.join(" / ")}</p>}
     {quota !== undefined && <div className="subscription-quota">
       <progress max={100} value={quota} aria-label="已用流量比例" />
       <small>已用 {formatBytes(used)} / {formatBytes(usage?.total)} ({quota.toFixed(1)}%)</small>

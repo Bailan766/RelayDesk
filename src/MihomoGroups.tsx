@@ -213,10 +213,10 @@ export function MihomoGroups({
                   {isCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
                 </button>
                 <strong>{group.name}</strong>
-                <span className="badge">{groupLabels[group.kind] ?? group.kind}</span>
-                <span className="badge is-accent">{group.selected || "等待提供者"}</span>
+                <span className="tag">{groupLabels[group.kind] ?? group.kind}</span>
+                <span className="tag is-accent">{group.selected || "等待提供者"}</span>
                 {selectedDelay !== undefined && (
-                  <span className={`badge ${selectedDelay === null ? "is-bad" : delayClass(selectedDelay)}`}>
+                  <span className={`latency ${selectedDelay === null ? "is-bad" : delayClass(selectedDelay)}`}>
                     {selectedDelay === null ? "超时" : `${selectedDelay} ms`}
                   </span>
                 )}
@@ -246,7 +246,7 @@ export function MihomoGroups({
                     >
                       <span>{choice}</span>
                       {delay !== undefined && (
-                        <span className={`badge ${delay === null ? "is-bad" : delayClass(delay)}`}>
+                        <span className={`latency ${delay === null ? "is-bad" : delayClass(delay)}`}>
                           {delay === null ? "超时" : `${delay}ms`}
                         </span>
                       )}

@@ -30,14 +30,14 @@ export function DownloadCheck({ port, disabled }: { port?: number; disabled: boo
       </button>
     </div>
     {sample && <div role="status" style={{ marginBottom: 8 }}>
-      <span className="badge is-good" style={{ fontSize: 13 }}>
+      <strong className="latency is-good" style={{ fontSize: 15 }}>
         {sample.megabits_per_second.toLocaleString("zh-CN", { maximumFractionDigits: 2 })} Mbps
-      </span>
+      </strong>
       <span className="muted" style={{ marginLeft: 10 }}>
         {(sample.bytes / (1024 * 1024)).toFixed(2)} MiB · {(sample.milliseconds / 1000).toFixed(2)} 秒
       </span>
     </div>}
     {error && <p className="error" role="status">{error}</p>}
-    <p className="rule-hint">{port ? "按当前路由从 Cloudflare 下载单次样本，最多使用 8 MiB 流量。" : "连接代理后可以测试下载吞吐。"}</p>
+    <p className="rule-hint">{port ? "通过 Cloudflare 下载单次样本（上限 8 MiB）。" : "连接代理后可测试下载吞吐。"}</p>
   </section>;
 }

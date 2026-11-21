@@ -106,15 +106,15 @@ const routingModes: { value: RoutingMode; label: string }[] = [
   { value: "direct", label: "直连" },
 ];
 
-const pageMeta: Record<Page, { subtitle: string; icon: typeof Activity }> = {
-  概览: { subtitle: "连接控制、核心状态与快捷节点切换", icon: LayoutDashboard },
-  节点: { subtitle: "浏览、筛选、测速并选择代理节点", icon: Globe2 },
-  订阅: { subtitle: "导入与管理多订阅来源及 Mihomo 原配置", icon: Boxes },
-  连接: { subtitle: "查看、搜索、管理活跃连接及快速分流", icon: Link2 },
-  规则: { subtitle: "管理节点模式的分流规则与默认动作", icon: Shield },
-  日志: { subtitle: "实时查看脱敏后的内核运行日志与网络事件", icon: List },
-  测试: { subtitle: "下载测速、网站连通性、服务解锁与本地诊断", icon: FlaskConical },
-  设置: { subtitle: "外观主题、Windows 权限、入口与恢复选项", icon: Settings2 },
+const pageIcons: Record<Page, typeof Activity> = {
+  概览: LayoutDashboard,
+  节点: Globe2,
+  订阅: Boxes,
+  连接: Link2,
+  规则: Shield,
+  日志: List,
+  测试: FlaskConical,
+  设置: Settings2,
 };
 
 const navOrder: Page[] = ["概览", "节点", "订阅", "连接", "规则", "日志", "测试", "设置"];
@@ -127,24 +127,24 @@ function latencyClass(ms?: number) {
 }
 
 const regionRules: [string, RegExp][] = [
-  ["🇭🇰 香港", /香港|hong\s*kong|\bhk\b/i],
-  ["🇹🇼 台湾", /台湾|台北|新北|taiwan|\btw\b/i],
-  ["🇯🇵 日本", /日本|东京|大阪|tokyo|osaka|japan|\bjp\b/i],
-  ["🇸🇬 新加坡", /新加坡|狮城|singapore|\bsg\b/i],
-  ["🇺🇸 美国", /美国|洛杉矶|硅谷|圣何塞|纽约|西雅图|达拉斯|芝加哥|united\s*states|\busa?\b/i],
-  ["🇰🇷 韩国", /韩国|首尔|korea|seoul|\bkr\b/i],
-  ["🇬🇧 英国", /英国|伦敦|united\s*kingdom|london|\buk\b|\bgb\b/i],
-  ["🇩🇪 德国", /德国|法兰克福|germany|frankfurt|\bde\b/i],
-  ["🇫🇷 法国", /法国|巴黎|france|paris|\bfr\b/i],
-  ["🇨🇦 加拿大", /加拿大|多伦多|温哥华|canada|\bca\b/i],
-  ["🇦🇺 澳大利亚", /澳大利亚|悉尼|澳洲|australia|\bau\b/i],
+  ["香港", /香港|hong\s*kong|\bhk\b/i],
+  ["台湾", /台湾|台北|新北|taiwan|\btw\b/i],
+  ["日本", /日本|东京|大阪|tokyo|osaka|japan|\bjp\b/i],
+  ["新加坡", /新加坡|狮城|singapore|\bsg\b/i],
+  ["美国", /美国|洛杉矶|硅谷|圣何塞|纽约|西雅图|达拉斯|芝加哥|united\s*states|\busa?\b/i],
+  ["韩国", /韩国|首尔|korea|seoul|\bkr\b/i],
+  ["英国", /英国|伦敦|united\s*kingdom|london|\buk\b|\bgb\b/i],
+  ["德国", /德国|法兰克福|germany|frankfurt|\bde\b/i],
+  ["法国", /法国|巴黎|france|paris|\bfr\b/i],
+  ["加拿大", /加拿大|多伦多|温哥华|canada|\bca\b/i],
+  ["澳大利亚", /澳大利亚|悉尼|澳洲|australia|\bau\b/i],
 ];
 
 function nodeRegion(name: string): string {
   for (const [label, pattern] of regionRules) {
     if (pattern.test(name)) return label;
   }
-  return "🌐 其他";
+  return "其他";
 }
 
 function App() {
@@ -447,16 +447,19 @@ function App() {
       ? runningNode?.id === node.id && nodeRevision(runningNode) === nodeRevision(node)
       : node.id === selected);
 
-  async function checkProxy() {
-    if (!port || busy || recovering) return;
+  async function checkProxy(targetPort = port, automatic = false) {
+    if (!targetPort || (!automatic && (busy || recovering))) return;
     const epoch = diagnosticsEpoch.current;
     setChecking(true);
-    setCheckResult("");
+    setCheckResult(automatic ? "正在验证外网连通性…" : "");
     try {
-      const ms = await invoke<number>("check_connection", { port, probeUrl });
-      if (epoch === diagnosticsEpoch.current) setCheckResult(`当前路由可达 · ${ms} ms`);
+      const ms = await invoke<number>("check_connection", { port: targetPort, probeUrl });
+      if (epoch === diagnosticsEpoch.current) setCheckResult(`连通正常 · ${ms} ms`);
     } catch (e) {
-      if (epoch === diagnosticsEpoch.current) setCheckResult(typeof e === "string" ? e : "网络验证失败");
+      if (epoch === diagnosticsEpoch.current) {
+        const message = typeof e === "string" ? e : "网络验证失败";
+        setCheckResult(automatic ? `端口已就绪但无法出站：${message}` : message);
+      }
     } finally {
       if (epoch === diagnosticsEpoch.current) setChecking(false);
     }
@@ -535,6 +538,7 @@ function App() {
           session.current = withSelectedOutbound(previous, loaded.tag);
           setRunningNode(node);
           await remember();
+          void checkProxy(port, true);
           return;
         }
         const next = await prepareSession(node, port);
@@ -547,6 +551,7 @@ function App() {
           setRunning(true);
           setAppliedRulesKey(currentRulesKey);
           await remember();
+          void checkProxy(port, true);
         } catch (failure) {
           try {
             await startProxy(previous);
@@ -594,6 +599,7 @@ function App() {
       setAppliedRulesKey(currentRulesKey);
       setPort(localPort);
       setRunning(true);
+      void checkProxy(localPort, true);
     } catch (e) {
       setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "连接失败");
     } finally {
@@ -651,6 +657,7 @@ function App() {
       setPort(localPort);
       setRunning(true);
       setPage("概览");
+      void checkProxy(localPort, true);
     } catch (e) {
       setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "切换原配置失败");
     } finally {
@@ -911,6 +918,7 @@ function App() {
         }
         setPort(localPort);
         setRunning(true);
+        void checkProxy(localPort, true);
       }
     } catch (e) {
       setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "连接失败");
@@ -935,6 +943,7 @@ function App() {
       setAppliedRulesKey(currentRulesKey);
       setPort(localPort);
       setRunning(true);
+      void checkProxy(localPort, true);
     } catch (e) {
       clearSession();
       setConnectionError(typeof e === "string" ? e : e instanceof Error ? e.message : "重连失败");
@@ -996,15 +1005,15 @@ function App() {
     <div className="app">
       <aside>
         <div className="brand">
-          <div className="brand-mark"><Cat size={20} /></div>
+          <div className="brand-mark"><Cat size={18} /></div>
           <div>
             <strong>RelayDesk</strong>
-            <small>Windows 代理工作台</small>
+            <small>v1.0.1</small>
           </div>
         </div>
         <nav>
           {navOrder.map(name => {
-            const Icon = pageMeta[name].icon;
+            const Icon = pageIcons[name];
             const badge = name === "节点" && nodes.length ? nodes.length
               : name === "订阅" && subscriptions.length ? subscriptions.length
               : name === "连接" && running && activeCount != null ? activeCount
@@ -1028,12 +1037,12 @@ function App() {
       <div className="workspace">
         <header>
           <div className="header-left">
-            <span className={`status-pill ${statusStateClass}`}>
+            <span className={`status-inline ${statusStateClass}`}>
               <span className="dot" />
               {recovering ? "正在恢复" : running ? (runningOriginal ? "Mihomo 运行中" : "sing-box 运行中") : "未连接"}
             </span>
             {running && port && (
-              <button type="button" className="chip-button" onClick={copyLocalEndpoint} title="点击复制本地代理地址">
+              <button type="button" className="chip-button" onClick={copyLocalEndpoint} title="复制本地代理地址">
                 {portCopied ? <Check size={12} /> : <Copy size={12} />}
                 <span>{allowLan ? "0.0.0.0" : "127.0.0.1"}:{port}</span>
               </button>
@@ -1041,11 +1050,11 @@ function App() {
           </div>
           <div className="header-right">
             {isTauri() && (
-              <span className={`badge ${elevated ? "is-good" : ""}`} title={elevated ? "管理员权限" : "普通用户权限"}>
+              <span className={`tag ${elevated ? "is-good" : ""}`} title={elevated ? "管理员权限" : "普通用户权限"}>
                 {elevated ? <><ShieldCheck size={12} /> 管理员</> : <><ShieldAlert size={12} /> 普通权限</>}
               </span>
             )}
-            <button type="button" className="chip-button" onClick={cycleTheme} title="切换主题模式">
+            <button type="button" className="chip-button" onClick={cycleTheme} title="切换主题">
               <ThemeIcon size={13} />
               <span>{themeLabel}</span>
             </button>
@@ -1054,10 +1063,7 @@ function App() {
 
         <main>
           <div className="title">
-            <div>
-              <h1>{page}</h1>
-              <p>{pageMeta[page].subtitle}</p>
-            </div>
+            <h1>{page}</h1>
             <div className="title-actions">
               {["概览", "节点", "订阅"].includes(page) && (
                 <button className="btn primary" disabled={!work.ready} onClick={() => setDialog(true)}>
@@ -1076,25 +1082,24 @@ function App() {
             <>
               <section className="connection">
                 <div className="connection-info">
-                  <div className="section-label">连接控制中心</div>
                   <div className={`status ${statusStateClass}`}>
                     <span className="status-dot" />
-                    {recovering ? "正在恢复代理连接" : running ? "代理内核运行中" : "代理未连接"}
+                    {recovering ? "正在恢复连接" : running ? "已连接" : "未连接"}
                   </div>
                   <p>
                     {connectionError || recoveryMessage || (running
-                      ? `本地混合入口：${allowLan ? "0.0.0.0" : "127.0.0.1"}:${port}`
+                      ? `${allowLan ? "0.0.0.0" : "127.0.0.1"}:${port}`
                       : originalName
-                        ? `已准备使用 Mihomo 原配置：${originalName}`
+                        ? `Mihomo 原配置：${originalName}`
                         : current
-                          ? `已就绪节点：${current.name}`
-                          : "请先导入订阅并选择节点或 Mihomo 原配置")}
+                          ? current.name
+                          : "未选择节点或配置")}
                     {running && !recovering && (
                       <>
                         {" · "}
-                        <span>{checkResult || "尚未检测远程路由"}</span>
+                        <span>{checkResult || "尚未检测"}</span>
                         <button className="link inline-action" disabled={checking || busy} onClick={() => void checkProxy()}>
-                          {checking ? "检测中…" : "测试连通性"}
+                          {checking ? "检测中…" : "测试"}
                         </button>
                       </>
                     )}
@@ -1137,11 +1142,11 @@ function App() {
                       disabled={busy || (!running && !current && !originalName) || !isTauri()}
                       onClick={() => void toggleProxy()}
                     >
-                      {busy ? "处理中…" : running ? "断开连接" : "立即连接"}
+                      {busy ? "处理中…" : running ? "断开" : "连接"}
                     </button>
                   </div>
                   {mode === "tun" && !running && !elevated && (
-                    <small className="muted">当前为普通权限，启动 TUN 时将请求管理员授权（可在设置中切换管理员重启）</small>
+                    <small className="muted">启用 TUN 时会弹出管理员权限授权</small>
                   )}
                 </div>
               </section>
@@ -1200,15 +1205,15 @@ function App() {
                 <div className="stat-card">
                   <div className="stat-card-head">
                     <span>入口与路由</span>
-                    <span className="badge">{allowLan ? "允许局域网" : "仅本机"}</span>
+                    <span className="tag">{allowLan ? "允许局域网" : "仅本机"}</span>
                   </div>
-                  <strong>{entryModes.find(e => e.value === mode)?.label} · {routingModes.find(r => r.value === routingMode)?.label}模式</strong>
-                  <small>{mode === "tun" ? (tunIpv6 ? "虚拟网卡双栈接管" : "虚拟网卡仅 IPv4") : mode === "system" ? "自动管理 WinINet 系统代理" : "手动配置应用代理端口"}</small>
+                  <strong>{entryModes.find(e => e.value === mode)?.label} · {routingModes.find(r => r.value === routingMode)?.label}</strong>
+                  <small>{mode === "tun" ? (tunIpv6 ? "虚拟网卡双栈接管所有应用" : "虚拟网卡仅 IPv4 接管") : mode === "system" ? "WinINet 系统代理（部分 CLI/IDE 需用 TUN）" : "仅本地端口监听"}</small>
                 </div>
 
                 <div className="stat-card">
                   <div className="stat-card-head">
-                    <span>节点健康与延迟</span>
+                    <span>节点与延迟</span>
                     {!originalName && current && isTauri() && (
                       <button type="button" className="link" disabled={testing} onClick={() => void testNodes([current])}>
                         {testing ? "测速中…" : "测速"}
@@ -1218,26 +1223,26 @@ function App() {
                   <strong style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <span>{(!originalName && current && probe(current)?.label) || (running ? "运行中" : "待连接")}</span>
                     {nodeHealth && (
-                      <span className={`badge ${nodeHealth === "healthy" ? "is-good" : nodeHealth === "unreachable" ? "is-bad" : "is-warn"}`}>
-                        {nodeHealth === "healthy" ? "正常" : nodeHealth === "checking" ? "探测中" : nodeHealth === "unreachable" ? "失联" : "不可检测"}
+                      <span className={`tag ${nodeHealth === "healthy" ? "is-good" : nodeHealth === "unreachable" ? "is-bad" : "is-warn"}`}>
+                        {nodeHealth === "healthy" ? "正常" : nodeHealth === "checking" ? "探测中" : nodeHealth === "unreachable" ? "失联" : "未检测"}
                       </span>
                     )}
                   </strong>
-                  <small>{checkResult || "点击上方“测试连通性”核实当前路由出站"}</small>
+                  <small>{checkResult || "连接后自动验证外网连通性"}</small>
                 </div>
 
                 <div className="stat-card">
                   <div className="stat-card-head">
-                    <span>当前出口 IP</span>
+                    <span>出口 IP</span>
                     <button type="button" className="link" disabled={!running || recovering || checking || busy} onClick={() => void showExitIp()}>
                       {checking ? "查询中…" : "查询"}
                     </button>
                   </div>
-                  <strong title={exitIp?.ip}>{exitIp?.ip || exitIpError || (running ? "点击右上角查询" : "未连接")}</strong>
+                  <strong title={exitIp?.ip}>{exitIp?.ip || exitIpError || (running ? "点击查询" : "未连接")}</strong>
                   <small>
                     {exitIp
-                      ? [exitIp.country, exitIp.city, exitIp.isp].filter(Boolean).join(" · ") || "出口 IP 已确认"
-                      : "通过当前路由访问 IP 归属服务"}
+                      ? [exitIp.country, exitIp.city, exitIp.isp].filter(Boolean).join(" · ") || "已获取"
+                      : "未查询"}
                   </small>
                 </div>
               </div>
@@ -1302,11 +1307,11 @@ function App() {
                             </div>
                           </div>
                           <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-                            <span className={`badge ${p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
+                            <span className={`latency ${p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
                               {p?.label ?? "未测速"}
                             </span>
                             {active ? (
-                              <span className="badge is-accent">{running ? "使用中" : "已选中"}</span>
+                              <span className="tag is-accent">{running ? "使用中" : "已选中"}</span>
                             ) : (
                               <button
                                 type="button"
@@ -1502,10 +1507,10 @@ function App() {
                           >
                             <div className="node-list-main">
                               <div className="node-list-title">
-                                <span className="badge">{region}</span>
+                                <span className="tag">{region}</span>
                                 <span className="source-index">#{n.sourceIndex}</span>
                                 <strong>{n.name}</strong>
-                                {active && <span className="badge is-accent">{running ? "使用中" : "已选中"}</span>}
+                                {active && <span className="tag is-accent">{running ? "使用中" : "已选中"}</span>}
                               </div>
                               <div className="node-list-sub">
                                 <span>{n.server}:{n.port}</span>
@@ -1514,7 +1519,7 @@ function App() {
                                 {reason && <span className="error">· {reason}</span>}
                               </div>
                             </div>
-                            <span className={`badge ${reason ? "is-bad" : p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
+                            <span className={`latency ${reason ? "is-bad" : p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
                               {reason ? "不可用" : p?.label || "未测速"}
                             </span>
                             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -1578,8 +1583,8 @@ function App() {
                             </div>
                           </div>
                           <div className="node-meta-row">
-                            <span className="badge">{region} · {n.protocol.toUpperCase()} · {n.transport}</span>
-                            <span className={`badge ${reason ? "is-bad" : p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
+                            <span className="tag">{region} · {n.protocol.toUpperCase()} · {n.transport}</span>
+                            <span className={`latency ${reason ? "is-bad" : p?.milliseconds != null ? latencyClass(p.milliseconds) : ""}`}>
                               {reason ? "不可用" : p?.label || "未测速"}
                             </span>
                           </div>
@@ -1672,7 +1677,7 @@ function App() {
                     );
                   })()}
                   <p className="rule-hint" style={{ marginTop: 12 }}>
-                    提示：真连接延迟（URL）使用统一单实例 Clash API 测速，反映完整代理+TLS 握手耗时；TCP 握手延迟反映节点服务器直连 RTT。双击节点即可连接/切换。
+                    双击节点可连接或切换。
                   </p>
                 </>
               )}
@@ -1807,9 +1812,9 @@ function App() {
                 </div>
                 <div className="env-row">
                   <span>Google TCP 443（含本机 DNS 解析）</span>
-                  <span className="badge">{localTcp}</span>
+                  <span className="tag">{localTcp}</span>
                 </div>
-                <p className="rule-hint">此诊断直接从本机发起连接以排查底层网络问题（启用 TUN 时可能经过虚拟网卡）。</p>
+                <p className="rule-hint">直接从本机发起连接，启用 TUN 时会经过虚拟网卡。</p>
               </section>
             </>
           )}

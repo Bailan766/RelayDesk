@@ -53,14 +53,12 @@ export function WebsiteChecks({ port, disabled }: { port?: number; disabled: boo
           <strong>{title}</strong>
           <button type="button" className="link" aria-label={`测试 ${title}`} disabled={!port || disabled || pending[id]}
             onClick={() => void test(id)}>{pending[id] ? "请求中…" : "测试"}</button>
-          <span role="status" className={`badge ${res ? (res.ok ? "is-good" : "is-bad") : ""}`}>
+          <span role="status" className={`latency ${res ? (res.ok ? "is-good" : "is-bad") : ""}`}>
             {res?.text ?? "未测试"}
           </span>
         </div>;
       })}
     </div>
-    <p className="rule-hint" style={{ marginTop: 10 }}>
-      {port ? "按当前路由请求，耗时计算至收到 HTTP 响应头。" : "连接代理后可以测试常用网站连通性。"}
-    </p>
+    {!port && <p className="rule-hint" style={{ marginTop: 10 }}>连接代理后可测试常用站点连通性。</p>}
   </section>;
 }

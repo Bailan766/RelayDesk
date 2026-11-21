@@ -775,6 +775,10 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         validate_rule(rule, outbounds, endpoints)?;
         output_rules.push(rule.clone());
     }
+    let route_final = match route.get("final").and_then(Value::as_str) {
+        Some("direct") => "direct",
+        _ => "proxy",
+    };
     Some(json!({
         "log": {"level":"warn"},
         "inbounds": [
@@ -783,7 +787,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         ],
         "outbounds": outbounds,
         "endpoints": endpoints,
-        "route":{"rules":output_rules,"final":"proxy","auto_detect_interface":true,"default_domain_resolver":"bootstrap"},
+        "route":{"rules":output_rules,"final":route_final,"auto_detect_interface":true,"default_domain_resolver":"bootstrap"},
         "dns":{
             "servers":[{"type":"local","tag":"bootstrap"},{"type":"https","tag":"remote","server":"1.1.1.1","path":"/dns-query","detour":"proxy"}],
             "rules":[{"clash_mode":"direct","action":"route","server":"bootstrap"},{"inbound":["tun","local"],"action":"route","server":"remote"}],
@@ -909,9 +913,54 @@ fn capture_config(
     })
 }
 
+const MIHOMO_GEODATA_FILES: &[&str] = &[
+    "Country.mmdb",
+    "geoip.metadb",
+    "geoip.dat",
+    "geosite.dat",
+    "ASN.mmdb",
+];
+
+fn mihomo_cache_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(env::var_os("LOCALAPPDATA")?)
+        .join("RelayDesk")
+        .join("mihomo-cache");
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn seed_mihomo_geodata(home: &std::path::Path) {
+    let Some(cache) = mihomo_cache_dir() else {
+        return;
+    };
+    for name in MIHOMO_GEODATA_FILES {
+        let src = cache.join(name);
+        let dst = home.join(name);
+        if src.is_file() && !dst.exists() {
+            let _ = fs::copy(&src, &dst);
+        }
+    }
+}
+
+fn save_mihomo_geodata(home: &std::path::Path) {
+    let Some(cache) = mihomo_cache_dir() else {
+        return;
+    };
+    for name in MIHOMO_GEODATA_FILES {
+        let src = home.join(name);
+        let dst = cache.join(name);
+        if let Ok(meta) = fs::metadata(&src) {
+            if meta.is_file() && meta.len() > 0 {
+                let _ = fs::copy(&src, &dst);
+            }
+        }
+    }
+}
+
 struct MihomoHome(PathBuf);
 impl Drop for MihomoHome {
     fn drop(&mut self) {
+        save_mihomo_geodata(&self.0);
         let _ = fs::remove_dir_all(&self.0);
     }
 }
@@ -1617,6 +1666,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
         controller.configure_mihomo(&mut config);
         let path = directory.join(format!("mihomo-{token}"));
         fs::create_dir(&path).map_err(|_| "无法创建 Mihomo 工作目录")?;
+        seed_mihomo_geodata(&path);
         Some(MihomoHome(path))
     } else if core == Core::Bridge {
         let target: CaptureTarget =
@@ -1750,7 +1800,7 @@ fn run_worker(args: &[String]) -> Result<(), String> {
     if mode == "system" {
         let bypass_text = bypass
             .as_deref()
-            .unwrap_or("localhost;127.0.0.1;[::1];<local>");
+            .unwrap_or("localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;[::1];<local>");
         system_proxy::enable_with_bypass(&journal, port, bypass_text)
             .map_err(|_| "无法设置系统代理")?;
     }

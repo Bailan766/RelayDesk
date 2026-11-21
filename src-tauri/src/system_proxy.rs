@@ -181,12 +181,16 @@ pub fn recover(path: &Path) -> Result<(), ()> {
 }
 
 pub fn enable(path: &Path, port: u16) -> Result<(), ()> {
-    enable_with_bypass(path, port, "localhost;127.0.0.1;[::1];<local>")
+    enable_with_bypass(
+        path,
+        port,
+        "localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;[::1];<local>",
+    )
 }
 
 pub fn enable_with_bypass(path: &Path, port: u16, bypass: &str) -> Result<(), ()> {
     let bypass = if bypass.trim().is_empty() {
-        "localhost;127.0.0.1;[::1];<local>"
+        "localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;[::1];<local>"
     } else {
         bypass.trim()
     };

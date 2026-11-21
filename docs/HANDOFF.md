@@ -5,7 +5,7 @@
 ## 版本与交付
 
 - 仓库：`Bailan766/RelayDesk`，默认分支为 `main`。
-- 版本：`1.0.0`（[tauri.conf.json](../src-tauri/tauri.conf.json)、[package.json](../package.json)、[Cargo.toml](../src-tauri/Cargo.toml)）。
+- 版本：`1.0.1`（[tauri.conf.json](../src-tauri/tauri.conf.json)、[package.json](../package.json)、[Cargo.toml](../src-tauri/Cargo.toml)）。
 - 产物：Windows x64 安装版和便携版，由 [Windows 工作流](../.github/workflows/windows.yml) 构建；非带 `-` 后缀的 `v*` 标签自动发布为正式 Release。
 - 固定内核：sing-box `1.14.4` 和 Mihomo `1.19.34`。
 
@@ -29,7 +29,8 @@
 | [src-tauri/src/mihomo.rs](../src-tauri/src/mihomo.rs) | Mihomo 原配置准备、LAN 选项与策略恢复。 |
 | [src-tauri/src/system_proxy.rs](../src-tauri/src/system_proxy.rs) | Windows 系统代理与自定义 Bypass 列表设置和恢复。 |
 | [src-tauri/src/storage.rs](../src-tauri/src/storage.rs) | SQLite 工作区数据和 Windows DPAPI 加密。 |
-| [src-tauri/src/telemetry.rs](../src-tauri/src/telemetry.rs)、[src-tauri/src/probes.rs](../src-tauri/src/probes.rs) | 实时流量、连接断开、脱敏日志流、出口归属与服务解锁探测。 |
+| [src-tauri/src/probes.rs](../src-tauri/src/probes.rs) | 下载测速、出口 IP、服务解锁、单实例 Clash API 批量测速会话与 TCP 握手测速。 |
+| [src-tauri/src/telemetry.rs](../src-tauri/src/telemetry.rs) | 实时流量、连接断开、脱敏日志流与延迟探测。 |
 
 ## 仍需持续完善
 

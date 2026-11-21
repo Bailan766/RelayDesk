@@ -10,7 +10,7 @@ export type Usage = { upload?: number; download?: number; total?: number; expire
 export type SubscriptionDownload = { content: string; usage: Usage | null };
 export type SubscriptionRequest = { route: "automatic" | "direct" | "relaydesk"; userAgent: string; allowHttp?: boolean };
 export const defaultSubscriptionRequest: SubscriptionRequest = { route: "automatic", userAgent: "" };
-export const defaultSystemProxyBypass = "localhost;127.0.0.1;[::1];<local>";
+export const defaultSystemProxyBypass = "localhost;127.*;192.168.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;[::1];<local>";
 export const defaultProbeUrl = "https://www.gstatic.com/generate_204";
 
 export const refreshOptions = [[0, "关闭"], [1, "每小时"], [6, "每 6 小时"], [24, "每天"]] as const;
@@ -192,10 +192,14 @@ export function receiveSubscription(
   });
 }
 
+const infoNodePattern = /^(?:.*(?:剩余流量|距离下次重置|套餐到期|过期时间|官方网址|最新官网|域名防走失|TG群组|官方频道|邀请返利|使用说明|重置流量|账号到期))|\s*(?:剩余|到期|官网)[:：]/i;
+
 export function preferredNode(subscriptions: Subscription[], selected?: string): string | undefined {
   const nodes = subscriptions.flatMap(profile => profile.parsed.nodes);
   const retained = nodes.find(node => node.id === selected);
-  return (retained && !connectionSupport(retained) ? retained : nodes.find(node => !connectionSupport(node)))?.id;
+  if (retained && !connectionSupport(retained)) return retained.id;
+  const realNode = nodes.find(node => !connectionSupport(node) && !infoNodePattern.test(node.name));
+  return (realNode ?? nodes.find(node => !connectionSupport(node)))?.id;
 }
 
 export function replaceSubscription(state: Workspace, profile: Subscription): Workspace {

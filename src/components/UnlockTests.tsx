@@ -96,7 +96,7 @@ export function UnlockTests({ port, disabled }: { port?: number; disabled: boole
         </button>
       </div>
       <p className="rule-hint" style={{ marginBottom: 14 }}>
-        {port ? "通过当前本地代理出口探测各平台可用性与地区标识，结果仅供当前路由参考。" : "连接代理后可测试服务解锁情况。"}
+        {port ? "通过当前本地代理出口检测。" : "连接代理后可检测服务解锁状态。"}
       </p>
       <div className="unlock-grid">
         {services.map(serviceName => {
@@ -117,10 +117,10 @@ export function UnlockTests({ port, disabled }: { port?: number; disabled: boole
                 </button>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                <span className={`badge ${badge?.cls ?? ""}`}>
+                <span className={`tag ${badge?.cls ?? ""}`}>
                   {busy ? "正在请求…" : badge?.text ?? "未检测"}
                 </span>
-                {res?.region && <span className="badge is-accent">{res.region}</span>}
+                {res?.region && <span className="tag is-accent">{res.region}</span>}
               </div>
               <footer>
                 <span>{res?.detail ?? "—"}</span>

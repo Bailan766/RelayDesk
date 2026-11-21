@@ -111,7 +111,7 @@ export function RulesEditor({
         </label>
       </div>
       <p className="rule-hint">
-        规则模式下按从上到下顺序匹配，指定节点不可用时会拦截对应流量。若使用 Mihomo 原配置，请在原配置中使用其自带规则。
+        按从上到下顺序匹配，仅作用于节点模式；使用 Mihomo 原配置时以其自带规则为准。
       </p>
       {dirtyWhileRunning && running && (
         <div className="notice is-warn" role="status">
@@ -198,9 +198,9 @@ export function RulesEditor({
           const badgeClass = rule.action === "direct" ? "is-good" : rule.action === "reject" ? "is-bad" : "is-accent";
           return <div className="env-row rule-row" key={`${rule.type}:${rule.value}:${index}`}>
             <span>
-              <span className="badge" style={{ marginRight: 8 }}>{label}</span>
+              <span className="tag" style={{ marginRight: 8 }}>{label}</span>
               <strong>{rule.value}</strong>
-              <span className={`badge ${badgeClass}`} style={{ marginLeft: 8 }}>{route}</span>
+              <span className={`tag ${badgeClass}`} style={{ marginLeft: 8 }}>{route}</span>
             </span>
             <div className="rule-actions">
               <button type="button" className="link" onClick={() => startEdit(rule, index)}>编辑</button>
