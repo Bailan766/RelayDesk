@@ -1,9 +1,9 @@
-/* Native Windows Fluent motion, dark/light custom scrollbars, and subtle micro-interactions */
+/* Material Design 3 motion tokens, state transitions, and linear progress indicators */
 :root {
-  --ease-fluent: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-press: cubic-bezier(0.2, 0, 0, 1);
-  --dur-fast: 110ms;
-  --dur-med: 160ms;
+  --md-sys-motion-easing-standard: cubic-bezier(0.2, 0, 0, 1);
+  --md-sys-motion-easing-emphasized: cubic-bezier(0.05, 0.7, 0.1, 1);
+  --md-sys-motion-duration-short: 150ms;
+  --md-sys-motion-duration-medium: 250ms;
   color-scheme: light;
 }
 
@@ -17,10 +17,10 @@
   }
 }
 
-/* Crisp thin scrollbars matching light & dark surfaces */
+/* Scrollbars aligned with surface hierarchy */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
+  scrollbar-color: var(--md-sys-color-outline-variant) transparent;
 }
 
 ::-webkit-scrollbar {
@@ -34,7 +34,7 @@
 
 ::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, var(--text-muted) 32%, transparent);
-  border-radius: 99px;
+  border-radius: var(--md-sys-shape-corner-full);
   border: 2px solid transparent;
   background-clip: padding-box;
 }
@@ -45,7 +45,7 @@
   background-clip: padding-box;
 }
 
-/* Smooth theme switching without sluggish morphing */
+/* Smooth theme and container surface transitions */
 body,
 aside,
 header,
@@ -54,54 +54,28 @@ header,
 .stat-card,
 .modal {
   transition:
-    background-color var(--dur-med) var(--ease-fluent),
-    border-color var(--dur-med) var(--ease-fluent),
-    color var(--dur-fast) var(--ease-fluent);
+    background-color var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
+    border-color var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-standard),
+    color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 input,
 select,
 textarea {
   transition:
-    border-color var(--dur-fast) var(--ease-fluent),
-    background-color var(--dur-fast) var(--ease-fluent),
-    box-shadow var(--dur-fast) var(--ease-fluent);
+    border-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
+    background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
+    box-shadow var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
-/* Tactile button press and alignment */
-.btn:active:not(:disabled),
-.connect:active:not(:disabled),
-.mini-btn:active:not(:disabled),
-.toolbar-pill:active:not(:disabled),
-.chip-button:active:not(:disabled),
-.icon-button:active:not(:disabled),
-.mode-switch button:active:not(:disabled) {
-  transform: scale(0.975);
-}
-
-.connect:hover:not(:disabled) {
-  filter: brightness(1.06);
-}
-
-.chip-button:hover:not(:disabled) {
-  border-color: var(--border-strong);
-  color: var(--text);
-}
-
-.mini-btn,
+button,
 .btn,
-.link.inline-action,
-.stat-card-head .link {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-}
-
-/* Interactive surfaces & card transitions */
-.mode-switch button,
+.connect,
+.mini-btn,
 .toolbar-pill,
 .chip-button,
+.icon-button,
+.mode-switch button,
 .node-row,
 .node-list-row,
 .node-card,
@@ -112,53 +86,65 @@ textarea {
 .subscription-card,
 .rule-row {
   transition:
-    background-color var(--dur-fast) var(--ease-fluent),
-    border-color var(--dur-fast) var(--ease-fluent),
-    color var(--dur-fast) var(--ease-fluent),
-    box-shadow var(--dur-fast) var(--ease-fluent);
+    background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
+    border-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
+    color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
+    box-shadow var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
+    transform 100ms var(--md-sys-motion-easing-standard),
+    opacity var(--md-sys-motion-duration-short) ease;
 }
 
-.node-list-row:active,
-.node-card:active,
-.mihomo-choice:active:not(:disabled) {
-  transform: scale(0.994);
+.btn:active:not(:disabled),
+.connect:active:not(:disabled),
+.mini-btn:active:not(:disabled),
+.toolbar-pill:active:not(:disabled),
+.chip-button:active:not(:disabled),
+.icon-button:active:not(:disabled),
+.mode-switch button:active:not(:disabled),
+nav button:active:not(:disabled) {
+  transform: scale(0.975);
+}
+
+.mini-btn,
+.btn,
+.link.inline-action,
+.stat-card-head .link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .node-favorite svg {
-  transition: transform 140ms var(--ease-fluent), color var(--dur-fast) ease;
+  transition: transform var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard), color var(--md-sys-motion-duration-short) ease;
 }
 
 .node-favorite:hover svg {
   transform: scale(1.12);
 }
 
-.node-favorite[aria-pressed="true"] svg {
-  transform: scale(1.06);
-}
-
-/* Page & sub-tab entrance */
+/* M3 Page & Tab Entrance */
 .page-view {
-  animation: page-enter var(--dur-med) var(--ease-fluent);
+  animation: page-enter var(--md-sys-motion-duration-medium) var(--md-sys-motion-easing-emphasized);
 }
 
 .tab-view {
-  animation: page-enter var(--dur-fast) var(--ease-fluent);
+  animation: page-enter var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
-/* Notice banner reveal */
 .notice {
-  animation: notice-enter 140ms var(--ease-fluent);
+  animation: notice-enter var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .rule-row.is-matched {
-  border-color: var(--accent);
-  background: var(--bg-active);
+  border-color: var(--md-sys-color-primary);
+  background: color-mix(in srgb, var(--md-sys-color-secondary-container) 55%, var(--md-sys-color-surface-container-low));
 }
 
-/* Live status indicators */
+/* Live Status Indicators */
 .is-running .dot,
 .is-running .status-dot {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 20%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 22%, transparent);
 }
 
 .is-recovering .dot,
@@ -170,68 +156,63 @@ textarea {
   animation: soft-pulse 1.1s ease-in-out infinite;
 }
 
-/* Collapsible chevrons & detail panels */
 .chevron {
-  transition: transform 140ms var(--ease-fluent);
+  transition: transform var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .chevron.is-collapsed {
   transform: rotate(-90deg);
 }
 
-.mihomo-choices {
-  animation: notice-enter 140ms var(--ease-fluent);
-}
-
+.mihomo-choices,
 .subscription-request-details[open] > :not(summary) {
-  animation: notice-enter 140ms var(--ease-fluent);
+  animation: notice-enter var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
-/* Batch probe deterministic progress strip */
+/* M3 Linear Progress Indicator */
 .probe-progress {
   display: grid;
-  gap: 5px;
+  gap: 6px;
   margin-bottom: 12px;
-  animation: notice-enter 120ms var(--ease-fluent);
+  animation: notice-enter var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .probe-progress-track {
   width: 100%;
-  height: 3px;
-  border-radius: 99px;
-  background: var(--border);
+  height: 4px;
+  border-radius: var(--md-sys-shape-corner-full);
+  background: var(--md-sys-color-secondary-container);
   overflow: hidden;
 }
 
 .probe-progress-fill {
   height: 100%;
-  background: var(--accent);
-  border-radius: 99px;
-  transition: width 140ms var(--ease-fluent);
+  background: var(--md-sys-color-primary);
+  border-radius: var(--md-sys-shape-corner-full);
+  transition: width 180ms var(--md-sys-motion-easing-standard);
 }
 
-/* Styled native subscription quota progress bar */
+/* M3 Styled Native Quota Progress Bar */
 .subscription-quota progress {
   height: 6px;
-  border-radius: 99px;
+  border-radius: var(--md-sys-shape-corner-full);
   overflow: hidden;
   appearance: none;
   border: 0;
-  background: var(--border);
+  background: var(--md-sys-color-secondary-container);
 }
 
 .subscription-quota progress::-webkit-progress-bar {
-  background: var(--border);
-  border-radius: 99px;
+  background: var(--md-sys-color-secondary-container);
+  border-radius: var(--md-sys-shape-corner-full);
 }
 
 .subscription-quota progress::-webkit-progress-value {
-  background: var(--accent);
-  border-radius: 99px;
-  transition: width 200ms var(--ease-fluent);
+  background: var(--md-sys-color-primary);
+  border-radius: var(--md-sys-shape-corner-full);
+  transition: width 220ms var(--md-sys-motion-easing-standard);
 }
 
-/* Subtle loading icon rotation */
 .spin {
   animation: spin 0.85s linear infinite;
   flex-shrink: 0;
@@ -240,7 +221,7 @@ textarea {
 @keyframes page-enter {
   from {
     opacity: 0;
-    transform: translateY(3px);
+    transform: translateY(4px);
   }
   to {
     opacity: 1;
@@ -271,22 +252,11 @@ textarea {
 @keyframes modal-enter {
   from {
     opacity: 0;
-    transform: translateY(6px) scale(0.985);
+    transform: translateY(8px) scale(0.975);
   }
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
-  }
-}
-
-@keyframes nav-pill-enter {
-  from {
-    opacity: 0;
-    transform: scaleY(0.35);
-  }
-  to {
-    opacity: 1;
-    transform: scaleY(1);
   }
 }
 

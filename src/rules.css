@@ -1,6 +1,6 @@
 .rule-hint {
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: 12.5px;
   line-height: 1.5;
   margin: 0;
 }
@@ -9,22 +9,27 @@
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
-  margin: 12px 0;
+  margin: 14px 0;
   align-items: center;
 }
 
 .rule-form input,
-.rule-form select,
+.rule-form select {
+  min-height: 36px;
+  border: 1px solid var(--md-sys-color-outline);
+  border-radius: var(--md-sys-shape-corner-small);
+  padding: 6px 10px;
+  background: var(--md-sys-color-surface-container-lowest);
+  color: var(--md-sys-color-on-surface);
+}
+
 .rule-form button {
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 6px 9px;
-  background: var(--bg-surface);
-  color: var(--text);
+  min-height: 36px;
+  border-radius: var(--md-sys-shape-corner-full);
 }
 
 .rule-form input {
-  flex: 1 1 170px;
+  flex: 1 1 180px;
   min-width: 150px;
 }
 
@@ -45,7 +50,7 @@
   display: flex;
   flex-wrap: wrap;
   flex-shrink: 0;
-  gap: 8px;
+  gap: 4px;
   align-items: center;
 }
 
@@ -53,20 +58,20 @@
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin: 8px 0 4px;
+  margin: 10px 0 6px;
 }
 
 .port-setting {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 10px;
 }
 
 .port-setting input {
   flex: none;
   min-width: 0;
-  width: 110px;
+  width: 118px;
 }
 
 .port-setting-note {

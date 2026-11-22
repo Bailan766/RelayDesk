@@ -9,3 +9,40 @@
   white-space: nowrap;
   border: 0;
 }
+
+/* M3 Focus-Visible Keyboard Accessibility Rings */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
+}
+
+.search input:focus-visible {
+  outline: none;
+}
+
+.search:focus-within {
+  box-shadow: 0 0 0 1px var(--md-sys-color-primary);
+}
+
+/* Windows High Contrast / Forced Colors Support */
+@media (forced-colors: active) {
+  nav button.active,
+  .mode-switch button[aria-pressed="true"],
+  .toolbar-pill[aria-pressed="true"],
+  .node-card.selected,
+  .node-list-row.selected,
+  .mihomo-choice.is-selected {
+    forced-color-adjust: none;
+    background: Highlight;
+    color: HighlightText;
+    border-color: Highlight;
+  }
+
+  .setting-item .checkbox-inline input[type="checkbox"] {
+    forced-color-adjust: auto;
+  }
+}
