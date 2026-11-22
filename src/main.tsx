@@ -1405,7 +1405,7 @@ function App() {
           <div className="brand-mark"><Cat size={18} /></div>
           <div>
             <strong>RelayDesk</strong>
-            <small>v1.6.0</small>
+            <small>v1.7.0</small>
           </div>
         </div>
         <nav>

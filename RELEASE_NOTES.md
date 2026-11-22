@@ -1,16 +1,12 @@
-# RelayDesk 1.6.0
+# RelayDesk 1.7.0
 
-RelayDesk 1.6.0 专注于**内核长期连接稳定性、断网/休眠自愈与系统底层容错**：
+RelayDesk 1.7.0 完成 **Google Material Design 3 (M3)** 桌面端界面全面重构（完整继承 `v1.6.0` 核心稳定性与自愈能力）：
 
-- **休眠唤醒与切网秒级自愈**：
-  - 系统从睡眠/休眠唤醒或切换网卡（Wi-Fi / 热点）时，主动清理半开残留连接（`DELETE /connections`），并在 Mihomo 模式下刷新陈旧 Fake-IP DNS 缓存，同时支持在恢复退避期间检测到网络恢复即刻重试拉起内核。
-- **内核假死心跳看门狗**：
-  - `supervise_core` 除监控进程存活与 TUN 路由外，每 12 秒巡检本地控制接口与混合端口握手机制，连续 3 次无响应即判定假死并自动重启恢复。
-- **Mihomo 远程 Provider 缓存持久化**：
-  - 持久化缓存 `proxy-providers/*.cache` 与 `rule-providers/*.cache` 到本地缓存目录并做原子写入与容量修剪，重连、崩溃恢复或弱网启动无需重新从远端下载规则集/节点集。
-- **智能故障切换防误判与 Mihomo 策略组兜底**：
-  - 故障探测增加本机直连联网校验（防物理断网误切节点）与 180 秒失败节点冷却队列；确认换线后立即断开挂载在旧故障节点上的残留连接；新增 Mihomo 主策略组失联自动探测测速并切换可用节点。
-- **系统代理实时注册表守护 + TUN 栈与严格路由可配置**：
-  - 使用 `RegNotifyChangeKeyValue` 实时监听 `Internet Settings` 注册表变化，发现被外部程序篡改时支持防抖速率限制的自动写回恢复；「设置」页新增 TUN 协议栈（`mixed` / `gvisor` / `system`）与 `strict-route` 兼容开关。
-- **底层进程与数据加固**：
-  - 新增 Windows 单实例互斥锁（重复启动自动唤起主窗口）、SQLite `WAL` 模式 + `busy_timeout=5000` + 自动上一份有效配置热备回滚、拉长崩溃重连退避阶梯并清理启动遗留孤儿临时目录与文件。
+- **Material Design 3 语义色彩与表面阶梯**：
+  - 基于 Teal-Cyan 品牌种子构建浅色 / 深色 / 跟随系统三态完整的 `--md-sys-color-*` 语义色板与 `surface` / `surface-container-*` 层级体系，取代原本密集边框与零散灰阶。
+  - 配对优化选中行、次要信息、状态提示文本与错误容器的对比度，确保深浅主题与 Windows 高对比度模式（`forced-colors`）下均清晰可读。
+- **M3 组件语义与自适应导航**：
+  - 宽屏左侧采用 M3 Standard Navigation Drawer 胶囊选中态；窄窗口（`<= 800px`）自适应折叠为居中图标的 Navigation Rail，并保持屏幕阅读器完整标签。
+  - 重构主连接 Filled Pill CTA、断开 Error-Container Pill 按钮、Single-Select Segmented Button（`.mode-switch`）、M3 搜索框与 Filter/Assist Chips、Settings 二元开关（M3 Switch）以及 `28px` 大圆角 M3 Dialog 弹窗。
+- **M3 动效曲线与无障碍焦点**：
+  - 统一采用 `--md-sys-motion-easing-standard` / `emphasized` 缓动、M3 State Layer 交互反馈与 4px/6px 线性进度条，并为全部交互控件补全 `:focus-visible` 焦点环与 `prefers-reduced-motion` 降噪支持。

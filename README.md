@@ -1,6 +1,6 @@
 # RelayDesk
 
-RelayDesk 是一款 Windows 代理客户端，提供节点管理、订阅更新、系统代理、TUN（含免 UAC 后台服务）和本地代理端口，当前正式版本为 `v1.6.0`。
+RelayDesk 是一款 Windows 代理客户端，提供节点管理、订阅更新、系统代理、TUN（含免 UAC 后台服务）和本地代理端口，当前正式版本为 `v1.7.0`。
 
 - **作者**：Bailan233
 - **开源地址**：https://github.com/Bailan766/RelayDesk
