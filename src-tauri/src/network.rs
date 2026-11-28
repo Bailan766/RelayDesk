@@ -921,7 +921,7 @@ fn tun_config(config: &Value, port: u16, interface_name: &str) -> Option<Value> 
         "log": {"level":"warn"},
         "inbounds": [
             {"type":"mixed","tag":"local","listen":"127.0.0.1","listen_port":port},
-            {"type":"tun","tag":"tun","interface_name":interface_name,"address":["172.28.254.1/30","fdfe:dcba:9876::1/126"],"auto_route":true,"strict_route":true,"stack":"mixed"}
+            {"type":"tun","tag":"tun","interface_name":interface_name,"address":["172.28.254.1/30","fdfe:dcba:9876::1/126"],"auto_route":true,"strict_route":true}
         ],
         "outbounds": outbounds,
         "endpoints": endpoints,
@@ -1935,7 +1935,9 @@ fn run_worker(args: &[String]) -> Result<(), String> {
             if !tun_ipv6 {
                 config["inbounds"][1]["address"] = json!(["172.28.254.1/30"]);
             }
-            config["inbounds"][1]["stack"] = json!(&tun_stack);
+            config["inbounds"][1]
+                .as_object_mut()
+                .and_then(|inbound| inbound.remove("stack"));
             config["inbounds"][1]["strict_route"] = json!(tun_strict_route);
         }
         if allow_lan {
@@ -2263,6 +2265,7 @@ mod tests {
             generated["inbounds"][1]["interface_name"].as_str(),
             Some(first.as_str())
         );
+        assert!(generated["inbounds"][1].get("stack").is_none());
         config["outbounds"][0]["tls"] = json!({"enabled":true,"certificate_path":"sensitive"});
         assert!(tun_config(&config, 17771, &second).is_none());
     }
