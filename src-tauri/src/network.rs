@@ -374,6 +374,7 @@ fn validate_tls(value: &Value) -> Option<()> {
             "alpn",
             "min_version",
             "max_version",
+            "certificate_sha256",
             "certificate_public_key_sha256",
             "utls",
             "reality",
@@ -382,7 +383,7 @@ fn validate_tls(value: &Value) -> Option<()> {
     for (key, value) in tls {
         let valid = match key.as_str() {
             "enabled" | "insecure" | "disable_sni" => value.is_boolean(),
-            "alpn" | "certificate_public_key_sha256" => string_list(value),
+            "alpn" | "certificate_sha256" | "certificate_public_key_sha256" => string_list(value),
             "utls" | "reality" => {
                 let allowed: &[&str] = if key == "utls" {
                     &["enabled", "fingerprint"]

@@ -7,7 +7,7 @@
 - 仓库：`Bailan766/RelayDesk`，默认分支为 `main`。
 - 版本：`1.7.0`（[tauri.conf.json](../src-tauri/tauri.conf.json)、[package.json](../package.json)、[Cargo.toml](../src-tauri/Cargo.toml)）。
 - 产物：Windows x64 安装版和便携版，由 [Windows 工作流](../.github/workflows/windows.yml) 构建；非带 `-` 后缀的 `v*` 标签自动发布为正式 Release。
-- 固定内核：sing-box `1.14.4` 和 Mihomo `1.19.34`。
+- 固定内核：sing-box `1.15.0-alpha.14` 和 Mihomo `1.19.34`。
 
 ## 架构与入口
 

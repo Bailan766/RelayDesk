@@ -10,6 +10,7 @@
     "targets": ["nsis"],
     "resources": {
       "../build-resources/sing-box.exe": "sing-box.exe",
+      "../build-resources/libcronet.dll": "libcronet.dll",
       "../build-resources/mihomo.exe": "mihomo.exe",
       "../build-resources/wintun.dll": "wintun.dll",
       "../build-resources/Country.mmdb": "Country.mmdb",

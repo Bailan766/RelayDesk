@@ -28,6 +28,14 @@ describe('sing-box configuration', () => {
     const node = parseSubscription('hysteria2://password@host.test:443?sni=site.test#Test').nodes[0];
     expect((buildConfig(node, 12345) as any).outbounds[0]).toMatchObject({ type: 'hysteria2', password: 'password', tls: { enabled: true, server_name: 'site.test' } });
   });
+  it('converts Hysteria2 certificate pins to sing-box certificate SHA-256 format', () => {
+    const node = parseSubscription('hysteria2://873ab3a6-55a5-4a15-a1bc-9f0367b4556a@3.113.28.24:65535?security=tls&alpn=h3&insecure=0&pinSHA256=aed504e85c4949a80953591e8d249e8924ee6ee7f03295fa4cdb0b0aeb5a75e9&sni=www.bing.com#gfjphy2').nodes[0];
+    expect((buildConfig(node, 12345) as any).outbounds[0]).toMatchObject({
+      type: 'hysteria2', server: '3.113.28.24', server_port: 65535,
+      tls: { enabled: true, server_name: 'www.bing.com', alpn: ['h3'], insecure: false,
+        certificate_sha256: ['rtUE6FxJSagJU1kejSSeiSTubufwMpX6TNsLCutadek='] },
+    });
+  });
   it('preserves Hysteria2 port hopping', () => {
     const node = parseSubscription('hysteria2://password@host.test:443?mport=2000-3000,4000#Test').nodes[0];
     const outbound = (buildConfig(node, 12345) as any).outbounds[0];

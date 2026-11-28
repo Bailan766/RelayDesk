@@ -13,6 +13,7 @@ describe.skipIf(!core)('real sing-box config validation', () => {
   const examples = [
     'vless://00000000-0000-4000-8000-000000000000@host.test:443?security=tls&sni=host.test&type=ws&path=%2Fws#ws',
     'hysteria2://password@host.test:443?sni=host.test&mport=2000-3000#hy',
+    'hysteria2://873ab3a6-55a5-4a15-a1bc-9f0367b4556a@3.113.28.24:65535?security=tls&alpn=h3&insecure=0&pinSHA256=aed504e85c4949a80953591e8d249e8924ee6ee7f03295fa4cdb0b0aeb5a75e9&sni=www.bing.com#gfjphy2',
     'trojan://password@host.test:443?sni=tls.host.test&type=grpc&serviceName=fixture#trojan',
     `vmess://${btoa(JSON.stringify({v:'2',ps:'VMess',add:'vmess.test',port:443,id:uuid,aid:0,net:'ws',type:'none',host:'cdn.test',path:'/test',tls:'tls',sni:'tls.test'}))}`,
     `ss://${btoa('aes-128-gcm:password')}@host.test:8388#ss`,

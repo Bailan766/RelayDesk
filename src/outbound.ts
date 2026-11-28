@@ -80,6 +80,13 @@ function tlsFields(enabled: boolean, sni: unknown, insecure?: boolean, alpn?: un
     alpn: strings(alpn, 'ALPN'), utls: fp ? { enabled: true, fingerprint: fp } : undefined };
 }
 
+function certificateSha256(value: string | null): string[] | undefined {
+  if (value == null || value === '') return;
+  if (!/^[0-9a-f]{64}$/i.test(value)) throw new Error('证书指纹格式无效');
+  const bytes = Array.from({ length: 32 }, (_, index) => Number.parseInt(value.slice(index * 2, index * 2 + 2), 16));
+  return [btoa(String.fromCharCode(...bytes))];
+}
+
 function transport(kind: string, options: Fields = {}): Fields | undefined {
   switch (kind) {
     case '':
@@ -134,7 +141,6 @@ function uriFields(node: NodeProfile): Fields {
   const secret = decodeURIComponent(uri.password);
   const security = q.get('security') ?? (node.protocol === 'vless' ? 'none' : 'tls');
   if (!['none', 'tls', 'reality'].includes(security)) throw new Error('此节点的 TLS 模式暂不支持');
-  if (q.has('pinSHA256') || q.has('pin-sha256')) throw new Error('当前内核无法保留此证书指纹校验');
   if (q.get('headerType') && q.get('headerType') !== 'none') throw new Error('此节点的传输头暂不支持');
   if (q.get('mode') && q.get('mode') !== 'gun' && (q.get('type') === 'grpc' || q.get('network') === 'grpc')) {
     throw new Error('此节点的 gRPC 工作模式暂不支持');
@@ -142,6 +148,8 @@ function uriFields(node: NodeProfile): Fields {
   const tls: Fields = tlsFields(security !== 'none', q.get('sni') || q.get('servername') || q.get('peer'),
     truthy(q.get('insecure')) || truthy(q.get('allowInsecure')), q.get('alpn'), q.get('fp'),
     q.has('disableSni') || q.has('disable-sni') ? truthy(q.get('disableSni') ?? q.get('disable-sni')) : undefined);
+  const certificatePin = certificateSha256(q.get('pinSHA256') ?? q.get('pin-sha256'));
+  if (certificatePin) tls.certificate_sha256 = certificatePin;
   if (security === 'reality') tls.reality = { enabled: true, public_key: requiredString(q.get('pbk'), 'Reality 公钥'), short_id: q.get('sid') || '' };
   const auth = secret ? `${user}:${secret}` : user;
   switch (node.protocol) {
@@ -254,10 +262,10 @@ function validate(value: Fields, protocol: string) {
   if (value.network !== undefined && value.network !== 'tcp' && value.network !== 'udp') throw new Error('节点网络模式无效');
   if (value.tls !== undefined) {
     const tls = object(value.tls, 'TLS');
-    fieldsOnly(tls, 'enabled server_name insecure alpn min_version max_version disable_sni certificate_public_key_sha256 utls reality', 'TLS');
+    fieldsOnly(tls, 'enabled server_name insecure alpn min_version max_version disable_sni certificate_sha256 certificate_public_key_sha256 utls reality', 'TLS');
     for (const key of ['enabled','insecure','disable_sni']) optionalBool(tls[key]);
     for (const key of ['server_name','min_version','max_version']) optionalString(tls[key]);
-    for (const key of ['alpn','certificate_public_key_sha256']) if (tls[key] !== undefined) tls[key] = strings(tls[key], key);
+    for (const key of ['alpn','certificate_sha256','certificate_public_key_sha256']) if (tls[key] !== undefined) tls[key] = strings(tls[key], key);
     if (tls.utls !== undefined) {
       const utls = object(tls.utls, 'uTLS');
       fieldsOnly(utls, 'enabled fingerprint', 'uTLS');
